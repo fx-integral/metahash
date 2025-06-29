@@ -1,0 +1,10 @@
+bittensor
+substrate-interface
+pytest
+pytest-asyncio
+python-dotenv
+tqdm
+hypothesis
+filelock
+scalecodec
+pyotp==2.8.0
