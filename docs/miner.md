@@ -16,7 +16,7 @@ You will trade alpha from other subnets in exchange for SN73 incentives.
 
 ```bash
 # clone repository
-git clone https://github.com/xxyrad/metahash/ && cd metahash
+git clone https://github.com/fx-integral/metahash/ && cd metahash
 
 # create python virtual environment and activate it 
 python3 -m venv .venv

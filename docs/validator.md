@@ -19,7 +19,7 @@ This guide outlines how to set up and operate a **MetaHash SN73 Validator**, whi
 
 ```bash
 # Clone the MetaHash repository
-git clone https://github.com/xxyrad/metahash && cd metahash
+git clone https://github.com/fx-integral/metahash && cd metahash
 
 # Create and activate virtual environment
 python3 -m venv .venv

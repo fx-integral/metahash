@@ -1,7 +1,7 @@
 __version__ = "3.0.0"
 __least_acceptable_version__ = "2.1.1"
 version_split = __version__.split(".")
-version_url = "https://raw.githubusercontent.com/xxyrad/MetaHash/main/metahash/__init__.py"
+version_url = "https://raw.githubusercontent.com/fx-integral/MetaHash/main/metahash/__init__.py"
 
 __spec_version__ = (
     (1000 * int(version_split[0]))
