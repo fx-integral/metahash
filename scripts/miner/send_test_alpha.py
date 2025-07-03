@@ -68,23 +68,23 @@ async def run(args: argparse.Namespace) -> None:
     await subtensor.initialize()
 
     # 2. Wallet
-    wallet = load_wallet(args.wallet_name, args.wallet_hotkey)
+    wallet = load_wallet(args.coldkey, args.hotkey)
 
-    dest = args.dest_coldkey or TREASURY_COLDKEY
+    dest = args.dest or TREASURY_COLDKEY
     logger.info(  # ← now logger, not bt.logging
         "Sending {amt} α from {src} to {dst} (origin-netuid={nid})…",
         amt=args.amount,
         src=wallet.coldkey.ss58_address,
         dst=dest,
-        nid=args.origin_netuid,
+        nid=args.netuid,
     )
 
     # 3. Transfer
     ok = await transfer_alpha(
         subtensor=subtensor,
         wallet=wallet,
-        hotkey_ss58=wallet.hotkey.ss58_address,
-        origin_netuid=args.origin_netuid,
+        hotkey_ss58=args.validator_hotkey,
+        origin_and_dest_netuid=args.netuid,
         dest_coldkey_ss58=dest,
         amount=bt.Balance.from_tao(args.amount),
         wait_for_inclusion=True,
@@ -101,15 +101,12 @@ async def run(args: argparse.Namespace) -> None:
 # ────────────────────────── CLI ────────────────────────────
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description="Send Alpha from any wallet to a coldkey")
-    p.add_argument("--wallet-name", required=True)
-    p.add_argument("--wallet-hotkey", required=True)
-    p.add_argument("--dest-coldkey")
+    p.add_argument("--coldkey", required=True)
+    p.add_argument("--hotkey", required=True)
+    p.add_argument("--validator_hotkey", required=True)
+    p.add_argument("--dest", default=TREASURY_COLDKEY)
     p.add_argument("--amount", type=float, default=10)
-    p.add_argument(
-        "--origin-netuid",
-        type=int,
-        default=int(os.getenv("ORIGIN_NETUID", "348")),
-    )
+    p.add_argument("--netuid",type=int)
     p.add_argument("--network", default="test")
     p.add_argument("--wait-final", action="store_true")
     p.add_argument("--log-level", default="DEBUG", help="DEBUG, INFO, WARNING …")

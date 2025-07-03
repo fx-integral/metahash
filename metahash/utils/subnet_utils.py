@@ -13,14 +13,16 @@ from typing import AsyncGenerator, Optional
 from bittensor.core.metagraph import AsyncMetagraph
 from bittensor import AsyncSubtensor
 from bittensor.utils.balance import Balance
+import time
+from typing import List
+import random
 
 # ── project‑specific constants (keep or replace) ────────────────────────────
 from metahash.config import (
     DEFAULT_NETWORK,   # e.g. "finney"
     DEFAULT_NETUID,       # default netuid for your project
     DECIMALS,          # 10**9 for TAO
-    SAMPLE_POINTS,
-)
+    SAMPLE_POINTS)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -101,26 +103,156 @@ async def liquidity_and_slippage(netuid: int = DEFAULT_NETUID, tao_in=1, *, st=N
                 "price": price, "slippage": slip}
 
 
-async def average_price(netuid: int, start_block: int, end_block: int, *,
-                        st=None, sample=SAMPLE_POINTS) -> Balance:
-    """Arithmetic mean TAO price sampled across a block interval."""
-    step = max((end_block - start_block) // max(sample - 1, 1), 1)
-    prices = []
+async def average_price(
+    netuid: int,
+    start_block: int,
+    end_block: int,
+    *,
+    st=None,
+    sample: int = SAMPLE_POINTS,
+    concurrent: int = 32,
+    even: bool = True,
+) -> Balance:
+    """
+    Arithmetic mean TAO price sampled from *sample* blocks in the
+    closed interval [start_block, end_block].
 
+    Parameters
+    ----------
+    netuid        : subnet identifier.
+    start_block   : first block (inclusive).
+    end_block     : last block  (inclusive).
+    st            : existing Subtensor connection (None → open one temporarily).
+    sample        : number of blocks to sample (defaults to SAMPLE_POINTS).
+    concurrent    : maximum number of simultaneous RPC calls.
+    even          : if True sample evenly spaced, else sample uniformly at random.
+    """
+    if end_block < start_block:
+        raise ValueError("end_block must be ≥ start_block")
+
+    total = end_block - start_block + 1
+    sample = max(1, min(sample, total))          # clamp
+
+    # ───────────────────────────────────────────────────────── sample block numbers
+    if sample == total:                          # small range → just take them all
+        block_sample: List[int] = list(range(start_block, end_block + 1))
+    elif even:                                   # deterministic, evenly spaced
+        step = (total - 1) / (sample - 1)
+        block_sample = [round(start_block + i * step) for i in range(sample)]
+    else:                                        # random (but reproducible if you seed random)
+        block_sample = random.sample(range(start_block, end_block + 1), sample)
+        block_sample.sort()
+
+    async def _price_at(sub, blk: int) -> int:
+        """Fetch price at a single block, with graceful fallback."""
+        try:
+            return (await sub.subnet(netuid, block=blk)).price.rao
+        except Exception:
+            price_rao = await sub.query_runtime_api(
+                "StakeInfoRuntimeApi",
+                "get_subnet_price_at",
+                params=[netuid, blk],
+            )
+            return int(price_rao)
+
+    prices: List[int] = []
     async with _with_subtensor(st) as sub:
-        for blk in range(start_block, end_block + 1, step):
-            try:
-                prices.append((await sub.subnet(netuid, block=blk)).price.rao)
-            except Exception:
-                price_rao = await sub.query_runtime_api(
-                    "StakeInfoRuntimeApi", "get_subnet_price_at",
-                    params=[netuid, blk])
-                prices.append(int(price_rao))
+        t0 = time.time()
+        # ───────────────────────────── batched concurrency ──────────────────────
+        for i in range(0, len(block_sample), concurrent):
+            batch = block_sample[i : i + concurrent]
+            prices.extend(await asyncio.gather(*(_price_at(sub, b) for b in batch)))
+        print(
+            f"Sampled {len(prices)} of {total} blocks "
+            f"in {time.time() - t0:.2f}s (concurrency={concurrent})"
+        )
 
     return Balance.from_rao(int(mean(prices))) if prices else Balance.tao(0)
 
 
+async def average_depth(
+    netuid: int,
+    start_block: int,
+    end_block: int,
+    *,
+    st: Optional[AsyncSubtensor] = None,
+    sample: int = SAMPLE_POINTS,
+    concurrent: int = 32,
+    even: bool = True,
+) -> int:
+    """
+    Arithmetic mean α‑stake depth of *netuid* sampled from *sample* blocks
+    in the closed interval ``[start_block, end_block]``.
+
+    Parameters
+    ----------
+    netuid        : Subnet identifier.
+    start_block   : First block (inclusive).
+    end_block     : Last block  (inclusive).
+    st            : Existing ``AsyncSubtensor`` connection
+                    (``None`` → open one temporarily).
+    sample        : Number of blocks to sample (default ``SLIP_SAMPLE_POINTS``).
+    concurrent    : Maximum simultaneous RPC calls.
+    even          : If *True* sample evenly spaced, else uniformly at random.
+
+    Returns
+    -------
+    int
+        Depth in **planck** (raw α).
+    """
+    if end_block < start_block:
+        raise ValueError("end_block must be ≥ start_block")
+
+    total = end_block - start_block + 1
+    sample = max(1, min(sample, total))
+
+    # ───────────────────────────── block sampling ─────────────────────────── #
+    if sample == total:                             # small range → take all
+        block_sample: List[int] = list(range(start_block, end_block + 1))
+    elif even:
+        step = (total - 1) / (sample - 1)
+        block_sample = [round(start_block + i * step) for i in range(sample)]
+    else:                                           # reproducible random sample
+        block_sample = random.sample(range(start_block, end_block + 1), sample)
+        block_sample.sort()
+
+    async def _depth_at(sub: AsyncSubtensor, blk: int) -> int:
+        """Depth of α‑stake for *netuid* at a single block."""
+        try:
+            # Fast runtime API path (≥1.4.0 subtensor runtimes)
+            depth_rao = await sub.query_runtime_api(
+                "StakeInfoRuntimeApi",
+                "get_subnet_alpha_in_at",
+                params=[netuid, blk],
+            )
+            return int(depth_rao)
+        except Exception:
+            # Fallback to storage query (slower, but exists everywhere)
+            bh = await sub.substrate.get_block_hash(block_id=blk)
+            storage = await sub.substrate.query(
+                "SubtensorModule",
+                "SubnetAlphaIn",
+                [netuid],
+                block_hash=bh,
+            )
+            value = getattr(storage, "value", storage)
+            return int(value) if value is not None else 0
+
+    depths: List[int] = []
+    async with _with_subtensor(st) as sub:
+        t0 = time.time()
+        for i in range(0, len(block_sample), concurrent):
+            batch = block_sample[i : i + concurrent]
+            depths.extend(await asyncio.gather(*(_depth_at(sub, b) for b in batch)))
+        print(
+            f"[depth] Sampled {len(depths)} of {total} blocks "
+            f"in {time.time() - t0:.2f}s (concurrency={concurrent})"
+        )
+
+    return int(mean(depths)) if depths else 0
 # ╭────────────────────────────── NEW helper ────────────────────────────────╮
+
+
 async def get_metagraph(
     netuid: int,
     *,

@@ -8,3 +8,4 @@ hypothesis
 filelock
 scalecodec
 pyotp==2.8.0
+loguru

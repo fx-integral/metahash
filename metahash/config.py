@@ -7,10 +7,11 @@ load_dotenv()
 
 # ─────────────────── 1.  NETWORK‑LEVEL CONSTANTS  ──────────────────── #
 TREASURY_COLDKEY: str = "5GW6xj5wUpLBz7jCNp38FzkdS6DfeFdUTuvUjcn6uKH5krsn"
-DEFAULT_NETWORK: str = os.getenv("BITTENSOR_NETWORK","finney")
-STARTING_AUCTIONS_BLOCK = 5_917_314 
+STARTING_AUCTIONS_BLOCK = int(os.getenv("STARTING_ACTIONS_BLOCK","5_917_314"))
 AUCTION_DELAY_BLOCKS: int = 50
 FORBIDDEN_ALPHA_SUBNETS: list[int] = [73]
+FORCE_BURN_WEIGHTS = True
+DEFAULT_NETWORK: str = os.getenv("BITTENSOR_NETWORK","finney")
 
 
 # ─────────────────── 2.  BOND‑CURVE DESIGN TARGETS  ────────────────── #
@@ -35,8 +36,8 @@ ADJUST_BOND_CURVE: bool = False
 DECIMALS: int = 10**9
 K_SLIP: Decimal = Decimal("1.0")
 CAP_SLIP: float = 1.0
-SLIP_TOLERANCE: Decimal = Decimal("0.001")       
-SLIP_SAMPLE_POINTS: Decimal = 8     
+SLIP_TOLERANCE: Decimal = Decimal("0.001")     
+SAMPLE_POINTS: int = 8  # Sampling interval use for avg price and avg depth
 
 # ─────────────────────── 6.  EVENT‑SCAN RPC TUNING ──────────────────── #
 MAX_CHUNK: int = 512
@@ -44,6 +45,8 @@ FINALITY_LAG: int = 1
 LOG_EVERY: int = 5_000
 
 # ───────────────────────── 7.  ORACLE SAMPLING  ─────────────────────── #
-SAMPLE_POINTS: int = 8
+
 DEFAULT_NETUID: int = 73
 MAX_CONCURRENCY = 5  # Blocks requested in parallel
+
+TEST_TREASURY = "5DLULtxCS9vA3pZRgSTd9gkvGrUwgNje2TNQeLibo9wUWjSS"

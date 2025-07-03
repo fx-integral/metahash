@@ -169,13 +169,6 @@ def add_validator_args(parser):
     )
 
     parser.add_argument(
-        "--neuron.moving_average_alpha",
-        type=float,
-        help="Moving average alpha parameter, how much to add of the new observation.",
-        default=0.1,
-    )
-
-    parser.add_argument(
         "--neuron.axon_off",
         "--axon_off",
         action="store_true",
@@ -235,6 +228,14 @@ def config():
         action="store_true",      # becomes True if flag is present
         default=False,            # otherwise remains False
         help="Enable mock mode (no real chain calls).",
+    )
+
+    # 1.0 so it reset completely the scores
+    parser.add_argument(
+        "--neuron.moving_average_alpha",
+        type=float,
+        help="Moving average alpha parameter, how much to add of the new observation.",
+        default=1,
     )
 
     return bt.config(parser)

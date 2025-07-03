@@ -1,5 +1,5 @@
-__version__ = "3.0.0"
-__least_acceptable_version__ = "2.1.1"
+__version__ = "1.0.0"
+__least_acceptable_version__ = "1.0.0"
 version_split = __version__.split(".")
 version_url = "https://raw.githubusercontent.com/fx-integral/metahash/main/metahash/__init__.py"
 

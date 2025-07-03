@@ -1,21 +1,24 @@
 # ====================================================================== #
 #  metahash/validator/alpha_transfers.py                                 #
+#  Patched 2025‑07‑03 – serialise every RPC call via an asyncio.Lock     #
+#                        – use α‑amount from StakeAdded instead of TAO   #
 # ====================================================================== #
 
 from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, replace
-from typing import Callable, List, Optional, Sequence, Tuple, Dict
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import bittensor as bt
+import websockets  # needed for WebSocketException subclasses
 from substrateinterface.utils.ss58 import (
-    ss58_encode as _ss58_encode_generic,
     ss58_decode as _ss58_decode_generic,
+    ss58_encode as _ss58_encode_generic,
 )
 
-from metahash.utils.async_substrate import maybe_async
 from metahash.config import MAX_CONCURRENCY
+from metahash.utils.async_substrate import maybe_async
 
 # ── constants ─────────────────────────────────────────────────────────── #
 MAX_CHUNK_DEFAULT = 1_000
@@ -27,6 +30,8 @@ DUMP_LAST = 5
 
 @dataclass(slots=True, frozen=True)
 class TransferEvent:
+    """Container for a single α‑stake transfer."""
+
     block: int
     from_uid: int
     to_uid: int
@@ -35,24 +40,27 @@ class TransferEvent:
     dest_coldkey: Optional[str]
     dest_coldkey_raw: Optional[bytes]
 
-# ── SS58 helpers (unchanged) ──────────────────────────────────────────── #
 
+# ── SS58 helpers ──────────────────────────────────────────────────────── #
 
-def _encode_ss58(raw: bytes, fmt: int) -> str:
+def _encode_ss58(raw: bytes, fmt: int) -> str:  # noqa: D401
+    """Encode 32‑byte account‐ID using Substrate’s SS58 format *fmt*."""
     try:
         return _ss58_encode_generic(raw, fmt)
-    except TypeError:  # very old substrate-interface
+    except TypeError:  # very old substrate‑interface
         return _ss58_encode_generic(raw, address_type=fmt)
 
 
-def _decode_ss58(addr: str) -> bytes:
+def _decode_ss58(addr: str) -> bytes:  # noqa: D401
+    """Inverse of :func:`_encode_ss58`."""
     try:
         return _ss58_decode_generic(addr)
-    except TypeError:
+    except TypeError:  # very old substrate‑interface
         return _ss58_decode_generic(addr, valid_ss58_format=True)
 
 
-def _account_id(obj) -> bytes | None:  # noqa: ANN001
+def _account_id(obj) -> bytes | None:  # noqa: ANN001,D401
+    """Best‑effort extraction of a 32‑byte *AccountId* from various shapes."""
     if isinstance(obj, (bytes, bytearray)) and len(obj) == 32:
         return bytes(obj)
     if isinstance(obj, (list, tuple)):
@@ -69,8 +77,8 @@ def _account_id(obj) -> bytes | None:  # noqa: ANN001
         return _account_id(inner)
     return None
 
-# ── generic event accessors (unchanged) ──────────────────────────────── #
 
+# ── generic event accessors ───────────────────────────────────────────── #
 
 def _event_name(ev) -> str:  # noqa: ANN001
     ev = ev.get("event", ev) if isinstance(ev, dict) else getattr(ev, "event", ev)
@@ -85,8 +93,12 @@ def _event_fields(ev) -> Sequence:  # noqa: ANN001
     ev = ev.get("event", ev) if isinstance(ev, dict) else getattr(ev, "event", ev)
     if isinstance(ev, dict):
         return ev.get("attributes") or ev.get("params") or ev.get("data") or ()
-    return getattr(ev, "attributes", ()) or getattr(ev, "params", ()) or getattr(
-        ev, "data", ()) or ()
+    return (
+        getattr(ev, "attributes", ())
+        or getattr(ev, "params", ())
+        or getattr(ev, "data", ())
+        or ()
+    )
 
 
 def _f(params, idx, default=None):  # noqa: ANN001
@@ -101,55 +113,53 @@ def _mask(ck: Optional[str]) -> str:
     return ck if ck is None or len(ck) < 10 else f"{ck[:4]}…{ck[-4:]}"
 
 
-# ── parser (unchanged) ───────────────────────────────────────────────── #
-
+# ── parser helpers ────────────────────────────────────────────────────── #
 
 def _parse_stake_transferred(
-        params, fmt: int, treasury_raw: Optional[bytes]
+    params, fmt: int, treasury_raw: Optional[bytes]
 ) -> TransferEvent:  # noqa: ANN001
-    """Return a TransferEvent for either legacy (≤ v8) *or* Dynamic-TAO (v9 +) layout."""
-    from_hot = _account_id(_f(params, 0))
-    a_raw = _account_id(_f(params, 1))
-    b_raw = _account_id(_f(params, 2))
+    """Parse *StakeTransferred* event parameters (legacy ≤ v8 *or* v9+)."""
 
-    if None in (from_hot, a_raw, b_raw):
-        raise ValueError("Malformed StakeTransferred parameters")
-
-    # Decide which of a_raw / b_raw is the cold-key
-    if treasury_raw:
-        if a_raw == treasury_raw:
-            dest_raw, to_hot = a_raw, b_raw
-        elif b_raw == treasury_raw:
-            dest_raw, to_hot = b_raw, a_raw
-        else:  # fall back
-            dest_raw, to_hot = b_raw, a_raw
-    else:  # heuristic: cold-key ≠ any hot-key
-        dest_raw, to_hot = (a_raw, b_raw) if a_raw != from_hot else (b_raw, a_raw)
+    from_coldkey_raw = _account_id(_f(params, 0))
+    dest_coldkey_raw = _account_id(_f(params, 1))
+    hotkey_staked_to = _account_id(_f(params, 2))  # noqa: F841 – kept for dbg
 
     subnet_id = int(_f(params, 3, -1))
     from_uid = subnet_id  # kept for backward compat
     to_uid = int(_f(params, 4, -1))
-    amount = int(_f(params, 5, 0))
+    amount_placeholder = int(_f(params, 5, 0))  # TAO amount – **will be patched**
 
     return TransferEvent(
         block=-1,
         from_uid=from_uid,
         to_uid=to_uid,
         subnet_id=subnet_id,
-        amount_rao=amount,
-        dest_coldkey=_encode_ss58(dest_raw, fmt),
-        dest_coldkey_raw=dest_raw,
+        amount_rao=amount_placeholder,
+        dest_coldkey=_encode_ss58(dest_coldkey_raw, fmt),
+        dest_coldkey_raw=dest_coldkey_raw,
     )
 
 
 def _amount_from_stake_removed(params) -> int:  # noqa: ANN001
-    return int(_f(params, 3, 0))
+    """Return TAO amount from *StakeRemoved* (index 2)."""
+    return int(_f(params, 2, 0))
+
+
+def _amount_from_stake_added(params) -> int:  # noqa: ANN001
+    """Return **α** amount from *StakeAdded*.
+
+    Empirically the amount sits at index 3 for v9+ chains; if that fails we
+    fall back to index 2 for older chains.
+    """
+
+    return int(_f(params, 3, _f(params, 2, 0)))
+
 
 # ── main scanner class (async) ────────────────────────────────────────── #
 
 
 class AlphaTransfersScanner:
-    """Scans a block-range for α-stake transfers to *one* treasury cold-key."""
+    """Scans a block‑range for α‑stake transfers to *one* treasury cold‑key."""
 
     def __init__(
         self,
@@ -160,6 +170,7 @@ class AlphaTransfersScanner:
         dump_last: int = DUMP_LAST,
         on_progress: Optional[Callable[[int, int, int], None]] = None,
         max_concurrency: int = MAX_CONCURRENCY,
+        rpc_lock: Optional[asyncio.Lock] = None,
     ) -> None:
         self.st = subtensor
         self.dest_ck = dest_coldkey
@@ -170,21 +181,23 @@ class AlphaTransfersScanner:
         self.max_conc = max_concurrency
         self.ss58_format = subtensor.substrate.ss58_format
 
+        # One shared lock per websocket connection – injected by Validator.
+        self._rpc_lock: asyncio.Lock = rpc_lock or asyncio.Lock()
+
     # ------------------------------------------------------------------ #
+    async def _rpc(self, fn, *a, **kw):
+        """Helper that serialises **all** RPC calls hitting the websocket."""
+        async with self._rpc_lock:
+            return await maybe_async(fn, *a, **kw)
+
     async def _get_events_at(self, bn: int):
-        bh = await maybe_async(self.st.substrate.get_block_hash, block_id=bn)
-        return await maybe_async(self.st.substrate.get_events, block_hash=bh)
+        bh = await self._rpc(self.st.substrate.get_block_hash, block_id=bn)
+        return await self._rpc(self.st.substrate.get_events, block_hash=bh)
 
     # ------------------------------------------------------------------ #
     async def scan(self, frm: int, to: int) -> List[TransferEvent]:
-        """
-        Return all α-stake transfers in the **safe** range
-        `[frm, to]` (inclusive).
+        """Return all α‑stake transfers in the **safe** range *[frm, to]*."""
 
-        Uses a bounded-concurrency producer/consumer pattern so that no
-        more than `max_conc` worker tasks exist at any time.  Events are
-        returned **deterministically sorted by block height**.
-        """
         if frm > to:
             return []
 
@@ -217,7 +230,18 @@ class AlphaTransfersScanner:
                 bn = await q.get()
                 if bn is None:
                     break
-                raw_events = await self._get_events_at(bn)
+                try:
+                    raw_events = await self._get_events_at(bn)
+                except websockets.exceptions.WebSocketException as err:
+                    # Reconnect once, then retry the block.
+                    bt.logging.warning(
+                        f"RPC error at block {bn}: {err}; reconnecting…"
+                    )
+                    async with self._rpc_lock:
+                        await self.st.__aexit__(None, None, None)
+                        await self.st.initialize()
+                    raw_events = await self._get_events_at(bn)
+
                 bucket = events_by_block.setdefault(bn, [])
                 seen, kept = self._accumulate(
                     raw_events,
@@ -258,33 +282,45 @@ class AlphaTransfersScanner:
         block_hint_single: int,
         dump: bool,
     ) -> Tuple[int, int]:
-        """Filters one block’s events; mutates *out*; returns (seen, kept)."""
+        """Filters one block’s events; mutates *out*; returns *(seen, kept)*."""
+
         seen = kept = 0
-        removed_by_x: dict[int, int] = {}
+        removed_by_x: Dict[int, int] = {}
+        added_by_x: Dict[int, int] = {}
 
+        # ── first pass: map companion events by *extrinsic_idx* ────────
         for ev in raw_events:
-            if _event_name(ev) == "StakeRemoved":
-                x = ev.get("extrinsic_idx")
-                if x is not None:
-                    removed_by_x[x] = _amount_from_stake_removed(_event_fields(ev))
+            name = _event_name(ev)
+            x = ev.get("extrinsic_idx")
+            if x is None:
+                continue
+            fields = _event_fields(ev)
+            if name == "StakeRemoved":
+                removed_by_x[x] = _amount_from_stake_removed(fields)
+            elif name == "StakeAdded":
+                added_by_x[x] = _amount_from_stake_added(fields)
 
+        # ── second pass: process *StakeTransferred* ────────────────────
         for ev in raw_events:
             if _event_name(ev) != "StakeTransferred":
                 continue
             seen += 1
-
+            fields = _event_fields(ev)
             try:
                 te = _parse_stake_transferred(
-                    _event_fields(ev), self.ss58_format, self.dest_ck_raw
+                    fields, self.ss58_format, self.dest_ck_raw
                 )
             except Exception as exc:  # pragma: no cover
                 bt.logging.debug(f"Malformed event skipped: {exc}")
                 continue
 
-            # Patch amount (token burn emits 0 here)
+            # Patch amount – prefer α from *StakeAdded*, else token burn, else raw
             x = ev.get("extrinsic_idx")
-            if x is not None and x in removed_by_x:
-                te = replace(te, amount_rao=removed_by_x[x])
+            if x is not None:
+                if x in added_by_x:
+                    te = replace(te, amount_rao=added_by_x[x])
+                elif x in removed_by_x:  # legacy burn‑companion
+                    te = replace(te, amount_rao=removed_by_x[x])
 
             te = replace(te, block=block_hint_single)
 

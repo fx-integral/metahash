@@ -176,6 +176,46 @@ def discount_for_deposit(
     return min(1.0, max(0.0, disc))            # guard-rails
 
 
+from decimal import Decimal, getcontext
+
+getcontext().prec = 60     # keep full sub-planck accuracy
+
+# copied from config / utils so we don’t import heavy deps here
+PLANCK_D = Decimal(10) ** 9
+K_SLIP = Decimal("0.003")
+SLIP_TOL = Decimal("0.00001")
+
+
+def quote_alpha_cost(
+    alpha_raw: int,
+    *,
+    price_tao: Decimal,
+    depth_rao: int,
+    c0: Decimal,              # baseline curve (D_START)
+    k_slip: Decimal = K_SLIP,
+) -> tuple[Decimal, Decimal, Decimal]:
+    """
+    Return (tao_post, tao_pre, discount).
+    • tao_pre  – α × price
+    • tao_post – tao_pre after 1-c0 baseline discount *and* dynamic slip
+    • discount – 1 − tao_post / tao_pre     (0.10 == 10 %)
+    """
+    if depth_rao <= 0 or alpha_raw <= 0:
+        return Decimal(0), Decimal(0), Decimal(0)
+
+    # dynamic slip (same form the validator uses)
+    ratio = Decimal(alpha_raw) / (Decimal(depth_rao) + Decimal(alpha_raw))
+    slip = k_slip * ratio
+    if slip <= SLIP_TOL:
+        slip = Decimal(0)
+    slip = min(slip, Decimal(1))
+
+    tao_pre = (Decimal(alpha_raw) / PLANCK_D) * price_tao
+    tao_post = tao_pre * (Decimal(1) - c0) * (Decimal(1) - slip)
+    discount = (Decimal(1) - tao_post / tao_pre) if tao_pre else Decimal(0)
+    return tao_post, tao_pre, discount
+
+
 # ───── public re-exports ───── #
 __all__ = [
     "_curve_rate",

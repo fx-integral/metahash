@@ -1,17 +1,11 @@
 # ╭────────────────────────────────────────────────────────────────────────╮
 # metahash/validator/rewards.py            Epoch reward‑calculation logic
-# Patched 2025‑06‑29 – cumulative fixes:
-#   • Decimal/float type clash in _apply_slippage
-#   • Safe UID handling for unknown miners
-#   • Flexible SubtensorAvgPoolDepth constructor
-#   • Surplus always burned (UID 0)
-#   • NEW (2025‑06‑29): filter‑out α deposits originating from forbidden
-#     subnets (e.g. the SN‑73 issuance subnet) via FORBIDDEN_ALPHA_SUBNETS
 # ╰────────────────────────────────────────────────────────────────────────╯
+
+
 from __future__ import annotations
 
 import asyncio
-import logging
 from dataclasses import dataclass
 from decimal import Decimal, getcontext
 from typing import (
@@ -24,6 +18,7 @@ from typing import (
     Protocol,
     Sequence,
     Tuple,
+    Optional,
     runtime_checkable,
 )
 
@@ -31,10 +26,8 @@ import bittensor as bt
 from metahash.config import (
     K_SLIP,
     SLIP_TOLERANCE,
-    SLIP_SAMPLE_POINTS,
     FORBIDDEN_ALPHA_SUBNETS,  # ← NEW
 )
-from metahash.utils.async_substrate import maybe_async
 
 # ───────────────────────────── GLOBAL CONSTANTS ────────────────────────── #
 
@@ -74,87 +67,6 @@ class PoolDepthProvider(Protocol):
 @runtime_checkable
 class MinerResolver(Protocol):
     async def __call__(self, coldkey: str) -> int | None: ...
-
-
-# ──────────────────────────── DEPTH PROVIDER  ──────────────────────────── #
-
-
-class SubtensorAvgPoolDepth:
-    """
-    Lazily computes – and caches – the average α‑stake depth of a subnet
-    across a configurable set of probe blocks.
-    """
-
-    def __init__(
-        self,
-        subtensor: bt.Subtensor | bt.AsyncSubtensor,
-        probe_blocks: Sequence[int] | None = None,
-        *,
-        start_block: int | None = None,
-        end_block: int | None = None,
-        samples: int = 32,
-    ) -> None:
-        """
-        One of:
-        • provide **probe_blocks** explicitly, or
-        • provide **start_block, end_block, samples** and the constructor
-          will sample `samples` blocks uniformly across the range
-          [start_block, end_block] (inclusive).
-        """
-        # Argument validation & automatic probe list
-        if probe_blocks is None:
-            if start_block is None or end_block is None:
-                raise ValueError(
-                    "Either ‘probe_blocks’ or the trio "
-                    "(start_block, end_block, samples) must be provided"
-                )
-            if end_block < start_block:
-                raise ValueError("end_block must be ≥ start_block")
-
-            span = end_block - start_block
-            step = max(1, span // max(1, samples - 1))
-            probe_blocks = range(end_block, start_block - 1, -step)[:samples]
-
-        self._probe_blocks: List[int] = sorted(set(probe_blocks))
-        self._subtensor = subtensor
-        self._cache: Dict[int, int] = {}
-
-    # ------------------------------------------------------------------ #
-    async def __call__(self, subnet_id: int) -> int:
-        """
-        Average pool depth for *subnet_id* at the probe blocks.
-        Result is memoised per‑epoch / per‑subnet.
-        """
-        if subnet_id in self._cache:
-            return self._cache[subnet_id]
-
-        depths: List[int] = []
-
-        async def _probe(bn: int) -> None:
-            try:
-                block_hash = await maybe_async(
-                    self._subtensor.substrate.get_block_hash, block_id=bn
-                )
-                storage = await maybe_async(
-                    self._subtensor.substrate.query,
-                    "SubtensorModule",
-                    "SubnetAlphaIn",
-                    [subnet_id],
-                    block_hash=block_hash,
-                )
-                value = getattr(storage, "value", storage)
-                if value is not None:
-                    depths.append(int(value))
-            except Exception as err:
-                logging.debug(
-                    f"[depth] subnet={subnet_id} block={bn} failed: {err!r}"
-                )
-
-        await asyncio.gather(*(_probe(b) for b in self._probe_blocks))
-
-        avg = int(sum(depths) / len(depths)) if depths else 0
-        self._cache[subnet_id] = avg
-        return avg
 
 
 # ──────────────────────────────── EVENTS ───────────────────────────────── #
@@ -316,6 +228,8 @@ async def attach_prices(
             raise RuntimeError(f"Price oracle returned None for subnet {sid}")
         price_cache[sid] = Decimal(str(p.tao))
 
+    bt.logging.info(f"Price Cache Dict: {price_cache}")
+
     for d in deposits:
         price = price_cache[d.subnet_id]
         d.avg_price = price
@@ -336,6 +250,8 @@ async def apply_slippage(
 
     depth_pairs = await asyncio.gather(*(_gather(s) for s in subnets))
     depth_cache = dict(depth_pairs)
+
+    bt.logging.info(f"Depth Cache Dict: {depth_cache}")
 
     for d in deposits:
         depth = depth_cache[d.subnet_id]
@@ -437,7 +353,8 @@ class EpochRewards:
 async def compute_epoch_rewards(
     *,
     validator: Any,
-    scanner: TransferScanner,
+    scanner: Optional[TransferScanner] = None,
+    events: Optional[Sequence[TransferEvent]] = None,
     pricing: PricingProvider,
     uid_of_coldkey: MinerResolver,
     start_block: int,
@@ -446,100 +363,98 @@ async def compute_epoch_rewards(
     c0: float,
     beta: float,
     r_min: float,
-    pool_depth_of: PoolDepthProvider | None = None,
-    depth_samples: int = SLIP_SAMPLE_POINTS,
+    pool_depth_of: PoolDepthProvider,
     log: Callable[[str], None] | None = None,
 ) -> EpochRewards:
+    """
+    Calculate SN‑73 rewards for a given (partial) auction window.
+
+    Either *events* **or** *scanner* must be provided.
+
+    • If *events* is given, it is taken as the authoritative list of
+      α‑transfers between *start_block*..*end_block* **inclusive**.
+
+    • Otherwise, *scanner* is used to fetch transfers on‑chain.
+    """
     # ------------------------------------------------------------------ #
     miner_uids = list(validator.get_miner_uids())
     metagraph_size = len(miner_uids)
 
-    # 1. SCAN
-    bt.logging.info(
-        f"Starting Transfers Scan from block {start_block} to {end_block}"
-    )
-    raw = await scan_transfers(
-        scanner=scanner,
-        from_block=start_block,
-        to_block=end_block,
-    )
+    # 1. TRANSFER COLLECTION ------------------------------------------------ #
+    if events is not None:
+        raw = list(events)
+        bt.logging.info(
+            f"[rewards] Using {len(raw)} injected transfer event(s) "
+            f"for blocks {start_block}-{end_block}"
+        )
+    else:
+        if scanner is None:
+            raise ValueError("compute_epoch_rewards: need either events or scanner")
+        bt.logging.info(
+            f"[rewards] Scanning transfers on‑chain "
+            f"({start_block}-{end_block})…"
+        )
+        raw = await scan_transfers(scanner=scanner,
+                                   from_block=start_block,
+                                   to_block=end_block)
 
-    # 2. CAST (now with forbidden subnet filter)
-    bt.logging.info("Casting events…")
+    # 2. CAST (forbidden subnet filter) ------------------------------------ #
+    bt.logging.info("[rewards] Casting events…")
     deposits = cast_events(raw)
 
-    # 3. RESOLVE MINERS
-    bt.logging.info("Resolving miner UIDs…")
+    # 3. RESOLVE MINERS ----------------------------------------------------- #
+    bt.logging.info("[rewards] Resolving miner UIDs…")
     await resolve_miners(deposits, uid_of_coldkey=uid_of_coldkey)
 
-    # 4. COMBINE
-    bt.logging.info("Combining deposits per miner/subnet…")
+    # 4. COMBINE ------------------------------------------------------------ #
+    bt.logging.info("[rewards] Combining deposits per miner/subnet…")
     deposits = _combine_deposits_by_miner_subnet(deposits)
 
-    # 5. PRICE
-    bt.logging.info("Attaching prices…")
-    await attach_prices(
-        deposits,
-        pricing=pricing,
-        epoch_start=start_block,
-        epoch_end=end_block,
-    )
+    # 5. PRICE -------------------------------------------------------------- #
+    bt.logging.info("[rewards] Attaching prices…")
+    await attach_prices(deposits,
+                        pricing=pricing,
+                        epoch_start=start_block,
+                        epoch_end=end_block)
 
-    # 6. SLIPPAGE
-    bt.logging.info("Building pool‑depth provider (average of previous epoch)…")
-    if pool_depth_of is None:
-        epoch_len = end_block - start_block + 1
-        prev_start = max(0, start_block - epoch_len)
-        prev_end = start_block - 1
-
-        pool_depth_of = SubtensorAvgPoolDepth(
-            validator._async_subtensor,
-            start_block=prev_start,
-            end_block=prev_end,
-            samples=depth_samples,
-        )
-
-    bt.logging.info("Applying slippage with averaged depths…")
+    # 6. SLIPPAGE ----------------------------------------------------------- #
+    bt.logging.info("[rewards] Applying slippage with averaged depths…")
     await apply_slippage(deposits, pool_depth_of=pool_depth_of)
 
-    # 7. BOND CURVE
-    bt.logging.info("Applying bond curve…")
-    allocate_bond_curve(
-        deposits=deposits,
-        bag_sn73=bag_sn73,
-        c0=c0,
-        beta=beta,
-        r_min=r_min,
-    )
+    # 7. BOND CURVE --------------------------------------------------------- #
+    bt.logging.info("[rewards] Applying bond curve…")
+    allocate_bond_curve(deposits=deposits,
+                        bag_sn73=bag_sn73,
+                        c0=c0,
+                        beta=beta,
+                        r_min=r_min)
 
-    # 8. AGGREGATION
+    # 8. AGGREGATION -------------------------------------------------------- #
     rewards_per_miner = aggregate_miner_rewards(deposits)
+    bt.logging.info(f"[rewards] Rewards per miner: {rewards_per_miner}")
+    rewards_list = [rewards_per_miner.get(uid, Decimal(0)) for uid in miner_uids]
 
-    # burn any surplus
+    # Burn any surplus
     bag = Decimal(str(bag_sn73))
     surplus = bag - sum(rewards_per_miner.values())
-    if surplus > Decimal(0):
+    if surplus > 0:
         rewards_per_miner[0] = rewards_per_miner.get(0, Decimal(0)) + surplus
-
-    # 9. NORMALISATION
-    weights = build_weights(
-        rewards=rewards_per_miner,
-        miner_uids=miner_uids,
-        burn_uid=0,
+    bt.logging.info(
+        f"[rewards] Surplus to burn: {surplus} (bag {bag})"
     )
 
-    rewards_list = [
-        rewards_per_miner.get(uid, Decimal(0)) for uid in miner_uids
-    ]
+    # 9. NORMALISATION ------------------------------------------------------ #
+    weights = build_weights(rewards=rewards_per_miner,
+                            miner_uids=miner_uids,
+                            burn_uid=0)
 
     issued = float(sum(rewards_per_miner.values()))
-    msg = (
-        f"✓ Epoch @{start_block}-{end_block}: "
-        f"{metagraph_size} miners accounted, "
+    (log or bt.logging.info)(
+        f"✓ Window {start_block}-{end_block}: "
+        f"{metagraph_size} miners, "
         f"{issued:.2f}/{bag_sn73} SN‑73 issued, "
         f"last deposit: {deposits[-1] if deposits else 'n/a'}"
     )
-    (log or logging.info)(msg)
 
     return EpochRewards(
         deposits=deposits,

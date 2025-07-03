@@ -6,11 +6,12 @@
 from __future__ import annotations
 
 import sys
-from typing import Optional, Sequence, Union
+from typing import Sequence, Union
 
 from bittensor import AsyncSubtensor
 from substrateinterface import Keypair, KeypairType
 from metahash.base.utils.logging import ColoredLogger as clog
+import bittensor as bt
 
 
 def verify_coldkey(
@@ -87,27 +88,53 @@ async def transfer_alpha(
     subtensor: AsyncSubtensor,
     wallet,                      # bittensor.wallet (already unlocked)
     hotkey_ss58: str,
-    origin_netuid: int,
+    origin_and_dest_netuid: int,
     dest_coldkey_ss58: str,
     amount,
-    dest_netuid: Optional[int] = None,
     wait_for_inclusion: bool = True,
     wait_for_finalization: bool = False,
     period: int = 256,           # safer default on slow nodes
 ) -> bool:
-    """
-    Convenience wrapper around `AsyncSubtensor.transfer_stake`.
+    # The bittensor SDK seems to have a wrong check only allowing transfrers of alpha staked to a hotkey owned by the coldkey. So random. 
+    # Lets use directly the extrinsics
+    try:
+        bt.logging.info(
+            f"Transferring stake from coldkey [blue]{wallet.coldkeypub.ss58_address}[/blue] to coldkey "
+            f"[blue]{dest_coldkey_ss58}[/blue]\n"
+            f"Amount: [green]{amount}[/green] from netuid [yellow]{origin_and_dest_netuid}[/yellow] to netuid "
+            f"[yellow]{origin_and_dest_netuid}[/yellow]"
+        )
+        call = await subtensor.substrate.compose_call(
+            call_module="SubtensorModule",
+            call_function="transfer_stake",
+            call_params={
+                "destination_coldkey": dest_coldkey_ss58,
+                "hotkey": hotkey_ss58,
+                "origin_netuid": origin_and_dest_netuid,
+                "destination_netuid": origin_and_dest_netuid,
+                "alpha_amount": amount.rao,
+            },
+        )
 
-    Only the arguments that differ from the default template are exposed here.
-    """
-    return await subtensor.transfer_stake(
-        wallet=wallet,
-        destination_coldkey_ss58=dest_coldkey_ss58,
-        hotkey_ss58=hotkey_ss58,
-        origin_netuid=origin_netuid,
-        destination_netuid=dest_netuid or origin_netuid,
-        amount=amount,
-        wait_for_inclusion=wait_for_inclusion,
-        wait_for_finalization=wait_for_finalization,
-        period=period,
-    )
+        success, err_msg = await subtensor.sign_and_send_extrinsic(
+            call=call,
+            wallet=wallet,
+            wait_for_inclusion=wait_for_inclusion,
+            wait_for_finalization=wait_for_finalization,
+            period=period,
+        )
+
+        if success:
+            if not wait_for_finalization and not wait_for_inclusion:
+                return True
+
+            bt.logging.success(":white_heavy_check_mark: [green]Finalized[/green]")
+
+            return True
+        else:
+            bt.logging.error(f":cross_mark: [red]Failed[/red]: {err_msg}")
+            return False
+
+    except Exception as e:
+        bt.logging.error(f":cross_mark: [red]Failed[/red]: {str(e)}")
+        return False

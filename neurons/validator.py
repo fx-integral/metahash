@@ -1,5 +1,7 @@
 # ╭────────────────────────────────────────────────────────────────────────╮
-# neurons/validator.py                                                    #
+# neurons/validator.py                                                     #
+# Patched 2025‑07‑03 – restored pricing/depth providers,                   #
+#                       always pass them to rewards pipeline               #
 # ╰────────────────────────────────────────────────────────────────────────╯
 from __future__ import annotations
 
@@ -16,31 +18,35 @@ from metahash.config import (
     GAMMA_TARGET,
     TREASURY_COLDKEY,
     STARTING_AUCTIONS_BLOCK,
-    AUCTION_DELAY_BLOCKS,          
+    AUCTION_DELAY_BLOCKS,
+    FORCE_BURN_WEIGHTS,
 )
 from metahash.utils.bond_utils import (
     beta_from_gamma,
     curve_params,
     get_bond_curve,
 )
-from metahash.validator.rewards import compute_epoch_rewards, TransferEvent
+from metahash.validator.rewards import (
+    compute_epoch_rewards,
+    TransferEvent,
+)
 from metahash.validator.epoch_validator import EpochValidatorNeuron
-from metahash.validator.alpha_transfers import AlphaTransfersScanner as _AlphaScanner
-from metahash.bittensor_config import config
+
+# Official helper for average subnet price
+from metahash.utils.subnet_utils import average_price, average_depth
 
 
 class Validator(EpochValidatorNeuron):
     """
     Adaptive validator – executed exactly ONCE per epoch head.
-    Phases (executed in this order):
-
-        1) Score miners for previous epoch
-        2) Optionally update bond‑curve parameters
     """
 
-    # ───────────────────────────────────────────────────────────────────── #
+    # ───────────────────────────────────────────────────────────────── #
     def __init__(self, config=None):
         super().__init__(config=config)
+
+        # single lock shared by every RPC that touches the websocket
+        self._rpc_lock: asyncio.Lock = asyncio.Lock()
 
         # Governable parameters
         self.treasury_coldkey: str = TREASURY_COLDKEY
@@ -48,7 +54,6 @@ class Validator(EpochValidatorNeuron):
         # Runtime state
         self._async_subtensor: Optional[bt.AsyncSubtensor] = None
         self._last_validated_epoch: Optional[int] = None
-        self._eaten_metric_prev: float = 0.0
 
         # Bond‑curve Updating
         self.gamma: float = GAMMA_TARGET
@@ -65,22 +70,27 @@ class Validator(EpochValidatorNeuron):
             self._r_min_current,
         )
 
-    # ╭────────────────── async‑substrate helper ──────────────────────────╮
+    # ╭────────────────── async‑substrate helper ───────────────────────╮
     async def _ensure_async_subtensor(self):
         if self._async_subtensor is None:
-            stxn = bt.AsyncSubtensor(
-                network=self.config.subtensor.network,
-            )
+            stxn = bt.AsyncSubtensor(network=self.config.subtensor.network)
             await stxn.initialize()
             self._async_subtensor = stxn
 
-    # ╭──────────────────── providers & scanners ──────────────────────────╮
-    @staticmethod
-    def _make_scanner(async_subtensor: bt.AsyncSubtensor):
-        """Wrap AlphaTransfersScanner → TransferEvent objects
-           understood by the pure‑Python rewards pipeline."""
+    # ╭──────────────────── providers & scanners ────────────────────────╮
+    def _make_scanner(self, async_subtensor: bt.AsyncSubtensor):
+        """
+        Wrap AlphaTransfersScanner → TransferEvent objects understood by
+        the pure‑Python rewards pipeline.
+        """
+        from metahash.validator.alpha_transfers import (
+            AlphaTransfersScanner as _AlphaScanner,
+        )
+
         alpha_scanner = _AlphaScanner(
-            async_subtensor, dest_coldkey=TREASURY_COLDKEY
+            async_subtensor,
+            dest_coldkey=TREASURY_COLDKEY,
+            rpc_lock=self._rpc_lock,  # single websocket recv() lock
         )
 
         class _Scanner:
@@ -97,47 +107,61 @@ class Validator(EpochValidatorNeuron):
 
         return _Scanner()
 
-    def _make_pricing_provider(self, async_subtensor: bt.AsyncSubtensor):
-        class _Pricing:
-            async def __call__(self, subnet_id: int, start: int, end: int):
-                spot = await async_subtensor.alpha_tao_avg_price(
-                    subnet_id=subnet_id, start=start, end=end
-                )
-                return type("Price", (), {"tao": spot, "rao": None})  # shim
+    # ------------ NEW: always‑supplied Pricing & Depth providers ------------- #
+    def _make_pricing_provider(
+        self,
+        async_subtensor: bt.AsyncSubtensor,
+        start_block: int,
+        end_block: int,
+    ):
+        """
+        Average TAO/α price across *start_block..end_block* inclusive.
+        """
+        async def _pricing(subnet_id: int, *_unused):
+            return await average_price(
+                subnet_id,
+                start_block=start_block,
+                end_block=end_block,
+                st=async_subtensor,
+            )
+        return _pricing  # NOTE: **return the function object – no ()**
 
-        return _Pricing()
-
-    def _make_pool_depth_provider(self, async_subtensor: bt.AsyncSubtensor):
+    def _make_pool_depth_provider(
+        self,
+        async_subtensor: bt.AsyncSubtensor,
+        start_block: int,
+        end_block: int,
+    ):
+        """
+        Average α‑stake depth across *start_block..end_block* inclusive.
+        """
         async def _depth(subnet_id: int) -> int:
-            return await async_subtensor.alpha_pool_depth(subnet_id=subnet_id)
+            return await average_depth(
+                subnet_id,
+                start_block=start_block,
+                end_block=end_block,
+                st=async_subtensor,
+            )
 
-        return _depth
+        return _depth    # return the coroutine‑compatible callable
+    # ----------------------------------------------------------------------- #
 
     def _make_uid_resolver(self) -> callable:
-        """
-        Re‑build the coldkey→UID map **every epoch head** so new miners start
-        receiving rewards immediately.
-        """
-
+        """Coldkey → UID map, refreshed every epoch head."""
         async def _resolver(coldkey: str) -> Optional[int]:
-            # Detect metagraph growth
             if len(self.metagraph.coldkeys) != getattr(
                 self, "_ck_cache_size", 0
             ):
-                cold_to_uid = {
+                self._cold_to_uid_cache = {
                     ck: uid for uid, ck in enumerate(self.metagraph.coldkeys)
                 }
-                self._cold_to_uid_cache = cold_to_uid
-                self._ck_cache_size = len(cold_to_uid)
-
+                self._ck_cache_size = len(self.metagraph.coldkeys)
             return self._cold_to_uid_cache.get(coldkey)
 
-        # Prime cache at construction time
         self._cold_to_uid_cache = {
             ck: uid for uid, ck in enumerate(self.metagraph.coldkeys)
         }
         self._ck_cache_size = len(self.metagraph.coldkeys)
-
         return _resolver
 
     # ╭────────────────────────────── PHASE 1 ─────────────────────────────╮
@@ -150,29 +174,29 @@ class Validator(EpochValidatorNeuron):
     ) -> None:
         """
         Reward accounting for the *previous* epoch and score update.
-        Scans **only the last (epoch_len – AUCTION_DELAY_BLOCKS) blocks**
-        of the epoch so that miners have 50 blocks to deposit α before
-        the auction window opens.
         """
         if prev_epoch_index < 0 or prev_epoch_index == self._last_validated_epoch:
             bt.logging.error("Phase 1 skipped – epoch calculation mismatch")
             return
 
-        # ── NEW: honour auction delay ────────────────────────────────── #
-        scan_start_block = prev_start_block + AUCTION_DELAY_BLOCKS
-
-        # Safety: never allow the range to be empty / negative
-        scan_start_block = min(scan_start_block, prev_end_block)
+        # Honour auction delay: skip the first AUCTION_DELAY_BLOCKS blocks
+        scan_start_block = min(
+            prev_start_block + AUCTION_DELAY_BLOCKS, prev_end_block
+        )
 
         beta_prev, c0_prev, r_min_prev = self._curve_params
 
         epoch_out = await compute_epoch_rewards(
             validator=self,
             scanner=self._make_scanner(async_subtensor),
-            pricing=self._make_pricing_provider(async_subtensor),
-            pool_depth_of=self._make_pool_depth_provider(async_subtensor),
+            pricing=self._make_pricing_provider(
+                async_subtensor, prev_start_block, prev_end_block
+            ),
+            pool_depth_of=self._make_pool_depth_provider(
+                async_subtensor, prev_start_block, prev_end_block
+            ),
             uid_of_coldkey=self._make_uid_resolver(),
-            start_block=scan_start_block,          
+            start_block=scan_start_block,
             end_block=prev_end_block,
             bag_sn73=BAG_SN73,
             c0=c0_prev,
@@ -183,7 +207,6 @@ class Validator(EpochValidatorNeuron):
 
         self._last_epoch_rewards = epoch_out.rewards
 
-        # ---------------------------------------------------------------- #
         miner_uids: List[int] = self.get_miner_uids()
         if len(miner_uids) != len(epoch_out.weights):
             raise ValueError(
@@ -191,15 +214,22 @@ class Validator(EpochValidatorNeuron):
                 f"≠ metagraph size {len(miner_uids)}"
             )
 
-        current_block = self.subtensor.get_current_block()   # get the chain height
+        current_block = self.subtensor.get_current_block()
+        blocks_till_update = STARTING_AUCTIONS_BLOCK - current_block
+        hours_till_update = blocks_till_update * 12 / 3600
+        bt.logging.info(
+            f"Blocks till update: {blocks_till_update}. "
+            f"Hours: {hours_till_update}"
+        )
 
-        # ── Burn‑all fallback on zero‑weights *or* pre‑cut‑off block ───── #
-        if not any(epoch_out.weights) or current_block < STARTING_AUCTIONS_BLOCK:
+        # Burn‑all fallback
+        if (
+            FORCE_BURN_WEIGHTS
+            or not any(epoch_out.weights)
+            or current_block < STARTING_AUCTIONS_BLOCK
+        ):
             bt.logging.error(
-                "Burn triggered – "
-                + ("zero-weight vector" if not any(epoch_out.weights) else
-                   f"height {current_block} < {STARTING_AUCTIONS_BLOCK}")
-                + ". Redirecting full emission to UID 0."
+                "Burn triggered – redirecting full emission to UID 0."
             )
             burn_weights = [1.0 if uid == 0 else 0.0 for uid in miner_uids]
             self.update_scores(burn_weights, miner_uids)
@@ -207,7 +237,6 @@ class Validator(EpochValidatorNeuron):
                 self.set_weights()
             self._last_validated_epoch = prev_epoch_index
             return
-        # ---------------------------------------------------------------- #
 
         # Normal path
         self.update_scores(epoch_out.weights, miner_uids)
@@ -225,14 +254,12 @@ class Validator(EpochValidatorNeuron):
 
         beta = beta_from_gamma(BAG_SN73, D_START, self.gamma)
         c0, r_min = curve_params(P_S_PAR, D_START, self.r_min_factor)
-
         self._beta_current, self._c0_current, self._r_min_current = (
             beta,
             c0,
             r_min,
         )
         self._curve_params = (beta, c0, r_min)
-
         clog.info(
             f"Bond‑curve set: β={beta:.6g}, c0={c0:.4f}, r_min={r_min:.4f}",
             color="cyan",
@@ -242,14 +269,9 @@ class Validator(EpochValidatorNeuron):
     async def forward(self) -> None:
         await self._ensure_async_subtensor()
         current_start = self.epoch_start_block
-
-        # Ask chain for the previous epoch start block
         prev_start_block = current_start - self.epoch_tempo
-
-        # Fallback if substrate method fails
         if prev_start_block is None:
             prev_start_block = current_start - (self.epoch_tempo + 1)
-
         prev_end_block = current_start - 1
         prev_epoch_index = self.epoch_index - 1
 
@@ -259,11 +281,7 @@ class Validator(EpochValidatorNeuron):
         )
 
         try:
-            # ── Phase 1 ─────────────────────────────────────────────────── #
-            clog.info(
-                "▶︎ Phase 1 – reward accounting & γ / tail controllers",
-                color="yellow",
-            )
+            clog.info("▶︎ Phase 1 – reward accounting", color="yellow")
             await self._set_weights_for_previous_epoch(
                 prev_epoch_index,
                 prev_start_block,
@@ -271,7 +289,6 @@ class Validator(EpochValidatorNeuron):
                 self._async_subtensor,
             )
 
-            # ── Phase 2 ─────────────────────────────────────────────────── #
             clog.info("▶︎ Phase 2 – bond‑curve auto‑tune", color="yellow")
             self._maybe_update_curve()
 
@@ -301,7 +318,8 @@ class Validator(EpochValidatorNeuron):
 
 # ╭────────────────── production keep‑alive (optional) ───────────────────╮
 if __name__ == "__main__":
+    from metahash.bittensor_config import config
     with Validator(config=config()) as validator:
         while True:
-            clog.info("Validator Running...", color="gray")
+            clog.info("Validator Running…", color="gray")
             time.sleep(15)
