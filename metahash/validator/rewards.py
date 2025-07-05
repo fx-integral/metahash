@@ -462,7 +462,7 @@ async def compute_epoch_rewards(
     surplus = bag - sum(rewards_per_miner.values())
     if surplus > 0:
         rewards_per_miner[0] = rewards_per_miner.get(0, Decimal(0)) + surplus
-    bt.logging.info(f"[rewards] Surplus to burn: {surplus} (bag {bag})")
+    bt.logging.info(f"[rewards] Surplus to burn: {surplus} or of {bag}({round(surplus*100/bag,1)})")
 
     # 9. NORMALISATION ------------------------------------------------------ #
     weights = build_weights(

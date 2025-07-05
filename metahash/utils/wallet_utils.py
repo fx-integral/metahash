@@ -12,6 +12,7 @@ from bittensor import AsyncSubtensor
 from substrateinterface import Keypair, KeypairType
 from metahash.base.utils.logging import ColoredLogger as clog
 import bittensor as bt
+import os
 
 
 def verify_coldkey(
@@ -97,6 +98,7 @@ async def transfer_alpha(
 ) -> bool:
     # The bittensor SDK seems to have a wrong check only allowing transfrers of alpha staked to a hotkey owned by the coldkey. So random. 
     # Lets use directly the extrinsics
+
     try:
         bt.logging.info(
             f"Transferring stake from coldkey [blue]{wallet.coldkeypub.ss58_address}[/blue] to coldkey "
@@ -138,3 +140,29 @@ async def transfer_alpha(
     except Exception as e:
         bt.logging.error(f":cross_mark: [red]Failed[/red]: {str(e)}")
         return False
+
+
+def load_wallet(coldkey_name: str, hotkey_name: str, unlock:bool = True, raise_exception:bool = True) -> bt.wallet:
+    bt.logging.debug(f"Loading wallet coldkey: {coldkey_name} hotkey: {hotkey_name}")
+    pwd = os.getenv("WALLET_PASSWORD")
+
+    if not pwd and raise_exception:
+        bt.logging.error("WALLET_PASSWORD not set in .env")
+        return None
+    else:
+        w = bt.wallet(name=coldkey_name, hotkey=hotkey_name)
+        w.coldkey_file.save_password_to_env(pwd)
+        if unlock:
+            try:
+                w.unlock_coldkey()
+            except Exception as e:  # noqa: BLE001
+                bt.logging.error(f"cannot unlock cold-key: {e}")
+                if raise_exception:
+                    raise Exception("Unable to unlock wallet with: coldkey name: cold, hotkey name: {hot}")
+
+        bt.logging.debug(
+            "Wallet unlocked (cold=%s hot=%s)",
+            w.coldkey.ss58_address,
+            w.hotkey.ss58_address,
+        )
+        return w

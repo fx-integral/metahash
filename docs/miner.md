@@ -1,257 +1,177 @@
 # 🛠 MetaHash Miner Setup Guide (Subnet 73)
 
-This guide explains how to configure and operate a **MetaHash SN73 Miner**, which allows you to participate in the decentralized OTC alpha bonding auction. 
-You will trade alpha from other subnets in exchange for SN73 incentives.
+## ⚠️ IMPORTANT: NO NEURON REQUIRED
+
+**🚨 BIG WARNING: MetaHash miners DO NOT NEED TO RUN A MINER NEURON! 🚨**
+
+**You only need to:**
+1. **Register** your miner on Subnet 73
+2. **Send alpha tokens** from your registered miner's coldkey to participate in auctions
+
+**Miners can use our helper auction_watch.py script but they can also send alph manually**
+
+---
+
+This guide explains how to configure and operate a **MetaHash SN73 Miner**, which allows you to participate in the decentralized OTC (Over-The-Counter) alpha bonding auction system. You will trade alpha tokens from other subnets in exchange for discounted SN73 incentives.
 
 ---
 
 ## 📦 Prerequisites
 
-1. **Python 3.10+** installed
-2. **pip/venv** for environment isolation
+Before starting, ensure you have:
+
+1. **Python 3.10+** installed on your system
+2. **pip/venv** for Python environment isolation
+3. **Git** for repository cloning
+4. **btcli** (Bittensor CLI) configured with your wallet
+5. **Registered miner** on at least one subnet to obtain alpha tokens
 
 ---
 
-## 🧪 Setup Environment
+## 🧪 Environment Setup
 
 ```bash
-# clone repository
+# Clone the MetaHash repository
 git clone https://github.com/fx-integral/metahash/ && cd metahash
 
-# create python virtual environment and activate it 
+# Create and activate Python virtual environment
 python3 -m venv .venv
 source .venv/bin/activate
+
+# Install dependencies
 pip install uv
 uv pip install -e .
 ```
 
 ---
 
-## ⚙️ Configuration
+## 🎯 How MetaHash Mining Works
 
-### 1. `miner.yml` — Auction Spending Profile
+Miners in SN73 participate in **alpha token auctions** where they:
+- **Sell alpha tokens** from other subnets (e.g., SN33) in an OTC marketplace
+- **Receive discounted SN73 alpha** in return
+- **Contribute to the SN73 treasury** while avoiding impact on their home subnet's economy
 
-This file defines how your miner spends in the SN73 bonding auction.
+### ⚠️ Important Restriction
+**FORBIDDEN**: You **cannot send SN73 alpha tokens** to the auctions. Only alpha from other subnets (SN33, SN1, etc.) can be used for bidding.
 
-Configure your coldkey(s) and respective subnet profiles in the project root: 
+### Auction Mechanics
 
-```yaml
-coldkeys:
-- address: 5H13H43jH1DLV3WG7tAL8vkmnMhjnqpkNaFiQcXmUyWBrT5C
-  signature: f6afac65f2b2ddd1bf549f10a1b86ec0c9c7bf7d161febbe0615a63463dc6d5ce320e7bbc305f076d7c33c4906d632dcf20e951a98e36dfb6ad38e03468f9680
-profiles:
-- subnet: 1
-  wallet: origin-1
-  sell_percent: 0.5
-  max_discount: 0.35
-  step_tao: 1.0
-- subnet: 2
-  wallet: origin-2
-  sell_percent: 0.3
-  max_discount: 0.25
-  step_tao: 0.5
-- subnet: 3
-  wallet: origin-3
-  sell_tao: 200
-  max_discount: 0.2
-  step_tao: 2.0
-```
-
----
-### Configuration Details of `miner.yml`
-
-### 🔐 `coldkeys`
-
-Authorizes specific coldkeys to submit alpha to SN73 and receive SN73 incentives.
-
-```yaml
-coldkeys:
-  - address: 5H13H43jH1DLV3WG7tAL8vkmnMhjnqpkNaFiQcXmUyWBrT5C
-    signature: f6afac65f2b2ddd1bf549f10a1b86ec0c9c7bf7d161febbe...
-```
-
-| Field     | Description                                                                 |
-|-----------|-----------------------------------------------------------------------------|
-| `address` | SS58 address of the coldkey contributing alpha                              |
-| `signature` | Cryptographic proof authorizing this address for SN73 OTC participation    |
+- **Frequency**: Auctions occur every **361 blocks** (approximately every epoch)
+- **Supply**: **148 SN73 alpha tokens** are auctioned each round
+- **Discount Structure**: 
+  - Starts at `D_START` (currently **10% discount**)
+  - Discount **decreases** as more alpha is contributed to the auction
+  - If total contributions exceed SN73 alpha value, excess contributions count as **0 value**
+- **Undersubscription**: Remaining SN73 alpha tokens are **burned** if auction is not fully subscribed
 
 ---
 
-### ⚙️ `profiles`
+## ⚙️ Miner Registration
 
-Each profile defines **how much TAO to bond**, **at what price**, from **which subnet and wallet**.
-
-```yaml
-profiles:
-  - subnet: 1
-    wallet: origin-1
-    sell_percent: 0.5
-    max_discount: 0.35
-    step_tao: 1.0
-
-  - subnet: 2
-    wallet: origin-2
-    sell_percent: 0.3
-    max_discount: 0.25
-    step_tao: 0.5
-
-  - subnet: 3
-    wallet: origin-3
-    sell_tao: 200
-    max_discount: 0.2
-    step_tao: 2.0
-```
-
-| Field         | Description                                                                 |
-|---------------|-----------------------------------------------------------------------------|
-| `subnet`      | The UID of the source subnet providing alpha (e.g. 1, 2, 3)                 |
-| `wallet`      | Bittensor wallet name (coldkey/hotkey pair)                                 |
-| `sell_percent`| Optional: fraction of wallet TAO to bond this epoch (0.0–1.0)               |
-| `sell_tao`    | Optional: fixed TAO amount to bond this epoch (overrides `sell_percent`)    |
-| `max_discount`| Maximum acceptable discount (e.g. 0.35 = 35%)                               |
-| `step_tao`    | How much TAO to bond per auction step (granularity)                         |
-
-> You can define multiple profiles to run parallel strategies from different wallets or subnets.
-
----
-
-### 🔄 Profile Evaluation Rules
-
-- `sell_tao` takes precedence over `sell_percent` if both are defined.
-- All auctions enforce:
-  - Discount threshold (`max_discount`)
-  - Step granularity (`step_tao`)
-  - Wallet reserve and quota checks (configured internally or in future extensions)
-- All coldkeys **must match an authorized entry with a valid signature**.
-
----
-
-### ✅ Example Summary
-
-```yaml
-coldkeys:
-  - address: 5H13H...
-    signature: abc123...
-
-profiles:
-  - subnet: 1
-    wallet: origin-1
-    sell_percent: 0.5         # Use 50% of wallet TAO
-    max_discount: 0.35        # Require ≤ 35% discount
-    step_tao: 1.0             # Bond in 1.0 TAO increments
-
-  - subnet: 3
-    wallet: origin-3
-    sell_tao: 200             # Bond 200 TAO this epoch
-    max_discount: 0.2
-    step_tao: 2.0
-```
-
-This configuration:
-- Authorizes one coldkey for OTC bonding
-- Defines auction strategies for 2 wallets:
-  - `origin-1` will bond 50% of its TAO in subnet 1
-  - `origin-3` will bond exactly 200 TAO from subnet 3
-
-
-
----
-
-### 2. `.env` — Environment Variables
-
-Create a `.env` file in the project root and define:
-```dotenv
-BT_WALLET_NAME=mywallet
-BT_HOTKEY=myhotkey
-BT_NETWORK=finney
-```
-
----
-
-### 3. 🧊 Wallet Initialization
-
-Initialize coldkey/hotkey if not yet created:
-```bash
-btcli new-coldkey --wallet.name mywallet
-btcli new-hotkey --wallet.name mywallet --wallet.hotkey myhotkey
-btcli subnets register --wallet.name mywallet --wallet.hotkey myhotkey
-```
-
-Authorize SN73 subnet on-chain:
-```bash
-python scripts/add_coldkey.py --coldkey mywallet --hotkey myhotkey
-```
-
----
-
-## 🚀 Running the Miner
-
-### ✅ Run with PM2 (recommended)
+### Step 1: Register Your Miner
 
 ```bash
-pm2 start python --name metahash-miner -- neurons/auction_loop.py
+# Register your miner on Subnet 73
+btcli s register --netuid 73 --wallet.name YOUR_WALLET_NAME --wallet.hotkey YOUR_HOTKEY_NAME
 ```
 
-### 🔁 Script Mode (testing)
+### Step 2: Important Registration Rules
+
+⚠️ **CRITICAL**: Only register **ONE miner per coldkey**
+- Each coldkey can only have one active UID on SN73
+- Multiple registered miners will result in only one receiving incentives
+- All alpha sent from your coldkey will be attributed to a single miner
+- **If you already have multiple miners registered**: That's okay, but only one will receive incentives from your alpha contributions
+
+---
+
+## 🚀 Mining Options
+
+You have two approaches to participate in MetaHash mining:
+
+### Option A: Manual/Custom Approach
+- **Freestyle trading**: Send alpha to treasury manually using btcli
+- **Custom scripts**: Build your own bidding automation
+- **Full control**: Implement your own auction strategies
+
+### Option B: Automated Auction Watcher (Recommended)
+
+Use the provided auction monitoring script:
 
 ```bash
-python neurons/auction_loop.py
+python scripts/miner/auction_watch.py \
+    --netuid 33 \
+    --validator-hotkey <VALIDATOR_HOTKEY> \
+    --wallet.name <WALLET_NAME> \
+    --wallet.hotkey <HOTKEY_NAME> \
+    --max-alpha 30 \
+    --step-alpha 5 \
+    --max-discount 20
 ```
 
-The auction loop will:
-- Load your YAML profile(s)
-- Check on-chain alpha balances and wallet health
-- Bond TAO using the SN73 bonding curve
-- Ensure quota, cooldown, and reserve rules are respected
-- Atomically log auctions using `filelock`-protected JSON
-
----
-
-## 🧠 How It Works
-
-- The miner monitors bonding opportunities based on the bonding curve (`bond_utils.py`)
-- Each epoch, it participates in auctions and receives SN73 incentives
-- Bids are evaluated for discount rate and quota compliance
-- Auctions can be customized for aggressiveness and spending tolerance
-
----
-
-## 🛡️ Safeguards
-
-- **Atomic lockfiles** prevent concurrent bidding
-- **Reserve protection** keeps wallet solvent
-- **Cooldown timers** reduce chain spam
-- **Discount filters** ensure you don’t overspend for SN73
-
----
-
-## 📓 Logs & Debugging
-
-Check PM2 logs:
-
+**Example with sample values:**
 ```bash
-pm2 logs metahash-miner
+python scripts/miner/auction_watch.py \
+    --netuid 33 \
+    --validator-hotkey <YOUR_VALIDATOR_HOTKEY> \
+    --wallet.name <YOUR_WALLET_NAME> \
+    --wallet.hotkey <YOUR_HOTKEY_NAME> \
+    --max-alpha 30 \
+    --step-alpha 5 \
+    --max-discount 20
 ```
 
-Or enable debug mode with:
+#### Script Parameters Explained
 
-```bash
-python neurons/auction_loop.py --logging.debug
-```
+| Parameter | Description | Example | Notes |
+|-----------|-------------|---------|-------|
+| `--netuid` | Source subnet for alpha tokens | `33` | Cannot be `73` (SN73 alpha forbidden) |
+| `--validator-hotkey` | Validator hotkey from source subnet where your alpha is staked | `<YOUR_VALIDATOR_HOTKEY>` | This is where your alpha will be taken from |
+| `--wallet.name` | Your coldkey/wallet name | `<YOUR_WALLET_NAME>` | Replace with your actual wallet name |
+| `--wallet.hotkey` | Your hotkey name | `<YOUR_HOTKEY_NAME>` | Replace with your actual hotkey name |
+| `--max-alpha` | Maximum alpha to bid per auction | `30` | Set based on your available alpha |
+| `--step-alpha` | Incremental bidding steps | `5` | Amount to increase bids by |
+| `--max-discount` | Maximum acceptable discount threshold | `20` | Stop bidding if discount falls below this |
+
+#### How the Script Works
+
+1. **Monitors** each auction in real-time
+2. **Bids alpha** from subnet 33 in increments of 5 alpha
+3. **Continues bidding** up to maximum of 30 alpha
+4. **Stops bidding** when discount falls below 20%
+5. **Automatically stops** if auction becomes over-subscribed
 
 ---
 
-## 🧩 Related Components
+## 📊 Auction Strategy & Risk Management
 
-- **SN73 Validators** track alpha inflows and emit weights
-- **Bonding Curve** enforces dynamic SN73 pricing
-- **Epoch Engine** determines when auctions are reset
+### Discount Mechanics
+- **Early bidding**: Higher discounts, better deals
+- **Late bidding**: Lower discounts, worse deals
+- **Over-subscription**: Zero value for excess contributions
+
+### Best Practices
+1. **Monitor discount levels** closely
+2. **Set conservative max-discount** thresholds
+3. **Stop bidding** when auctions become over-subscribed
+4. **Diversify** across multiple auctions rather than going all-in
+
+### Risk Warnings
+⚠️ **Stop sending alpha if auction is over-subscribed** - your contributions will have zero value  
+⚠️ **Monitor your max-discount threshold** - don't accept unfavorable deals  
+⚠️ **Only use surplus alpha** - don't compromise your home subnet operations  
+⚠️ **NEVER send SN73 alpha** - only alpha from other subnets is allowed
 
 ---
 
-## ✅ You're Mining!
 
-If successful, you will:
-- Contribute alpha to the SN73 treasury
-- Receive discounted SN73 tokens
-- Avoid impacting your home subnet's economy
+## 📚 Additional Resources
+
+- [MetaHash GitHub Repository](https://github.com/fx-integral/metahash/)
+- [Bittensor Documentation](https://docs.bittensor.com/)
+- [SN73 Specifications](https://github.com/fx-integral/metahash/blob/main/docs/sn73-specs.md)
+
+---
+
+*Happy Mining! 🚀*

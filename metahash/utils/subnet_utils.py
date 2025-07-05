@@ -19,7 +19,7 @@ import random
 
 # ── project‑specific constants (keep or replace) ────────────────────────────
 from metahash.config import (
-    DEFAULT_NETWORK,   # e.g. "finney"
+    DEFAULT_BITTENSOR_NETWORK,   # e.g. "finney"
     DEFAULT_NETUID,       # default netuid for your project
     DECIMALS,          # 10**9 for TAO
     SAMPLE_POINTS)
@@ -30,7 +30,7 @@ from metahash.config import (
 
 
 @asynccontextmanager
-async def _auto_subtensor(network=DEFAULT_NETWORK) -> AsyncGenerator[AsyncSubtensor, None]:
+async def _auto_subtensor(network=DEFAULT_BITTENSOR_NETWORK) -> AsyncGenerator[AsyncSubtensor, None]:
     """Create, initialise, yield, and tear‑down a subtensor client."""
     st = AsyncSubtensor(network=network)   # sync ctor
     await st.initialize()                  # async handshake

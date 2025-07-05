@@ -11,13 +11,13 @@ STARTING_AUCTIONS_BLOCK = int(os.getenv("STARTING_ACTIONS_BLOCK","5_917_314"))
 AUCTION_DELAY_BLOCKS: int = 50
 FORBIDDEN_ALPHA_SUBNETS: list[int] = [73]
 FORCE_BURN_WEIGHTS = True
-DEFAULT_NETWORK: str = os.getenv("BITTENSOR_NETWORK","finney")
+DEFAULT_BITTENSOR_NETWORK: str = os.getenv("BITTENSOR_NETWORK","finney")
 PLANCK = 10**9
 
 # ─────────────────── 2.  BOND‑CURVE DESIGN TARGETS  ────────────────── #
 P_S_PAR: float = 1.0                       # spot‑parity (TAO ⇄ SN‑73)
 D_START: float = 0.10                      # 10 % apex discount
-D_TAIL_TARGET: float = 0.20                # 20 % tail discount
+D_TAIL_TARGET: float = 0.10                # 10 % tail discount just to start for simplicity
 GAMMA_TARGET: float = 1.18                 # ≈ 15 % average discount
 GAMMA_TOL: float = 0.02
 BETA_NUDGE: float = 0.05
