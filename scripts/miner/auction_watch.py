@@ -2,18 +2,11 @@
 # --------------------------------------------------------------------------- #
 #  auction_watch.py – Subnet auction monitor with optional automatic bidding  #
 #
-#  2025‑07‑05 • wallet loading uses --wallet.name / --wallet.hotkey           #
-#             • cold‑key defaults to wallet.coldkey.ss58                      #
-#             • validator‑hotkey defaults to wallet.hotkey.ss58               #
-#             • NEW: seeds the auction automatically at baseline discount     #
-#             • 2025‑07‑05 (FIX) all α amounts are TAO, not RAO; transfers    #
-#               use bt.Balance.from_rao(...)                                  #
-#             • 2025‑07‑05 (CHANGE) --max-discount is now given in PERCENT    #
-#               (e.g. 10 == 10 %), not as a fraction (0.1)                    #
-#             • 2025‑07‑05 (UI) status line now shows                         #
-#               <auction‑state> | Epoch <id> [start–end] (Block <head>)       #
-#  2025‑07‑05 (REF) introduce --meta-netuid to decouple meta‑subnet from      #
-#               auction subnet; all weight/reward calculations use it.        #
+#  2025‑07‑05 • rewritten for “direct‑value” rewards (no bond curve)          #
+#             • discount = 1 – TAO_spent / TAO_value_of_expected_SN‑73        #
+#             • SN‑73 price fetched each loop with subnet_utils.subnet_price  #
+#             • new flag --safety-buffer,                                     #
+#               --max-discount kept (alias of --target-discount)              #
 # --------------------------------------------------------------------------- #
 
 from __future__ import annotations
@@ -22,6 +15,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import time
 from collections import defaultdict
 from decimal import Decimal, getcontext
@@ -31,20 +25,24 @@ import bittensor as bt
 from metahash.config import (
     AUCTION_DELAY_BLOCKS,
     TREASURY_COLDKEY,
-    D_START as _D_START_FLOAT,
     BAG_SN73,
+    D_START as _D_START_FLOAT,
+    DEFAULT_BITTENSOR_NETWORK,
 )
 from metahash.utils.colors import ColoredLogger as clog
-from metahash.utils.subnet_utils import average_price, average_depth
+from metahash.utils.subnet_utils import (
+    average_price,
+    average_depth,
+    subnet_price,         # ← spot SN‑73 price
+)
 from metahash.validator.rewards import compute_epoch_rewards, TransferEvent
-from metahash.utils.bond_utils import get_bond_curve, quote_alpha_cost
+from metahash.utils.bond_utils import quote_alpha_cost
 from metahash.utils.wallet_utils import load_wallet, transfer_alpha
-from metahash.config import DEFAULT_BITTENSOR_NETWORK
 
 # ───────────────────────── precision / constants ────────────────────────── #
 
 getcontext().prec = 60
-D_START = Decimal(str(_D_START_FLOAT))        # float → exact Decimal (fraction)
+D_START = Decimal(str(_D_START_FLOAT))        # float → exact Decimal
 RAO_PER_TAO = Decimal(10) ** 9                # 1 TAO = 10⁹ rao
 bt.logging.set_info()
 
@@ -55,13 +53,12 @@ def _arg_parser() -> argparse.ArgumentParser:
     """
     Build the argument parser.
 
-    NOTE: --max-discount is specified in **percent** (e.g. 10, 20),
-    not as a fraction (0.1, 0.2).  The value is converted to a
-    fraction after parsing so all internal code still works on fractions.
+    --max-discount **or** --target-discount specify the minimum discount
+    you are willing to accept (percent).  They are synonyms.
     """
     p = argparse.ArgumentParser(
         description="Incremental subnet auction monitor with live reward "
-        "forecast and optional automatic α→TAO bidding.",
+        "forecast and optional automatic α→TAO bidding (no bond‑curve).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
@@ -72,16 +69,15 @@ def _arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--netuid",
         type=int,
-        default=73,
+        required=True,
         help="Subnet uid whose auction you monitor / bid in (α is sold here)",
     )
     p.add_argument(
         "--meta-netuid",
         type=int,
         default=73,
-        help="Subnet uid whose metagraph is used for UID look‑ups, weights and "
-             "reward forecasting (defaults to 73).  This may differ from "
-             "--netuid, which is the auction target subnet.",
+        help="Subnet uid whose metagraph is used for UID look‑ups and "
+             "reward forecasting (defaults to 73).",
     )
     p.add_argument(
         "--delay",
@@ -113,7 +109,7 @@ def _arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--validator-hotkey",
         required=True,
-        help="Validator hotkey SS58 that will receive α (defaults to wallet hotkey)",
+        help="Validator hotkey SS58 that will receive α",
     )
     p.add_argument(
         "--max-alpha",
@@ -127,12 +123,21 @@ def _arg_parser() -> argparse.ArgumentParser:
         default=Decimal("1"),
         help="α (TAO) amount for each transfer",
     )
+    # new logic: target discount (percent)
     p.add_argument(
-        "--max-discount",
+        "--target-discount",
+        "--max-discount",          # alias for backward compatibility
+        dest="target_discount",
         type=Decimal,
-        default=D_START * Decimal(100),    # show same default but in percent
-        help="Stop bidding when discount exceeds this percentage "
-             "(e.g. 12.5 for 12.5 %)",
+        default=Decimal("10"),
+        help="Minimum discount you accept (percent, e.g. 12.5)",
+    )
+    p.add_argument(
+        "--safety-buffer",
+        type=Decimal,
+        default=Decimal("1.25"),
+        help="Assume others will add this × more TAO before epoch close "
+             "(e.g. 1.25 = +25 %) when simulating a bid",
     )
 
     # wallet flags (match bittensor‑CLI style)
@@ -167,7 +172,7 @@ def _status_line(
     """
     Compose a human‑readable status line:
 
-        <Auction Waiting/Active …> │ Epoch <id> [<start>-<end>] (Block <head>)
+        <Auction Waiting/Active …> │ Epoch <id> [start‑end] (Block <head>)
     """
     state = (
         f"Auction Active (started {head - auction_open} blocks ago)"
@@ -183,7 +188,7 @@ def _status_line(
 
 async def _monitor(args: argparse.Namespace):
     # ───────── convert CLI percent → fraction ─────────
-    args.max_discount = args.max_discount / Decimal(100)
+    args.target_discount = args.target_discount / Decimal(100)
 
     # ───────── logging ─────────
     logging.basicConfig(
@@ -218,7 +223,6 @@ async def _monitor(args: argparse.Namespace):
     my_deposits: Dict[int, Decimal] = defaultdict(lambda: Decimal(0))
 
     events: List[TransferEvent] = []
-    forecast_weights: List[float] | None = None
     forecast_rewards: Dict[int, Decimal] | None = None
     my_uid: Optional[int] = None
     my_forecast_reward: Optional[Decimal] = None
@@ -233,7 +237,8 @@ async def _monitor(args: argparse.Namespace):
         info(
             f"Auto‑bid ON → step={step_alpha_tao} α, "
             f"max={max_alpha_tao or '∞'} α, "
-            f"max_discount={args.max_discount:.2%}"
+            f"target_discount={args.target_discount:.2%}, "
+            f"safety_buffer={args.safety_buffer}"
         )
 
     # ───────── main loop ─────────
@@ -260,13 +265,12 @@ async def _monitor(args: argparse.Namespace):
 
             # ── metagraph is always taken from *meta‑netuid* ──
             meta = await st.metagraph(args.meta_netuid)
-            # diagnostic / can be removed
-
             uid_resolver = {ck: uid for uid, ck in enumerate(meta.coldkeys)}.get
             my_uid = uid_resolver(wallet.coldkey.ss58_address) if wallet.coldkey.ss58_address else None
-            info(f"⟫ NEW EPOCH {epoch_start // epoch_len} [{_format_epoch_range(epoch_start, epoch_len)}]")
+            info(f"⟫ NEW EPOCH {epoch_start // epoch_len} "
+                 f"[{_format_epoch_range(epoch_start, epoch_len)}]")
 
-        # combined status banner (new order & contents)
+        # combined status banner
         info(_status_line(head, auction_open, epoch_start, epoch_len))
 
         # wait for auction open
@@ -295,10 +299,8 @@ async def _monitor(args: argparse.Namespace):
             next_block = head + 1
             debug(f"Processed {len(raw)} α‑transfer(s)")
 
-        # reward forecast (always on meta subnet)
+        # reward forecast (always on meta subnet) – no bond curve
         try:
-            curve = get_bond_curve()
-
             class _Val:  # dummy validator adapter
                 def __init__(self, n):
                     self._uids = list(range(n))
@@ -312,22 +314,17 @@ async def _monitor(args: argparse.Namespace):
             async def _uid_of_ck(ck):
                 return uid_resolver(ck)
 
-            forecast = await compute_epoch_rewards(
+            rewards = await compute_epoch_rewards(
                 validator=_Val(len(meta.coldkeys)),
                 events=events,
                 pricing=pricing_provider,
                 uid_of_coldkey=_uid_of_ck,
                 start_block=auction_open,
                 end_block=head,
-                bag_sn73=BAG_SN73,
-                c0=curve.c0,
-                beta=curve.beta,
-                r_min=curve.r_min,
                 pool_depth_of=depth_provider,
                 log=lambda m: debug("FORECAST – " + m),
             )
-            forecast_weights = forecast.weights
-            forecast_rewards = forecast.rewards_per_miner
+            forecast_rewards = {uid: r for uid, r in enumerate(rewards)}
             my_forecast_reward = (
                 forecast_rewards.get(my_uid, Decimal(0)) if my_uid is not None else None
             )
@@ -338,15 +335,45 @@ async def _monitor(args: argparse.Namespace):
         rows: List[Tuple[int, str, str, str, str]] = []
         a_tot_tao = t_post_tot = t_pre_tot = Decimal(0)
 
-        async def _maybe_bid(sid: int, discount: Decimal):
-            nonlocal alpha_sent_tao
-            if sid != args.netuid or not autobid_enabled:
-                return
-            if discount > args.max_discount:
-                return
-            if max_alpha_tao is not None and alpha_sent_tao >= max_alpha_tao:
+        # spot SN‑73 price (TAO)
+        spot_bal = await subnet_price(args.meta_netuid, st=st)
+        sn73_price_tao: Decimal = Decimal(str(spot_bal.tao)) if spot_bal else Decimal(0)
+
+        # ---------- inner helpers ---------- #
+        async def _bid_if_worthwhile():
+            """Decide whether to send one α‑tranche."""
+            nonlocal alpha_sent_tao, t_post_tot, my_t_post
+            if not autobid_enabled or sn73_price_tao == 0:
                 return
 
+            # pessimistic future totals
+            A_i_now = my_t_post
+            A_i_after = A_i_now + step_alpha_tao
+            A_sigma_now = t_post_tot
+            others_now = A_sigma_now - A_i_now
+            A_sigma_future = others_now * args.safety_buffer + A_i_after
+
+            if A_sigma_future == 0:
+                return  # avoid div/0
+
+            share_future = A_i_after / A_sigma_future
+            sn73_future = share_future * BAG_SN73
+            value_future = sn73_future * sn73_price_tao
+            if value_future == 0:
+                return
+            discount_future = Decimal(1) - A_i_after / value_future
+
+            debug(
+                f"Simulated bid → future discount {discount_future:.2%} "
+                f"(target {args.target_discount:.2%})"
+            )
+
+            if discount_future < args.target_discount:
+                return  # not attractive enough
+
+            # caps
+            if max_alpha_tao is not None and alpha_sent_tao >= max_alpha_tao:
+                return
             amount_tao: Decimal = (
                 step_alpha_tao
                 if max_alpha_tao is None
@@ -374,10 +401,12 @@ async def _monitor(args: argparse.Namespace):
                 clog.success(
                     f"AUTO‑BID sent {amount_tao} α "
                     f"(cumulative {alpha_sent_tao} α) "
-                    f"at discount {discount:.2%}"
+                    f"at discount ≥ {discount_future:.2%}"
                 )
+        # ---------- end helpers ---------- #
 
         # iterate deposits
+        my_t_post = Decimal(0)
         for sid, a_tao in sorted(deposits.items()):
             if a_tao <= 0:
                 continue
@@ -393,10 +422,18 @@ async def _monitor(args: argparse.Namespace):
                 depth_rao=await depth_provider(sid),
                 c0=D_START,
             )
-            await _maybe_bid(sid, disc)
+
+            # our own discount logic uses tao_post (post‑slip spend)
+            if sid == args.netuid and wallet.coldkey.ss58_address:
+                my_t_post = my_deposits[sid] if sid in my_deposits else Decimal(0)
 
             if a_tao < args.min_display_alpha:
+                # still need totals!
+                a_tot_tao += a_tao
+                t_post_tot += tao_post
+                t_pre_tot += tao_pre
                 continue
+
             rows.append(
                 (
                     sid,
@@ -422,35 +459,8 @@ async def _monitor(args: argparse.Namespace):
             ),
         )
 
-        # ────────────────────── NEW: seed auction if empty ───────────────────
-        if (
-            autobid_enabled
-            and head >= auction_open
-            and not deposits.get(args.netuid)      # no α yet in this subnet
-            and alpha_sent_tao == 0                # haven’t seeded before
-        ):
-            await _maybe_bid(args.netuid, D_START)
-        # ─────────────────────────────────────────────────────────────────────
-
-        # personal summary
-        my_rows: List[Tuple[int, str, str]] = []
-        my_a_tao = my_t_post = my_t_pre = Decimal(0)
-        for sid, a_tao in sorted(my_deposits.items()):
-            price_bal = await pricing_provider(sid)
-            if not price_bal or price_bal.tao == 0:
-                continue
-            a_raw = int((a_tao * RAO_PER_TAO).to_integral_value())
-            tao_post, tao_pre, _ = quote_alpha_cost(
-                a_raw,
-                price_tao=Decimal(str(price_bal.tao)),
-                depth_rao=await depth_provider(sid),
-                c0=D_START,
-            )
-            my_rows.append((sid, f"{a_tao.normalize():f}", f"{tao_post.normalize():f}"))
-            my_a_tao += a_tao
-            my_t_post += tao_post
-            my_t_pre += tao_pre
-        my_disc_tot = (Decimal(1) - my_t_post / my_t_pre) if my_t_pre else D_START
+        # ────────────────────── AUTO‑BID decision ──────────────────────
+        await _bid_if_worthwhile()
 
         # ───────── output ─────────
         if args.json:
@@ -461,14 +471,7 @@ async def _monitor(args: argparse.Namespace):
                         "blk": head,
                         "epoch": epoch_start,
                         "rows": rows,
-                        "my_rows": my_rows,
-                        "my_totals": {
-                            "alpha": f"{my_a_tao.normalize():f}",
-                            "tao_post": f"{my_t_post.normalize():f}",
-                            "tao_pre": f"{my_t_pre.normalize():f}",
-                            "disc": f"{(my_disc_tot*100):.2f}%",
-                        },
-                        "forecast_weights": forecast_weights or [],
+                        "sn73_price": str(sn73_price_tao),
                         "forecast_rewards": {
                             str(k): str(v) for k, v in (forecast_rewards or {}).items()
                         },
@@ -489,20 +492,18 @@ async def _monitor(args: argparse.Namespace):
             for sid, a_s, tao_post_s, _, disc_s in rows[1:]:
                 info(f"  Subnet {sid:<3}: {a_s} α → {tao_post_s} TAO (disc {disc_s})")
             if wallet.coldkey.ss58_address:
-                if my_rows:
+                if my_t_post > 0:
                     info(
-                        f"MY  {wallet.coldkey.ss58_address[:12]}… {my_a_tao.normalize():f} α → "
-                        f"{my_t_post.normalize():f} TAO (disc {(my_disc_tot*100):.2f}%)"
+                        f"MY  {wallet.coldkey.ss58_address[:12]}… "
+                        f"{my_t_post.normalize():f} TAO spent (post‑slip)"
                     )
-                    for sid, a_s, tao_post_s in my_rows:
-                        info(f"    Subnet {sid:<3}: {a_s} α → {tao_post_s} TAO")
                 else:
                     info(f"MY  {wallet.coldkey.ss58_address[:12]}… no deposits yet.")
-            if my_uid is not None and forecast_weights is not None:
-                w = forecast_weights[my_uid]
+            if my_uid is not None and forecast_rewards is not None:
+                fr = forecast_rewards.get(my_uid, Decimal(0))
                 info(
-                    f"FORECAST – UID {my_uid} {my_forecast_reward or Decimal(0):.4f} "
-                    f"SN‑{args.meta_netuid} (weight {w:.2%})"
+                    f"FORECAST – UID {my_uid} {fr:.4f} SN‑{args.meta_netuid} "
+                    f"(spot value {(fr*sn73_price_tao):.4f} TAO)"
                 )
             if autobid_enabled:
                 info(
@@ -513,7 +514,7 @@ async def _monitor(args: argparse.Namespace):
         await asyncio.sleep(args.interval)
 
 
-# ────────────────────────── providers (defined late) ───────────────────── #
+# ───────────────────────── providers (defined late) ───────────────────── #
 
 def _make_pricing_provider(st: bt.AsyncSubtensor, start: int, end: int):
     async def _pricing(subnet_id: int, *_):
