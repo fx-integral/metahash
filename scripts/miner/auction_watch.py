@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # --------------------------------------------------------------------------- #
-#  auction_watch.py – profit‑maximising auto‑bid                              #
+#  auction_watch.py – v3  (count‑down logging + on‑chain min TAO)             #
 # --------------------------------------------------------------------------- #
 from __future__ import annotations
 
@@ -22,11 +22,7 @@ from metahash.config import (
     DEFAULT_BITTENSOR_NETWORK,
 )
 from metahash.utils.colors import ColoredLogger as clog
-from metahash.utils.subnet_utils import (
-    average_price,
-    average_depth,
-    subnet_price,
-)
+from metahash.utils.subnet_utils import average_price, average_depth, subnet_price
 from metahash.validator.rewards import compute_epoch_rewards, TransferEvent
 from metahash.utils.bond_utils import quote_alpha_cost
 from metahash.utils.wallet_utils import load_wallet, transfer_alpha
@@ -35,7 +31,11 @@ from metahash.utils.wallet_utils import load_wallet, transfer_alpha
 getcontext().prec = 60
 RAO_PER_TAO = Decimal(10) ** 9
 D_START = Decimal(str(_D_START_FLOAT))
-MIN_ALPHA = Decimal("0.01")                     # on‑chain minimum
+
+# on‑chain minima (taken from error message “Minimum: 0.0005 TAO”)
+MIN_TAO_ONCHAIN = Decimal("0.0005")
+DEFAULT_STEP_ALPHA = Decimal("0.01")         # convenient default, may be raised
+
 bt.logging.set_info()
 
 # ───────────────────────────── CLI ────────────────────────────── #
@@ -70,17 +70,14 @@ def _arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--validator-hotkey", required=True)
     p.add_argument("--max-alpha", type=Decimal, default=Decimal("0"),
                    help="Absolute cap on α you are willing to spend this epoch.")
-    p.add_argument("--step-alpha", type=Decimal, default=MIN_ALPHA,
-                   help="Smallest α that will be sent in a single bid. "
-                        "Default = on‑chain minimum.")
+    p.add_argument("--step-alpha", type=Decimal, default=DEFAULT_STEP_ALPHA,
+                   help="Smallest α that can be sent in a single bid.")
     p.add_argument("--max-discount", type=Decimal, default=Decimal("20"),
-                   help="Maximum loss (discount) you tolerate, in percent. "
-                        "Example: 20 = you accept receiving SN‑73 worth 80 % "
-                        "of TAO spent.")
+                   help="Maximum loss (discount) you tolerate, in percent.")
     p.add_argument("--safety-buffer", type=Decimal, default=Decimal("1.25"),
-                   help="Assume others add ×this TAO before epoch close when "
-                        "computing the optimal bid.")
-    # wallet flags
+                   help="Assume others add ×this TAO before epoch close.")
+
+    # wallet
     p.add_argument("--wallet.name", dest="wallet_name", default=None)
     p.add_argument("--wallet.hotkey", dest="wallet_hotkey", default=None)
     return p
@@ -93,13 +90,16 @@ def _format_range(start: int, length: int) -> str:
 
 
 def _status(head: int, open_: int, start: int, length: int) -> str:
+    epoch_end = start + length - 1
+    blocks_left = epoch_end - head
     state = (
         f"Auction Active (started {head - open_} blocks ago)"
         if head >= open_
         else f"Auction Waiting ({open_ - head} blocks to start)"
     )
     eid = head // length
-    return f"{state} │ Epoch {eid} [{_format_range(start, length)}] (Block {head})"
+    return (f"{state} │ Epoch {eid} [{_format_range(start, length)}] "
+            f"(Block {head}) │ {blocks_left} blk left")
 
 # ─────────────────── providers ─────────────────── #
 
@@ -126,6 +126,11 @@ async def _monitor(args: argparse.Namespace):
     # logger aliases
     def warn(m): return clog.warning("[auction] " + m)
     def info(m): return clog.info("[auction] " + m, color="cyan")
+
+    # parameter sanity
+    if args.max_alpha and 0 < args.max_alpha < args.step_alpha:
+        warn("--step-alpha is larger than --max-alpha; reducing step-alpha.")
+        args.step_alpha = args.max_alpha
 
     # wallet
     wallet = load_wallet(coldkey_name=args.wallet_name, hotkey_name=args.wallet_hotkey)
@@ -168,6 +173,28 @@ async def _monitor(args: argparse.Namespace):
             c0=D_START,
         )
         return tao_post
+
+    async def _min_allowed_alpha(price_tao: Decimal,
+                                 depth_rao: int) -> Decimal:
+        """Smallest α that creates ≥ MIN_TAO_ONCHAIN post‑slip."""
+        tao_for_step = await _alpha_to_tao_post(args.step_alpha, price_tao, depth_rao)
+        if tao_for_step >= MIN_TAO_ONCHAIN:
+            return args.step_alpha
+
+        # binary search for minimal α
+        lo = args.step_alpha
+        hi = lo * 2
+        while await _alpha_to_tao_post(hi, price_tao, depth_rao) < MIN_TAO_ONCHAIN:
+            lo, hi = hi, hi * 2
+
+        for _ in range(30):
+            mid = (lo + hi) / 2
+            tao_mid = await _alpha_to_tao_post(mid, price_tao, depth_rao)
+            if tao_mid < MIN_TAO_ONCHAIN:
+                lo = mid
+            else:
+                hi = mid
+        return hi
 
     # ─────────────────────────────────────── #
 
@@ -222,7 +249,7 @@ async def _monitor(args: argparse.Namespace):
             next_block = head + 1
             info(f"… scanned {len(raw)} new α‑transfer(s)")
 
-        # ───── reward engine – authoritative post‑slip TAO per miner ─────
+        # ───── reward engine ─────
         meta = await st.metagraph(args.meta_netuid)
         uid_of = {ck: uid for uid, ck in enumerate(meta.coldkeys)}.get
 
@@ -245,7 +272,7 @@ async def _monitor(args: argparse.Namespace):
         price_bal = await subnet_price(args.meta_netuid, st=st)
         sn73_price = Decimal(str(price_bal.tao)) if price_bal else Decimal(0)
 
-        # cached pricing / depth for our own subnet (for fast α→TAO)
+        # cached pricing / depth for our own subnet
         pb_self = await pricing_provider(args.netuid)
         depth_self = await depth_provider(args.netuid)
         if not pb_self or pb_self.tao == 0:
@@ -254,6 +281,8 @@ async def _monitor(args: argparse.Namespace):
             continue
         price_tao_self = Decimal(str(pb_self.tao))
 
+        min_alpha_chain = await _min_allowed_alpha(price_tao_self, depth_self)
+
         # ───── profit‑maximising bid calculation ─────
         async def _optimal_delta_alpha() -> Decimal:
             """Return how many *extra* α to send (0 if none)."""
@@ -261,12 +290,10 @@ async def _monitor(args: argparse.Namespace):
             others_now = total_tao - my_tao_spent
             others_future = others_now * args.safety_buffer
 
-            # special case: nobody else bids → send minimum α
+            # no‑one else bids
             if others_future == 0:
-                tao_for_min = await _alpha_to_tao_post(MIN_ALPHA, price_tao_self, depth_self)
-                if tao_for_min == 0:
-                    return Decimal(0)
-                return MIN_ALPHA if (alpha_sent + MIN_ALPHA) <= (args.max_alpha or Decimal("Infinity")) else Decimal(0)
+                return min_alpha_chain if (not args.max_alpha
+                                           or alpha_sent + min_alpha_chain <= args.max_alpha) else Decimal(0)
 
             # profit‑maximising spend
             bag_val = BAG_SN73 * sn73_price               # TAO value of the bag
@@ -282,24 +309,21 @@ async def _monitor(args: argparse.Namespace):
                 if m_disc < 0:
                     m_disc = Decimal(0)
 
-            # choose the smaller of the two bounds (but not below current spend)
+            # target spend
             target_my_tao = min(m_star, m_disc)
             if target_my_tao <= my_tao_spent:
                 return Decimal(0)
 
             delta_tao_needed = target_my_tao - my_tao_spent
 
-            # invert bond‑curve: find α such that post‑slip TAO == delta_tao_needed
-            # binary search between MIN_ALPHA and a doubling upper bound
+            # invert bond‑curve → α
             lo = Decimal("0")
-            hi = MIN_ALPHA
-            # ensure hi big enough
+            hi = min_alpha_chain
             while await _alpha_to_tao_post(hi, price_tao_self, depth_self) < delta_tao_needed:
                 lo, hi = hi, hi * 2
                 if args.max_alpha and (alpha_sent + hi) > args.max_alpha:
                     hi = args.max_alpha - alpha_sent
                     break
-            # precision search
             for _ in range(32):
                 mid = (lo + hi) / 2
                 tao_mid = await _alpha_to_tao_post(mid, price_tao_self, depth_self)
@@ -307,7 +331,8 @@ async def _monitor(args: argparse.Namespace):
                     lo = mid
                 else:
                     hi = mid
-            alpha_needed = max(MIN_ALPHA, hi)
+            alpha_needed = hi
+
             # obey global cap
             if args.max_alpha and (alpha_sent + alpha_needed) > args.max_alpha:
                 return Decimal(0)
@@ -323,7 +348,7 @@ async def _monitor(args: argparse.Namespace):
             if alpha_to_send == 0:
                 return
 
-            # simulate final discount after adding this α (safety check)
+            # safety check: discount after bid
             tao_new = await _alpha_to_tao_post(alpha_to_send, price_tao_self, depth_self)
             others_future = (total_tao - my_tao_spent) * args.safety_buffer
             tao_after = my_tao_spent + tao_new
