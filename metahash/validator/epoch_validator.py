@@ -104,7 +104,7 @@ class EpochValidatorNeuron(BaseValidatorNeuron):
             )
 
             # Sleep 2 blocks while ≥4 remain, otherwise 1 block
-            sleep_blocks = 5 if remain_blocks >= 4 else 1
+            sleep_blocks = 10 if remain_blocks >= 20 else 1
             await asyncio.sleep(sleep_blocks * BLOCKTIME * 0.98)
 
     # ----------------------------- run -------------------------------- #

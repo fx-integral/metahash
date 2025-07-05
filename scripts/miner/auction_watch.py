@@ -215,7 +215,7 @@ async def _monitor(args: argparse.Namespace):
             pool_depth_of=depth_provider,
             log=lambda m: info("FORECAST – " + m),
         )
-        tao_by_uid = {uid: r for uid, r in enumerate(rewards)}
+        tao_by_uid = {uid: Decimal(r) for uid, r in enumerate(rewards)}
         total_tao = sum(tao_by_uid.values())
         my_tao_spent = tao_by_uid.get(my_uid, Decimal(0)) if my_uid is not None else Decimal(0)
 
