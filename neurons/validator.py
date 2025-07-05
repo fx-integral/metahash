@@ -197,7 +197,7 @@ class Validator(EpochValidatorNeuron):
                 "Burn triggered – redirecting full emission to UID 0."
             )
             bt.logging.debug(
-                f"FORCE_BURN_WEIGHTS: {FORCE_BURN_WEIGHTS}. are_rewards_empty: {are_rewards_empty}. Auctions Started: {self.block < STARTING_AUCTIONS_BLOCK} ({self.block} - {STARTING_AUCTIONS_BLOCK})"
+                f"FORCE_BURN_WEIGHTS: {FORCE_BURN_WEIGHTS}. are_rewards_empty: {are_rewards_empty}. Auctions Have not started: {self.block < STARTING_AUCTIONS_BLOCK} ({self.block} - {STARTING_AUCTIONS_BLOCK})"
             )
 
             burn_weights = [1.0 if uid == 0 else 0.0 for uid in miner_uids]

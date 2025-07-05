@@ -49,7 +49,7 @@ def _arg_parser() -> argparse.ArgumentParser:
 
     # network / subnets
     p.add_argument("--network", default=DEFAULT_BITTENSOR_NETWORK)
-    p.add_argument("--netuid", type=int, required=True, help="Auction subnet uid")
+    p.add_argument("--netuid", type=int, required=True, help="Subnet to send alpha from")
     p.add_argument("--meta-netuid", type=int, default=73,
                    help="Subnet uid for UID look‑ups / reward forecast")
 
@@ -159,7 +159,7 @@ async def _monitor(args: argparse.Namespace):
     while True:
         print()
         head = await st.get_current_block()
-        tempo = await st.tempo(args.netuid)
+        tempo = await st.tempo(args.meta_netuid)
         epoch_len = tempo + 1
         epoch_start_now = head - (head % epoch_len)
 
