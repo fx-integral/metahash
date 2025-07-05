@@ -43,13 +43,13 @@ class EpochValidatorNeuron(BaseValidatorNeuron):
         tempo = self.subtensor.tempo(self.config.netuid) or 360
 
         try:
-            head      = self.subtensor.get_current_block()
+            head = self.subtensor.get_current_block()
             next_head = self.subtensor.get_next_epoch_start_block(self.config.netuid)
             if next_head is None:
                 raise ValueError("RPC returned None")
 
             derived = next_head - (head - head % tempo)
-            length  = derived if derived in (tempo, tempo + 1) else tempo + 1
+            length = derived if derived in (tempo, tempo + 1) else tempo + 1
         except Exception as e:
             bt.logging.warning(f"[epoch] RPC error while probing length: {e}")
             length = tempo + 1                       # safest guess
@@ -64,54 +64,51 @@ class EpochValidatorNeuron(BaseValidatorNeuron):
         Returns tuple: (head, epoch_start, epoch_end, epoch_index, epoch_len)
         using the *current* epoch length.
         """
-        blk  = self.subtensor.get_current_block()
+        blk = self.subtensor.get_current_block()
         ep_l = self._epoch_len or self._discover_epoch_length()
 
         start = blk - (blk % ep_l)
-        end   = start + ep_l - 1
-        idx   = blk // ep_l
+        end = start + ep_l - 1
+        idx = blk // ep_l
         return blk, start, end, idx, ep_l
 
     # ----------------------- async wait‑loop --------------------------- #
     async def _wait_for_next_head(self):
-        """
-        Sleep in short chunks until the first block of the next epoch,
-        emitting progress banners frequently.
-        """
+        """Sleep until the next epoch head, logging every 1–2 blocks."""
         netuid = self.config.netuid
 
         while not self.should_exit:
+            # Ask the chain when the next head should be
             try:
-                next_head = self.subtensor.get_next_epoch_start_block(netuid)
+                next_head_rpc = self.subtensor.get_next_epoch_start_block(netuid)
             except Exception as e:
                 bt.logging.warning(f"[epoch] RPC error: {e}")
-                next_head = None
+                next_head_rpc = None
 
             blk = self.subtensor.get_current_block()
 
-            # epoch head reached?
-            if next_head and blk >= next_head:
+            # Derive our *own* next‑head from the cached length
+            next_head_calc = (blk - (blk % self._epoch_len)) + self._epoch_len
+            next_head = next_head_rpc or next_head_calc      # fall back to calc
+
+            # If we’ve reached / passed the head → return to run() loop
+            if blk >= next_head:
                 return
 
-            # compute how many blocks remain / decide sleep size
-            if next_head:
-                remain = max(0, next_head - blk - 1)
-                sleep_blocks = (
-                    2 if remain >= 4 else 1           # 2 blocks far away, 1 block when close
-                )
-            else:
-                remain = -1
-                sleep_blocks = 1                      # conservative fallback
-
-            eta_s = remain * BLOCKTIME
+            # Progress print based on the locally derived value
+            remain_blocks = next_head_calc - blk
+            eta_s = remain_blocks * BLOCKTIME
             bt.logging.info(
-                f"[status] Block {blk:,} | {remain if remain>=0 else '?'} "
-                f"blocks → next epoch (~{eta_s//60:.0f} m {eta_s%60:02.0f} s)"
+                f"[status] Block {blk:,} | {remain_blocks} blocks → next epoch "
+                f"(~{eta_s//60:.0f} m {eta_s%60:02.0f} s)"
             )
 
-            await asyncio.sleep(sleep_blocks * BLOCKTIME * 0.98)  # small safety margin
+            # Sleep 2 blocks while ≥4 remain, otherwise 1 block
+            sleep_blocks = 5 if remain_blocks >= 4 else 1
+            await asyncio.sleep(sleep_blocks * BLOCKTIME * 0.98)
 
     # ----------------------------- run -------------------------------- #
+
     def run(self):  # noqa: D401
         bt.logging.info(
             f"EpochValidator starting at block {self.block:,} (netuid {self.config.netuid})"
@@ -121,8 +118,8 @@ class EpochValidatorNeuron(BaseValidatorNeuron):
             while not self.should_exit:
                 # snapshot + banner
                 blk, start, end, idx, ep_len = self._epoch_snapshot()
-                into  = blk - start
-                left  = end - blk + 1
+                into = blk - start
+                left = end - blk + 1
                 eta_s = left * BLOCKTIME
 
                 bt.logging.info(
@@ -141,9 +138,9 @@ class EpochValidatorNeuron(BaseValidatorNeuron):
 
                 # expose to subclasses
                 self.epoch_start_block = start2
-                self.epoch_end_block   = end2
-                self.epoch_index       = idx2
-                self.epoch_tempo       = ep_len2
+                self.epoch_end_block = end2
+                self.epoch_index = idx2
+                self.epoch_tempo = ep_len2
 
                 bt.logging.success(
                     f"[epoch {idx2}] head at block {blk2:,} ({head_time} UTC) – len={ep_len2}"
