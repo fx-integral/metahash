@@ -9,3 +9,4 @@ __pycache__/
 .vscode
 .hypothesis
 .pytest_cache
+local/

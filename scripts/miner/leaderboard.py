@@ -52,8 +52,6 @@ def _arg_parser() -> argparse.ArgumentParser:
     # network / subnets
     p.add_argument("--network", default=DEFAULT_BITTENSOR_NETWORK,
                    help="Bittensor network name or endpoint")
-    p.add_argument("--netuid", type=int, required=True,
-                   help="Subnet ID where the auction is happening")
     p.add_argument("--meta-netuid", type=int, default=73,
                    help="Subnet whose bag is distributed to winners (default 73)")
     # timing
@@ -124,7 +122,7 @@ async def _snapshot(args):
 
     # ---------- chain state ----------
     head = await st.get_current_block()
-    tempo = await st.tempo(args.netuid)           # tempo = epoch_len − 1
+    tempo = await st.tempo(args.meta_netuid)           # tempo = epoch_len − 1
     epoch_len = tempo + 1
     epoch_start = head - (head % epoch_len)
     auction_open = epoch_start + args.delay
@@ -202,7 +200,7 @@ async def _snapshot(args):
 
     # ---------- leaderboard ----------
     lb = Table(
-        title=f"Subnet {args.netuid} Leaderboard – Epoch {eid}",
+        title=f"Subnet {args.meta_netuid} Leaderboard – Epoch {eid}",
         header_style="bold magenta",
         box=MINIMAL_HEAVY_HEAD,
         show_lines=False,
