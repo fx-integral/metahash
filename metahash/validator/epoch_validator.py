@@ -1,6 +1,6 @@
-# ╭────────────────────────────────────────────────────────────────────────╮
-# metahash/validator/epoch_validator.py                                    #
-# ╰────────────────────────────────────────────────────────────────────────╯
+# ╭──────────────────────────────────────────────────────────────────────╮
+# metahash/validator/epoch_validator.py                                  #
+# ╰──────────────────────────────────────────────────────────────────────╯
 from __future__ import annotations
 
 import asyncio
@@ -9,13 +9,13 @@ from datetime import datetime
 from typing import Optional, Tuple
 
 import bittensor as bt
-from bittensor import BLOCKTIME  # 12 s on Finney
+from bittensor import BLOCKTIME  # 12 s on Finney
 
 from metahash.base.validator import BaseValidatorNeuron
 
 
 class EpochValidatorNeuron(BaseValidatorNeuron):
-    """Validator base-class with robust epoch rollover handling.
+    """Validator base‑class with robust epoch rollover handling.
 
     *Does not change the definition of epoch start/end – only how we wait
     for the next head so `forward()` is triggered in the very first
@@ -32,7 +32,7 @@ class EpochValidatorNeuron(BaseValidatorNeuron):
     # ----------------------- helpers ---------------------------------- #
     def _discover_epoch_length(self) -> int:
         """Return the real epoch length, compensating for historical
-        tempo + 1 bug. Re-evaluated at every head."""
+        tempo + 1 bug. Re‑evaluated at every head."""
         tempo = self.subtensor.tempo(self.config.netuid) or 360
         try:
             head = self.subtensor.get_current_block()
@@ -64,7 +64,7 @@ class EpochValidatorNeuron(BaseValidatorNeuron):
         self.epoch_end_block = end
         return blk, start, end, idx, ep_l
 
-    # ------------------------ wait-loop (patched) ---------------------- #
+    # ------------------------ wait‑loop (patched) ---------------------- #
     async def _wait_for_next_head(self):
         """Sleep until the *locally derived* next epoch head.
 
@@ -86,7 +86,7 @@ class EpochValidatorNeuron(BaseValidatorNeuron):
             eta_s = remain * BLOCKTIME
             bt.logging.info(
                 f"[status] Block {blk:,} | {remain} blocks → next epoch "
-                f"(~{eta_s // 60:.0f} m {eta_s % 60:02.0f} s)"
+                f"(~{eta_s // 60:.0f} m {eta_s % 60:02.0f} s)"
             )
 
             # Sleep a fraction of remaining blocks (1–30)
@@ -101,10 +101,10 @@ class EpochValidatorNeuron(BaseValidatorNeuron):
 
         async def _loop():
             while not self.should_exit:
-                # Snapshot -------------------------------------------------------
+                # Snapshot ---------------------------------------------------
                 blk, start, end, idx, ep_len = self._epoch_snapshot()
 
-                # ────────── Bootstrap: run forward immediately on first loop ──
+                # ───────── Bootstrap: run forward immediately on first loop ─
                 if not getattr(self, "_bootstrapped", False):
                     self.epoch_start_block = start
                     self.epoch_end_block = end
@@ -114,12 +114,12 @@ class EpochValidatorNeuron(BaseValidatorNeuron):
                     bt.logging.info("[bootstrap] running forward immediately")
                     try:
                         self.sync()
-                        await self.concurrent_forward()  # ← runs forward()
+                        await self.concurrent_forward()    # ← runs forward()
                     except Exception as e:
                         bt.logging.error(f"bootstrap forward failed: {e}")
 
                     self._bootstrapped = True
-                # ───────────────────────────────────────────────────────────────
+                # -----------------------------------------------------------
 
                 # Compute same target head used by the waiter for banners
                 next_head = start + ep_len
@@ -130,15 +130,15 @@ class EpochValidatorNeuron(BaseValidatorNeuron):
                 bt.logging.info(
                     f"[status] Block {blk:,} | Epoch {idx} "
                     f"[{into}/{ep_len} blocks] – next epoch in {left} "
-                    f"blocks (~{eta_s // 60:.0f} m {eta_s % 60:02.0f} s)"
+                    f"blocks (~{eta_s // 60:.0f} m {eta_s % 60:02.0f} s)"
                 )
 
-                # Wait for rollover ---------------------------------------------
+                # Wait for rollover -----------------------------------------
                 if not self.config.no_epoch:
                     await self._wait_for_next_head()
 
-                # -------- new epoch head ---------------------------------------
-                self._epoch_len = None  # force re-probe
+                # -------- new epoch head ------------------------------------
+                self._epoch_len = None  # force re‑probe
                 blk2, start2, end2, idx2, ep_len2 = self._epoch_snapshot()
                 head_time = datetime.utcnow().strftime("%H:%M:%S")
 
@@ -149,16 +149,19 @@ class EpochValidatorNeuron(BaseValidatorNeuron):
                 self.epoch_tempo = ep_len2
 
                 bt.logging.success(
-                    f"[epoch {idx2}] head at block {blk2:,} ({head_time} UTC) – len={ep_len2}"
+                    f"[epoch {idx2}] head at block {blk2:,} "
+                    f"({head_time} UTC) – len={ep_len2}"
                 )
 
-                # *** validator business logic ***********************************
+                # *** validator business logic *******************************
                 try:
-                    self.sync()  # refresh wallet / weights
+                    self.sync()                   # refresh wallet / weights
                     await self.concurrent_forward()
                 except Exception as err:
                     bt.logging.error(f"forward() raised: {err}")
-                    bt.logging.debug("".join(traceback.format_exception(err)))
+                    bt.logging.debug(
+                        "".join(traceback.format_exception(err))
+                    )
                 finally:
                     try:
                         self.sync()

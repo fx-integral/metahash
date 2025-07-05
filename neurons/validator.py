@@ -1,17 +1,17 @@
-# ╭────────────────────────────────────────────────────────────────────────╮
-# neurons/validator.py                                                     #
-# ╰────────────────────────────────────────────────────────────────────────╯
+# ╭──────────────────────────────────────────────────────────────────────╮
+# neurons/validator.py                                                   #
+# ╰──────────────────────────────────────────────────────────────────────╯
 from __future__ import annotations
 
 import asyncio
 import json
 import time
 from pathlib import Path
-from typing import Optional, Callable, List
+from typing import Optional, Callable, List, Union
 
 import bittensor as bt
 from metahash.base.utils.logging import ColoredLogger as clog
-from metahash.config import (                      # project-level constants
+from metahash.config import (                      # project‑level constants
     TREASURY_COLDKEY,
     AUCTION_DELAY_BLOCKS,
     FORCE_BURN_WEIGHTS,
@@ -21,18 +21,18 @@ from metahash.validator.rewards import compute_epoch_rewards, TransferEvent
 from metahash.validator.epoch_validator import EpochValidatorNeuron
 from metahash.utils.subnet_utils import average_price, average_depth
 
-# ────────────────────────── persistence constants ───────────────────────── #
+# ────────────────────────── persistence constants ────────────────────── #
 STATE_FILE = "last_epoch_state.json"           # tiny JSON state file
 STATE_KEY = "last_validated_epoch"
 
 
 class Validator(EpochValidatorNeuron):
     """
-    Adaptive validator – executes exactly ONCE per epoch head, even across
-    restarts, thanks to disk-based epoch deduplication.
+    Adaptive validator – executes exactly **once** per epoch head, even across
+    restarts, thanks to disk‑based epoch de‑duplication.
     """
 
-    # ───────────────────────── initialization ────────────────────────── #
+    # ───────────────────────── initialization ───────────────────────── #
     def __init__(self, config=None):
         super().__init__(config=config)
 
@@ -46,14 +46,34 @@ class Validator(EpochValidatorNeuron):
         self._async_subtensor: Optional[bt.AsyncSubtensor] = None
         self._last_validated_epoch: Optional[int] = self._load_last_epoch()
 
-    # ╭─────────────────────── persistence helpers ───────────────────────╮
+    # ╭─────────────────────── persistence helpers ─────────────────────╮
     def _state_path(self) -> Path:
-        """Path of the JSON state file (next to wallet hotkey by default)."""
-        wallet_root = Path(self.wallet.hotkey_file).expanduser().parent
+        """
+        Resolve the JSON state‑file path, irrespective of whether
+        `self.wallet.hotkey_file` is a plain string / `Path` or a
+        `bittensor.Keyfile` instance.
+
+        The directory is created on first use so writes never fail.
+        """
+        hotkey_file: Union[str, Path, "bt.Keyfile"] = self.wallet.hotkey_file
+
+        # ••• FIX ••• --------------------------------------------------- #
+        if isinstance(hotkey_file, (str, Path)):
+            hotkey_path = Path(hotkey_file)
+        else:
+            # Newer bittensor returns a Keyfile object
+            try:
+                hotkey_path = Path(hotkey_file.path)      # preferred
+            except AttributeError:
+                hotkey_path = Path(str(hotkey_file))      # best‑effort
+        # --------------------------------------------------------------- #
+
+        wallet_root = hotkey_path.expanduser().parent
+        wallet_root.mkdir(parents=True, exist_ok=True)     # ensure dir exists
         return wallet_root / STATE_FILE
 
     def _load_last_epoch(self) -> Optional[int]:
-        """Return the persisted last-validated epoch (or None)."""
+        """Return the persisted last‑validated epoch (or None)."""
         try:
             val = int(json.loads(self._state_path().read_text()).get(STATE_KEY))
             bt.logging.info(f"[state] loaded last epoch = {val}")
@@ -68,18 +88,18 @@ class Validator(EpochValidatorNeuron):
         except Exception as e:
             bt.logging.warning(f"[state] failed to store epoch {idx}: {e}")
 
-    # ╭────────────────── async-substrate helper ────────────────────────╮
+    # ╭────────────────── async‑substrate helper ───────────────────────╮
     async def _ensure_async_subtensor(self):
         if self._async_subtensor is None:
             stxn = bt.AsyncSubtensor(network=self.config.subtensor.network)
             await stxn.initialize()
             self._async_subtensor = stxn
 
-    # ╭──────────────────── providers & scanners ─────────────────────────╮
+    # ╭──────────────────── providers & scanners ────────────────────────╮
     def _make_scanner(self, async_subtensor: bt.AsyncSubtensor):
         """
         Wrap AlphaTransfersScanner → TransferEvent objects understood by the
-        pure-Python rewards pipeline.
+        pure‑Python rewards pipeline.
         """
         from metahash.validator.alpha_transfers import (
             AlphaTransfersScanner as _AlphaScanner,
@@ -91,13 +111,15 @@ class Validator(EpochValidatorNeuron):
             rpc_lock=self._rpc_lock,  # single websocket recv() lock
         )
 
-        outer = self  # capture Validator for UID→cold-key map
+        outer = self  # capture Validator for UID→cold‑key map
 
         class _Scanner:
-            async def scan(self, from_block: int, to_block: int) -> List[TransferEvent]:
+            async def scan(
+                self, from_block: int, to_block: int
+            ) -> List[TransferEvent]:
                 raw = await alpha_scanner.scan(from_block, to_block)
 
-                # Fast UID→cold-key map (may be missing for legacy chains)
+                # Fast UID→cold‑key map (may be missing for legacy chains)
                 uid2ck = outer.metagraph.coldkeys
 
                 def _uid_to_ck(uid: int | None) -> Optional[str]:
@@ -163,11 +185,13 @@ class Validator(EpochValidatorNeuron):
             return self._cold_to_uid_cache.get(coldkey)
 
         # initial cache
-        self._cold_to_uid_cache = {ck: uid for uid, ck in enumerate(self.metagraph.coldkeys)}
+        self._cold_to_uid_cache = {
+            ck: uid for uid, ck in enumerate(self.metagraph.coldkeys)
+        }
         self._ck_cache_size = len(self.metagraph.coldkeys)
         return _resolver
 
-    # ╭────────────────────────────── PHASE 1 ─────────────────────────────╮
+    # ╭────────────────────────────── PHASE 1 ───────────────────────────╮
     async def _set_weights_for_previous_epoch(
         self,
         prev_epoch_index: int,
@@ -180,14 +204,16 @@ class Validator(EpochValidatorNeuron):
         """
         if prev_epoch_index < 0 or prev_epoch_index == self._last_validated_epoch:
             bt.logging.error(
-                f"Phase 1 skipped – epoch {prev_epoch_index} already evaluated"
+                f"Phase 1 skipped – epoch {prev_epoch_index} already evaluated"
             )
             return
 
         miner_uids: list[int] = list(self.get_miner_uids())
 
-        # Honour auction delay: skip the first AUCTION_DELAY_BLOCKS blocks
-        scan_start_block = min(prev_start_block + AUCTION_DELAY_BLOCKS, prev_end_block)
+        # Honour auction delay: skip the first `AUCTION_DELAY_BLOCKS` blocks
+        scan_start_block = min(
+            prev_start_block + AUCTION_DELAY_BLOCKS, prev_end_block
+        )
 
         rewards = await compute_epoch_rewards(
             miner_uids=miner_uids,
@@ -206,9 +232,13 @@ class Validator(EpochValidatorNeuron):
 
         self._last_epoch_rewards = rewards
 
-        # Burn-all fallback
+        # Burn‑all fallback
         are_rewards_empty = not any(rewards)
-        if FORCE_BURN_WEIGHTS or are_rewards_empty or self.block < STARTING_AUCTIONS_BLOCK:
+        if (
+            FORCE_BURN_WEIGHTS
+            or are_rewards_empty
+            or self.block < STARTING_AUCTIONS_BLOCK
+        ):
             bt.logging.warning("Burn triggered – redirecting full emission to UID 0.")
             burn_weights = [1.0 if uid == 0 else 0.0 for uid in miner_uids]
             self.update_scores(burn_weights, miner_uids)
@@ -225,9 +255,9 @@ class Validator(EpochValidatorNeuron):
         self._last_validated_epoch = prev_epoch_index
         self._save_last_epoch(prev_epoch_index)
 
-    # ╭───────────────────────────── Main loop ────────────────────────────╮
+    # ╭────────────────────────────── Main loop ─────────────────────────╮
     async def forward(self) -> None:
-        """Runs once per epoch head – Phase 1 & extra logic."""
+        """Runs once per epoch head – Phase 1 & extra logic."""
         bt.logging.success(
             f"▶︎ forward() called at block {self.block:,} (epoch {self.epoch_index})"
         )
@@ -253,7 +283,7 @@ class Validator(EpochValidatorNeuron):
         )
 
         try:
-            clog.info("▶︎ Phase 1 – reward accounting", color="yellow")
+            clog.info("▶︎ Phase 1 – reward accounting", color="yellow")
             await self._set_weights_for_previous_epoch(
                 prev_epoch_index,
                 prev_start_block,
@@ -265,7 +295,7 @@ class Validator(EpochValidatorNeuron):
             bt.logging.error(f"forward() – unexpected exception: {err}")
             raise
 
-    # ╭────────────────────── clean shutdown helpers ───────────────────────╮
+    # ╭────────────────────── clean shutdown helpers ───────────────────╮
     async def _close_async_subtensor(self):
         if self._async_subtensor:
             try:
@@ -285,7 +315,7 @@ class Validator(EpochValidatorNeuron):
                 pass  # interpreter shutting down
 
 
-# ╭────────────────── production keep-alive (optional) ───────────────────╮
+# ╭────────────────── production keep‑alive (optional) ──────────────────╮
 if __name__ == "__main__":
     from metahash.bittensor_config import config
 

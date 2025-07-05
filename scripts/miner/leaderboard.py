@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # --------------------------------------------------------------------------- #
-#  leaderboard.py – v1.1                                                      #
+#  leaderboard.py – v1.2                                                      #
 #  Realtime subnet–auction dashboard (Rich)                                   #
 #                                                                             #
-#  Fixes:                                                                     #
-#    • Removed illegal “await” inside synchronous lambdas by using            #
-#      small async helpers produced with factory functions.                   #
-#    • Highlights your own coldkey row automatically if a wallet is given.    #
+#  Changes (v1.1 → v1.2):                                                     #
+#    • Added lightweight in‑memory cache so we *only* scan new blocks,        #
+#      avoiding expensive rescans.                                            #
+#    • Re‑used AsyncSubtensor and scanner across refreshes.                   #
+#    • Minor refactor: moved snapshot‑state variables into a tiny dict.       #
 # --------------------------------------------------------------------------- #
 from __future__ import annotations
 
@@ -14,7 +15,7 @@ import argparse
 import asyncio
 import statistics
 from decimal import Decimal, getcontext
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import bittensor as bt
 from metahash.config import (
@@ -46,7 +47,7 @@ bt.logging.set_info()
 # ═══════════════════════════ CLI ══════════════════════════════ #
 def _arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Realtime subnet-auction leaderboard",
+        description="Realtime subnet‑auction leaderboard",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     # network / subnets
@@ -65,7 +66,7 @@ def _arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--treasury", default=TREASURY_COLDKEY,
                    help="Coldkey that receives α bids (treasury)")
     p.add_argument("--my-coldkey", default=None,
-                   help="Highlight this coldkey’s row (auto-detected from wallet)")
+                   help="Highlight this coldkey’s row (auto‑detected from wallet)")
     p.add_argument("--wallet.name", dest="wallet_name", default=None,
                    help="Wallet coldkey name (for highlight)")
     p.add_argument("--wallet.hotkey", dest="wallet_hotkey", default=None,
@@ -115,18 +116,36 @@ def _make_depth_provider(st: bt.AsyncSubtensor, start: int, end: int):
 
 
 # ════════════════ snapshot (one render) ═════════════════ #
-async def _snapshot(args):
-    """Pull on-chain data once and render the summary + leaderboard."""
-    st = bt.AsyncSubtensor(network=args.network)
-    await st.initialize()
-
+async def _snapshot(
+    st: bt.AsyncSubtensor,
+    cache: Dict[str, object],
+    args: argparse.Namespace,
+):
+    """
+    Pull on‑chain data once and render the summary + leaderboard.
+    A small cache (events, last_scanned, etc.) is kept in memory so that
+    we *only* query blocks we have not seen yet.
+    """
     # ---------- chain state ----------
     head = await st.get_current_block()
-    tempo = await st.tempo(args.meta_netuid)           
+    tempo = await st.tempo(args.meta_netuid)
     epoch_len = tempo + 1
     epoch_start = head - (head % epoch_len)
     auction_open = epoch_start + args.delay
     eid = epoch_start // epoch_len
+
+    # New epoch? → reset cache
+    if cache.get("epoch_start") != epoch_start:
+        cache.clear()
+        cache.update({
+            "epoch_start": epoch_start,
+            "auction_open": auction_open,
+            "events": [],
+            "last_scanned": auction_open - 1,
+            # we’ll fill these lazily ↓
+            "scanner": None,
+            "meta": None,
+        })
 
     # ---------- display state banner ----------
     state = ("🟢 Auction active"
@@ -139,26 +158,38 @@ async def _snapshot(args):
         console.print(Panel("Auction has not opened yet.", style="yellow"))
         return
 
-    # ---------- scan α transfers in current auction ----------
-    scanner = AlphaTransfersScanner(st, dest_coldkey=args.treasury)
-    raw = await scanner.scan(auction_open, head)
-    events: List[TransferEvent] = [
-        TransferEvent(
-            src_coldkey=ev.src_coldkey,
-            dest_coldkey=ev.dest_coldkey or args.treasury,
-            subnet_id=ev.subnet_id,
-            amount_rao=ev.amount_rao,
-        )
-        for ev in raw
-    ]
+    # ---------- scanner (re‑use across refreshes) ----------
+    if cache["scanner"] is None:
+        cache["scanner"] = AlphaTransfersScanner(st, dest_coldkey=args.treasury)
+    scanner: AlphaTransfersScanner = cache["scanner"]  # type: ignore
 
-    # ---------- build providers (average over previous epoch) ----------
+    # ---------- scan only NEW blocks ----------
+    start_blk = cache["last_scanned"] + 1
+    if start_blk <= head:
+        new_raw = await scanner.scan(start_blk, head)
+        new_events = [
+            TransferEvent(
+                src_coldkey=ev.src_coldkey,
+                dest_coldkey=ev.dest_coldkey or args.treasury,
+                subnet_id=ev.subnet_id,
+                amount_rao=ev.amount_rao,
+            )
+            for ev in new_raw
+        ]
+        cache["events"].extend(new_events)
+        cache["last_scanned"] = head
+
+    events: List[TransferEvent] = cache["events"]
+
+    # ---------- providers (average over previous epoch) ----------
     start_prev, end_prev = max(0, epoch_start - epoch_len), epoch_start - 1
     pricing_provider = _make_pricing_provider(st, start_prev, end_prev)
     depth_provider = _make_depth_provider(st, start_prev, end_prev)
 
     # ---------- metagraph & reward computation ----------
-    meta = await st.metagraph(args.meta_netuid)
+    if cache["meta"] is None:
+        cache["meta"] = await st.metagraph(args.meta_netuid)
+    meta = cache["meta"]  # type: ignore
     uid_of = {ck: uid for uid, ck in enumerate(meta.coldkeys)}.get
 
     async def _uid_of_ck(ck):  # type: ignore[return-value]
@@ -244,9 +275,14 @@ async def _runner(args: argparse.Namespace):
         except Exception:
             pass  # ignore wallet load errors
 
+    st = bt.AsyncSubtensor(network=args.network)
+    await st.initialize()
+
+    cache: Dict[str, object] = {}
+
     while True:
         console.clear()
-        await _snapshot(args)
+        await _snapshot(st, cache, args)
         if not args.watch:
             break
         await asyncio.sleep(args.interval)
