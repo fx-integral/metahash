@@ -269,7 +269,7 @@ async def _runner(args: argparse.Namespace):
     # Highlight your own coldkey automatically if wallet provided
     if not args.my_coldkey and (args.wallet_name or args.wallet_hotkey):
         try:
-            w = load_wallet(args.wallet_name, args.wallet_hotkey)
+            w = load_wallet(args.wallet_name, args.wallet_hotkey, unlock=False)
             if w and w.coldkey:
                 args.my_coldkey = w.coldkey.ss58_address
         except Exception:
