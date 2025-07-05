@@ -16,8 +16,8 @@ PLANCK = 10**9
 
 # ─────────────────── 2.  BOND‑CURVE DESIGN TARGETS  ────────────────── #
 P_S_PAR: float = 1.0                       # spot‑parity (TAO ⇄ SN‑73)
-D_START: float = 0.10                      # 10 % apex discount
-D_TAIL_TARGET: float = 0.10                # 10 % tail discount just to start for simplicity
+D_START: float = 0.1                      # 10 % apex discount
+D_TAIL_TARGET: float = 0.2               # 10 % tail discount just to start for simplicity
 GAMMA_TARGET: float = 1.18                 # ≈ 15 % average discount
 GAMMA_TOL: float = 0.02
 BETA_NUDGE: float = 0.05
