@@ -1,160 +1,148 @@
-# MetaHash Miner Guide (Subnet 73)
+# ⛏️ MetaHash Miner Guide (Subnet 73)
 
-## 🎯 Should you be a miner?
+## 🤔 Should You Mine?
 
-Pls before start mining in sn73 ask you the following question:
-Do i want to sell OTC alpha of other subnets?
-I am willing to give a discount for it in exchange on not impacting the subnet pools. 
+Before you spin up a miner in **Subnet 73 (SN73)**, ask yourself:
 
-If yes, lets proceed
+> 💰 **Do I want to sell OTC α-tokens from other subnets?**  
+> Mining SN73 only makes sense if you hold surplus α-tokens from other subnets that you wish to liquidate at a discount instead of impacting their on-chain liquidity pools.
 
-## 🎯 How it works?
+**✅ If YES** → Proceed with this guide!  
+**❌ If NO** → Mining SN73 won't add value for you.
 
-**You're competing with other miners in auctions that happen each epoch where 148 sn73 alpha are auctioned and you get it proportional to how much tao value of alpha you sent**
+---
 
-- Bid against other miners every ~1 hour to win the bag (148 sn73 alpha)
-- Win proportional rewards based on your bid value
-- 148 SN73 tokens available per auction
+## ⚙️ How Subnet 73 Mining Works
 
-**What other miners do affect you as the bag is always 148 alpha but the total value provided depends on miner. So final discount is undertermined and depend on competition**
+Each epoch (~1 hour) an on-chain auction distributes **148 SN73 α-tokens** to miners, proportional to the total **τ-value** of α-tokens they supply from other subnets.
 
-## ⚡ Quick Start
+### 🔑 Key Points
+- 🪙 You bid with α-tokens *from any subnet except 73*
+- 📊 Your share of the 148 prize tokens is **proportional to your τ-value** at auction close
+- 🏁 The effective discount you get depends entirely on competition; more bidders → smaller discount
 
-**Step 1:** Decide which subnet alpha you want to sell OTC  
-<br>**Step 2:** Register on Subnet 73 a miner (one time only)  
-<br>**Step 3:** Make sure in the same COLDEY of you miner you have that alpha ready.
-**Step 4:** Once the auction start send alpha manually or use our scripts to help you
+```
+💰 payout = (your τ-value / total τ-value) × 148 SN73 α
+```
+
+---
+
+## 🚀 Quick Start
+
+1. **🎯 Decide** which subnet's α you want to sell  
+2. **📥 Install** the MetaHash tooling and dependencies  
+3. **📝 Register** your miner (one-time per `coldkey`)  
+4. **💰 Fund** the same `coldkey` with the α you intend to bid  
+5. **🎲 Bid** manually or automate with the provided scripts
 
 ```bash
-# Install
-git clone https://github.com/fx-integral/metahash/ && cd metahash
+# 📂 Clone & install
+git clone https://github.com/fx-integral/metahash.git && cd metahash
 python3 -m venv .venv && source .venv/bin/activate
 pip install uv && uv pip install -e .
 
-# Register (ONE TIME ONLY)
-btcli s register --netuid 73 --wallet.name YOUR_WALLET --wallet.hotkey YOUR_HOTKEY
-```
-
-## 🛠️ Mining Tools
-
-### Tool 1: Check Competition
-See who's winning and track performance:
-
-```bash
-python scripts/miner/leaderboard.py \
-    --meta-netuid 73 \
+# 🔐 One-time miner registration
+btcli s register \
+    --netuid 73 \
     --wallet.name YOUR_WALLET \
     --wallet.hotkey YOUR_HOTKEY
 ```
 
-### Tool 2: Auto-Bid (Recommended)
-Automatically compete in auctions:
+---
 
-```bash
-python scripts/miner/auction_watch.py \
-    --netuid SOURCE_SUBNET_ID \
-    --validator-hotkey VALIDATOR_HOTKEY_ADDRESS \
-    --wallet.name YOUR_WALLET \
-    --wallet.hotkey YOUR_HOTKEY \
-    --max-alpha MAX_ALPHA_PER_AUCTION \
-    --step-alpha BIDDING_INCREMENT \
-    --max-discount MINIMUM_DISCOUNT_THRESHOLD
-```
+## 🔧 Mining Tools
 
-**What it does:**
-- Watches for new auctions
-- Bids your alpha in small steps
-- Stops if discount gets too low
-- Prevents over-bidding
+| 🛠️ Tool | 📋 Purpose | 💻 Example |
+|---------|------------|------------|
+| **📊 Leaderboard** | Monitor current and historical winners | `python scripts/miner/leaderboard.py --meta-netuid 73 --wallet.name YOUR_WALLET --wallet.hotkey YOUR_HOTKEY` |
+| **🤖 Auto-Bidder** | Automatically watch auctions and place incremental bids while respecting a minimum discount | `python scripts/miner/auction_watch.py --netuid SOURCE_SUBNET_ID --validator-hotkey VALIDATOR_HOTKEY_ADDRESS --wallet.name YOUR_WALLET --wallet.hotkey YOUR_HOTKEY --max-alpha 100 --step-alpha 5 --max-discount 8` |
 
-
-## 📊 How Auctions Work
-
-### The Competition
-- **Who:** All miners registered on SN73
-- **When:** Every 361 blocks (~1 hour)
-- **Prize:** 148 SN73 alpha tokens
-- **How to win:** Send highest value alpha tokens
-- weights are given proportionally to total post slippage tao value sent by each miner coldkey to treasury
-
-### Example Auction
-```
-Total auction value: 100 alpha tokens
-Your bid: 20 alpha tokens  
-Your share: 20% × 148 = 29.6 SN73 tokens
-```
-
-
-## ✅ Rules & Restrictions
-
-### ✅ ALLOWED
-- Send alpha from any subnet except 73
-- Bid on multiple auctions
-- Use automated scripts
-
-### ⚠️ FORBIDDEN
-- Cannot send SN73 alpha to auctions
-- Only ONE registration per coldkey
-
-### 🎯 GOAL
-- Maximize value of alpha sent
-- Beat other miners in auctions
-
-## 💡 Winning Strategies
-
-### Be Fast
-- **Bid early** for better discounts
-- **Use automation** to beat manual traders
-- **Monitor constantly** for new auctions
-
-### Be Smart
-- **Set minimum discounts** (don't accept bad deals)
-- **Watch competition levels** before bidding
-- **Use surplus alpha only** (don't hurt your main subnet)
-
-### Be Safe
-- **⚠️ Stop if over-subscribed** (you get nothing if auction is too full)
-- **⚠️ Track your performance** (learn what works)
-- **⚠️ Start small** (test before going big)
-
-## 🔥 Common Scenarios
-
-### 🟢 Good Auction (Low Competition)
-- Few miners bidding
-- You get good discount
-- High returns
-
-### 🟡 Busy Auction (High Competition)  
-- Many miners bidding
-- Lower discount
-- Still profitable if you're strategic
-
-### 🔴 Bad Auction (Over-Subscribed)
-- Too many miners bidding
-- Late bidders destroy the discount for everyone
-- Everyone gets worse deals
-
-## 🚀 Getting Started
-
-1. **Mine other subnets first** to get alpha tokens
-2. **Register on SN73** (remember: only once per coldkey)
-3. **Start with small bids** to learn the market
-4. **Use the leaderboard** to study competition
-5. **Scale up** as you get more confident
-
-## 📋 Requirements
-
-- Python 3.10+
-- Alpha tokens from other subnets
-- Configured btcli wallet
-- Basic understanding of auctions
-
-## 🔗 Resources
-
-- [GitHub Repository](https://github.com/fx-integral/metahash/)
-- [Bittensor Docs](https://docs.bittensor.com/)
-- [Technical Specs](https://github.com/fx-integral/metahash/blob/main/docs/sn73-specs.md)
+### 🤖 Auto-Bidder Workflow
+- ▶️ Starts bidding when a new auction opens
+- 📈 Increases bids in step-alpha increments until reaching max-alpha or max-discount
+- 🛑 Stops automatically when the discount becomes unattractive
 
 ---
 
-**💡 Pro Tip:** Start by running the leaderboard script to watch a few auctions before jumping in. Learn the patterns, then start bidding small amounts to get experience!
+## 🎯 Auction Mechanics
+
+- **⏰ Frequency**: Every 361 blocks (~1 hour)
+- **🏆 Prize Pool**: 148 SN73 α-tokens
+- **✅ Eligibility**: Any miner registered on SN73
+- **⚖️ Weighting**: Payouts proportional to each miner's τ-contribution
+
+### 📊 Example
+
+| 📈 Metric | 💰 Value |
+|-----------|----------|
+| Total τ-value | 100 α |
+| Your bid | 20 α |
+| Your share | 20% × 148 = **29.6 SN73 α** |
+
+---
+
+## 📜 Rules & Restrictions
+
+| ✅ **Allowed** | ❌ **Forbidden** |
+|----------------|------------------|
+| 🪙 α-tokens from any subnet except 73 | 🚫 Sending SN73 α back into the auction |
+| 🔄 Multiple concurrent auctions | 🚫 More than one registration per coldkey |
+| 🤖 Automation and custom scripts | — |
+
+> 🎯 **Goal**: Maximise the τ-value you send while paying the lowest discount.
+
+---
+
+## 🏆 Winning Strategies
+
+### ⚡ Be Fast
+- 🚀 Bid early to lock higher discounts
+- 🤖 Automate to stay ahead of manual competitors
+
+### 🧠 Be Smart
+- 🎯 Define a minimum acceptable discount and step-alpha to avoid over-bidding
+- 👀 Monitor the leaderboard before each auction to gauge competition
+- 💡 Only bid surplus α to avoid harming your main subnet
+
+### 🛡️ Be Safe
+- 🛑 Abort when an auction becomes over-subscribed—late bids can dilute everyone's discount
+- 📊 Track your ROI across multiple epochs; refine parameters gradually
+- 🐣 Start small; scale after several successful runs
+
+---
+
+## 📊 Typical Auction Scenarios
+
+| 🎯 Scenario | 🔍 Indicators | 📈 Outcome |
+|-------------|---------------|------------|
+| 🟢 **Low Competition** | 👥 Few miners, thin τ-value | 💰 Deep discount, high returns |
+| 🟡 **Moderate Competition** | 👥👥 Several miners, rising τ-value | 📊 Reduced but still positive discount |
+| 🔴 **Over-Subscribed** | 👥👥👥 Many miners join late | 💸 Discount collapses; you may earn nothing |
+
+---
+
+## ✅ Getting Started Checklist
+
+- [ ] 🪙 Acquire α-tokens on other subnets
+- [ ] 👛 Prepare a wallet (wallet.name) and hotkey (wallet.hotkey)
+- [ ] 📝 Register on SN73 once
+- [ ] 👀 Observe several auctions via the leaderboard
+- [ ] ⚙️ Configure and dry-run the auto-bidder
+- [ ] 📈 Scale up bids as confidence grows
+
+---
+
+## 📋 Requirements
+
+- 🐍 Python ≥ 3.10
+- 👛 btcli wallet set up
+- 🪙 α-tokens from subnets other than 73
+- 🧠 Basic understanding of Dutch/weighted auctions
+
+---
+
+## 🔗 Resources
+
+- 📁 **GitHub**: https://github.com/fx-integral/metahash/
+- 📚 **Bittensor Docs**: https://docs.bittensor.com/
+- 📋 **SN73 Technical Specs**: https://github.com/fx-integral/metahash/blob/main/docs/sn73-specs.md
