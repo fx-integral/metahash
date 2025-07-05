@@ -20,7 +20,6 @@ import argparse
 import asyncio
 import json
 import logging
-import os
 import time
 from collections import defaultdict
 from decimal import Decimal, getcontext
@@ -183,8 +182,8 @@ async def _monitor(args: argparse.Namespace):
     )
     debug = logging.getLogger("watch").debug
 
-    def warn(m): return clog.warning(m)  # colored warning
-    def info(m): return clog.info(m, color="cyan")
+    def warn(m): return clog.warning("[auction] " + m)  # colored warning
+    def info(m): return clog.info("[auction] " + m, color="cyan")
 
     # ───────── wallet ─────────
     wallet = load_wallet(coldkey_name=args.wallet_name , hotkey_name=args.wallet_hotkey)
@@ -249,6 +248,9 @@ async def _monitor(args: argparse.Namespace):
             depth_provider = _make_depth_provider(st, prev_start, prev_end)
 
             meta = await st.metagraph(args.netuid)
+            print(meta.hotkeys)
+            input()
+
             uid_resolver = {ck: uid for uid, ck in enumerate(meta.coldkeys)}.get
             my_uid = uid_resolver(wallet.coldkey.ss58_address) if wallet.coldkey.ss58_address else None
             info(f"⟫ NEW EPOCH {epoch_start // epoch_len} [{_format_epoch_range(epoch_start, epoch_len)}]")
@@ -264,7 +266,7 @@ async def _monitor(args: argparse.Namespace):
         # incremental scan
         if next_block <= head:
             debug(f"Scanning transfers {next_block}→{head}")
-            raw = await scanner.scan(next_block, head)
+            raw = await scanner.scan(next_block, head + AUCTION_DELAY_BLOCKS)
             for ev in raw:
                 src_ck = ev.src_coldkey or ""
                 a_tao = Decimal(ev.amount_rao) / RAO_PER_TAO
