@@ -225,6 +225,8 @@ async def average_depth(
                 "get_subnet_alpha_in_at",
                 params=[netuid, blk],
             )
+            print(depth_rao)
+            input()
             return int(depth_rao)
         except Exception:
             # Fallback to storage query (slower, but exists everywhere)

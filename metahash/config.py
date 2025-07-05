@@ -7,7 +7,7 @@ load_dotenv()
 
 # ─────────────────── 1.  NETWORK‑LEVEL CONSTANTS  ──────────────────── #
 TREASURY_COLDKEY: str = "5GW6xj5wUpLBz7jCNp38FzkdS6DfeFdUTuvUjcn6uKH5krsn"
-STARTING_AUCTIONS_BLOCK = int(os.getenv("STARTING_ACTIONS_BLOCK","5_917_314"))
+STARTING_AUCTIONS_BLOCK = int(os.getenv("STARTING_ACTIONS_BLOCK","5_931_714"))
 AUCTION_DELAY_BLOCKS: int = 50
 FORBIDDEN_ALPHA_SUBNETS: list[int] = [73]
 FORCE_BURN_WEIGHTS = True

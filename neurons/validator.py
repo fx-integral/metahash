@@ -11,18 +11,9 @@ from typing import Optional
 import bittensor as bt
 from metahash.base.utils.logging import ColoredLogger as clog
 from metahash.config import (
-    BAG_SN73, P_S_PAR,
-    ADJUST_BOND_CURVE,
-    D_START, D_TAIL_TARGET,
-    GAMMA_TARGET,
     TREASURY_COLDKEY,
     AUCTION_DELAY_BLOCKS,
     FORCE_BURN_WEIGHTS,
-)
-from metahash.utils.bond_utils import (
-    beta_from_gamma,
-    curve_params,
-    get_bond_curve,
 )
 from metahash.validator.rewards import (
     compute_epoch_rewards,
@@ -53,24 +44,8 @@ class Validator(EpochValidatorNeuron):
         self._async_subtensor: Optional[bt.AsyncSubtensor] = None
         self._last_validated_epoch: Optional[int] = None
 
-        # Bond‑curve Updating
-        self.gamma: float = GAMMA_TARGET
-        # Tail discount must be *smaller* than the apex discount
-        self.r_min_factor: float = (1 - D_TAIL_TARGET) / (1 - D_START)
-        assert self.r_min_factor <= 1.0, "r_min must not exceed c0"
-
-        # Snapshot of the curve for *this* epoch
-        curve = get_bond_curve()
-        self._beta_current: float = curve.beta
-        self._c0_current: float = curve.c0
-        self._r_min_current: float = curve.r_min
-        self._curve_params = (
-            self._beta_current,
-            self._c0_current,
-            self._r_min_current,
-        )
-
     # ╭────────────────── async‑substrate helper ───────────────────────╮
+
     async def _ensure_async_subtensor(self):
         if self._async_subtensor is None:
             stxn = bt.AsyncSubtensor(network=self.config.subtensor.network)
@@ -151,6 +126,7 @@ class Validator(EpochValidatorNeuron):
             )
 
         return _depth
+
     # ----------------------------------------------------------------------- #
 
     def _make_uid_resolver(self) -> callable:
@@ -237,26 +213,8 @@ class Validator(EpochValidatorNeuron):
         # Any additional controller logic
         self._last_validated_epoch = prev_epoch_index
 
-    # ╭────────────────────────────── PHASE 2 ─────────────────────────────╮
-    def _maybe_update_curve(self) -> None:
-        if not ADJUST_BOND_CURVE:
-            clog.debug("Bond‑curve auto‑tune disabled.")
-            return
-
-        beta = beta_from_gamma(BAG_SN73, D_START, self.gamma)
-        c0, r_min = curve_params(P_S_PAR, D_START, self.r_min_factor)
-        self._beta_current, self._c0_current, self._r_min_current = (
-            beta,
-            c0,
-            r_min,
-        )
-        self._curve_params = (beta, c0, r_min)
-        clog.info(
-            f"Bond‑curve set: β={beta:.6g}, c0={c0:.4f}, r_min={r_min:.4f}",
-            color="cyan",
-        )
-
     # ╭───────────────────────────── Main loop ────────────────────────────╮
+
     async def forward(self) -> None:
         await self._ensure_async_subtensor()
         current_start = self.epoch_start_block
@@ -279,9 +237,6 @@ class Validator(EpochValidatorNeuron):
                 prev_end_block,
                 self._async_subtensor,
             )
-
-            clog.info("▶︎ Phase 2 – bond‑curve auto‑tune", color="yellow")
-            self._maybe_update_curve()
 
         except Exception as err:
             bt.logging.error(f"forward() – unexpected exception: {err}")
