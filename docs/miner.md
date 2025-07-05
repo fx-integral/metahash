@@ -1,19 +1,29 @@
 # MetaHash Miner Guide (Subnet 73)
 
-## 🎯 What You're Doing
+## 🎯 Should you be a miner?
 
-**You're competing with other miners in auctions to win SN73 rewards.**
+Pls before start mining in sn73 ask you the following question:
+Do i want to sell OTC alpha of other subnets?
+I am willing to give a discount for it in exchange on not impacting the subnet pools. 
 
-- Trade your alpha tokens from other subnets (SN1, SN33, etc.)
-- Bid against other miners every ~1 hour
+If yes, lets proceed
+
+## 🎯 How it works?
+
+**You're competing with other miners in auctions that happen each epoch where 148 sn73 alpha are auctioned and you get it proportional to how much tao value of alpha you sent**
+
+- Bid against other miners every ~1 hour to win the bag (148 sn73 alpha)
 - Win proportional rewards based on your bid value
 - 148 SN73 tokens available per auction
 
+**What other miners do affect you as the bag is always 148 alpha but the total value provided depends on miner. So final discount is undertermined and depend on competition**
+
 ## ⚡ Quick Start
 
-**Step 1:** Get alpha tokens from other subnets first  
-<br>**Step 2:** Register on Subnet 73 (one time only)  
-**Step 3:** Use our scripts to compete in auctions
+**Step 1:** Decide which subnet alpha you want to sell OTC  
+<br>**Step 2:** Register on Subnet 73 a miner (one time only)  
+<br>**Step 3:** Make sure in the same COLDEY of you miner you have that alpha ready.
+**Step 4:** Once the auction start send alpha manually or use our scripts to help you
 
 ```bash
 # Install
@@ -23,21 +33,6 @@ pip install uv && uv pip install -e .
 
 # Register (ONE TIME ONLY)
 btcli s register --netuid 73 --wallet.name YOUR_WALLET --wallet.hotkey YOUR_HOTKEY
-```
-
-## 📊 How Auctions Work
-
-### The Competition
-- **Who:** All miners registered on SN73
-- **When:** Every 361 blocks (~1 hour)
-- **Prize:** 148 SN73 alpha tokens
-- **How to win:** Send highest value alpha tokens
-
-### Example Auction
-```
-Total auction value: 100 alpha tokens
-Your bid: 20 alpha tokens  
-Your share: 20% × 148 = 29.6 SN73 tokens
 ```
 
 ## 🛠️ Mining Tools
@@ -71,6 +66,24 @@ python scripts/miner/auction_watch.py \
 - Bids your alpha in small steps
 - Stops if discount gets too low
 - Prevents over-bidding
+
+
+## 📊 How Auctions Work
+
+### The Competition
+- **Who:** All miners registered on SN73
+- **When:** Every 361 blocks (~1 hour)
+- **Prize:** 148 SN73 alpha tokens
+- **How to win:** Send highest value alpha tokens
+- weights are given proportionally to total post slippage tao value sent by each miner coldkey to treasury
+
+### Example Auction
+```
+Total auction value: 100 alpha tokens
+Your bid: 20 alpha tokens  
+Your share: 20% × 148 = 29.6 SN73 tokens
+```
+
 
 ## ✅ Rules & Restrictions
 

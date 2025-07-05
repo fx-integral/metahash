@@ -226,7 +226,7 @@ def config():
     parser.add_argument(
         "--no_epoch",
         action="store_true",      # becomes True if flag is present
-        default=True,            # otherwise remains False
+        default=False,            # otherwise remains False
         help="Enable mock mode (no real chain calls).",
     )
 
