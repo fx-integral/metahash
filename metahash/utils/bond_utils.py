@@ -43,8 +43,15 @@ def _curve_rate(
 ) -> float:
     if m < 0:
         raise ValueError("m must be ≥ 0")
-    rate = c0 / (1.0 + beta * m) if beta * m <= 1.0 else c0 / (1.0 + beta * m * m)
-    return max(r_min, rate)
+
+    if beta * m <= 1.0:
+        rate = c0 / (1.0 + beta * m)
+    else:
+        rate = c0 / (1.0 + beta * m * m)
+
+    # Clamp to the legal range [r_min, 1.0]
+    return max(r_min, min(rate, 1.0))
+
 
 # ───────────────────────── bond-curve dataclass ──────────────────────── #
 

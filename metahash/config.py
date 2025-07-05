@@ -12,7 +12,7 @@ AUCTION_DELAY_BLOCKS: int = 50
 FORBIDDEN_ALPHA_SUBNETS: list[int] = [73]
 FORCE_BURN_WEIGHTS = True
 DEFAULT_NETWORK: str = os.getenv("BITTENSOR_NETWORK","finney")
-
+PLANCK = 10**9
 
 # ─────────────────── 2.  BOND‑CURVE DESIGN TARGETS  ────────────────── #
 P_S_PAR: float = 1.0                       # spot‑parity (TAO ⇄ SN‑73)
@@ -48,5 +48,7 @@ LOG_EVERY: int = 5_000
 
 DEFAULT_NETUID: int = 73
 MAX_CONCURRENCY = 5  # Blocks requested in parallel
+
+# ───────────────────────── 7.  Testing  ─────────────────────── #
 
 TEST_TREASURY = "5DLULtxCS9vA3pZRgSTd9gkvGrUwgNje2TNQeLibo9wUWjSS"

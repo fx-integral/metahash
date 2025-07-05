@@ -1,7 +1,6 @@
 # ╭────────────────────────────────────────────────────────────────────────╮
 # neurons/validator.py                                                     #
-# Patched 2025‑07‑03 – restored pricing/depth providers,                   #
-#                       always pass them to rewards pipeline               #
+# Patched 2025‑07‑03 – scanner now passes src/dest cold‑keys through      #
 # ╰────────────────────────────────────────────────────────────────────────╯
 from __future__ import annotations
 
@@ -57,7 +56,9 @@ class Validator(EpochValidatorNeuron):
 
         # Bond‑curve Updating
         self.gamma: float = GAMMA_TARGET
-        self.r_min_factor: float = (1 - D_START) / (1 - D_TAIL_TARGET)
+        # Tail discount must be *smaller* than the apex discount
+        self.r_min_factor: float = (1 - D_TAIL_TARGET) / (1 - D_START)
+        assert self.r_min_factor <= 1.0, "r_min must not exceed c0"
 
         # Snapshot of the curve for *this* epoch
         curve = get_bond_curve()
@@ -93,16 +94,30 @@ class Validator(EpochValidatorNeuron):
             rpc_lock=self._rpc_lock,  # single websocket recv() lock
         )
 
+        outer = self                 # capture Validator for UID→cold‑key map
+
         class _Scanner:
             async def scan(self, from_block: int, to_block: int):
                 raw = await alpha_scanner.scan(from_block, to_block)
+
+                # Fast UID→cold‑key map (may be missing for legacy chains)
+                uid2ck = outer.metagraph.coldkeys
+
+                def _uid_to_ck(uid: int | None) -> str:
+                    try:
+                        return uid2ck[uid] if uid is not None and uid >= 0 else None
+                    except IndexError:
+                        return None
+
                 return [
                     TransferEvent(
-                        coldkey=ev.dest_coldkey or "",
+                        src_coldkey=ev.src_coldkey or _uid_to_ck(ev.from_uid),
+                        dest_coldkey=ev.dest_coldkey or outer.treasury_coldkey,
                         subnet_id=ev.subnet_id,
                         amount_rao=ev.amount_rao,
                     )
                     for ev in raw
+                    if (ev.src_coldkey or _uid_to_ck(ev.from_uid)) is not None
                 ]
 
         return _Scanner()
@@ -114,9 +129,6 @@ class Validator(EpochValidatorNeuron):
         start_block: int,
         end_block: int,
     ):
-        """
-        Average TAO/α price across *start_block..end_block* inclusive.
-        """
         async def _pricing(subnet_id: int, *_unused):
             return await average_price(
                 subnet_id,
@@ -124,7 +136,7 @@ class Validator(EpochValidatorNeuron):
                 end_block=end_block,
                 st=async_subtensor,
             )
-        return _pricing  # NOTE: **return the function object – no ()**
+        return _pricing
 
     def _make_pool_depth_provider(
         self,
@@ -132,9 +144,6 @@ class Validator(EpochValidatorNeuron):
         start_block: int,
         end_block: int,
     ):
-        """
-        Average α‑stake depth across *start_block..end_block* inclusive.
-        """
         async def _depth(subnet_id: int) -> int:
             return await average_depth(
                 subnet_id,
@@ -143,7 +152,7 @@ class Validator(EpochValidatorNeuron):
                 st=async_subtensor,
             )
 
-        return _depth    # return the coroutine‑compatible callable
+        return _depth
     # ----------------------------------------------------------------------- #
 
     def _make_uid_resolver(self) -> callable:
@@ -228,7 +237,7 @@ class Validator(EpochValidatorNeuron):
             or not any(epoch_out.weights)
             or current_block < STARTING_AUCTIONS_BLOCK
         ):
-            bt.logging.error(
+            bt.logging.warning(
                 "Burn triggered – redirecting full emission to UID 0."
             )
             burn_weights = [1.0 if uid == 0 else 0.0 for uid in miner_uids]

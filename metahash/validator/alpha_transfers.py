@@ -1,6 +1,7 @@
 # ====================================================================== #
 #  metahash/validator/alpha_transfers.py                                 #
-#  Patched 2025‑07‑03 – serialise every RPC call via an asyncio.Lock     #
+#  Patched 2025‑07‑03 – explicit src/dest cold‑keys in TransferEvent     #
+#                        – serialise every RPC call via an asyncio.Lock  #
 #                        – use α‑amount from StakeAdded instead of TAO   #
 # ====================================================================== #
 
@@ -36,8 +37,12 @@ class TransferEvent:
     from_uid: int
     to_uid: int
     subnet_id: int
+    # NOTE: Despite the name this now carries the amount of **α** (in RAO).
     amount_rao: int
+    # Explicit cold‑keys
+    src_coldkey: Optional[str]
     dest_coldkey: Optional[str]
+    src_coldkey_raw: Optional[bytes]
     dest_coldkey_raw: Optional[bytes]
 
 
@@ -135,7 +140,9 @@ def _parse_stake_transferred(
         to_uid=to_uid,
         subnet_id=subnet_id,
         amount_rao=amount_placeholder,
+        src_coldkey=_encode_ss58(from_coldkey_raw, fmt),
         dest_coldkey=_encode_ss58(dest_coldkey_raw, fmt),
+        src_coldkey_raw=from_coldkey_raw,
         dest_coldkey_raw=dest_coldkey_raw,
     )
 
@@ -151,7 +158,6 @@ def _amount_from_stake_added(params) -> int:  # noqa: ANN001
     Empirically the amount sits at index 3 for v9+ chains; if that fails we
     fall back to index 2 for older chains.
     """
-
     return int(_f(params, 3, _f(params, 2, 0)))
 
 
@@ -201,7 +207,7 @@ class AlphaTransfersScanner:
         if frm > to:
             return []
 
-        safe_to = max(frm - 1, to)
+        safe_to = to
         if safe_to < frm:
             return []
 
@@ -335,7 +341,8 @@ class AlphaTransfersScanner:
             if dump:
                 bt.logging.info(
                     f"[blk {block_hint_single}] StakeTransferred uid={te.from_uid}→{te.to_uid} "
-                    f"dest={_mask(te.dest_coldkey)} amt={te.amount_rao} "
+                    f"src={_mask(te.src_coldkey)} dest={_mask(te.dest_coldkey)} "
+                    f"amt={te.amount_rao} "
                     f"{'KEPT' if matches else 'SKIP'}"
                 )
 

@@ -1,7 +1,7 @@
 # ╭────────────────────────────────────────────────────────────────────────╮
 # metahash/validator/rewards.py            Epoch reward‑calculation logic
+# Patched 2025‑07‑03 – explicit src/dest cold‑keys in TransferEvent
 # ╰────────────────────────────────────────────────────────────────────────╯
-
 
 from __future__ import annotations
 
@@ -15,26 +15,26 @@ from typing import (
     Iterable,
     List,
     Mapping,
+    Optional,
     Protocol,
     Sequence,
     Tuple,
-    Optional,
     runtime_checkable,
 )
-
+import time
 import bittensor as bt
 from metahash.config import (
     K_SLIP,
     SLIP_TOLERANCE,
-    FORBIDDEN_ALPHA_SUBNETS,  # ← NEW
+    FORBIDDEN_ALPHA_SUBNETS,
 )
 
 # ───────────────────────────── GLOBAL CONSTANTS ────────────────────────── #
 
 getcontext().prec = 60  # 60‑digit arithmetic precision
 
-PLANCK: int = 10**18
-DECIMALS: Decimal = Decimal(10) ** 18
+PLANCK: int = 10**9
+DECIMALS: Decimal = Decimal(10) ** 9
 
 # Keep monetary constants in Decimal space
 K_SLIP_D: Decimal = Decimal(str(K_SLIP))
@@ -74,7 +74,16 @@ class MinerResolver(Protocol):
 
 @dataclass(slots=True, frozen=True)
 class TransferEvent:
-    coldkey: str
+    """
+    A single α‑stake transfer credited to the treasury.
+
+    • **src_coldkey**  – cold‑key that *paid* the α (miner’s key)
+    • **dest_coldkey** – cold‑key that *received* the α (treasury)
+    • **subnet_id**    – originating subnet
+    • **amount_rao**   – α amount in planck (RAO)
+    """
+    src_coldkey: str
+    dest_coldkey: str
     subnet_id: int
     amount_rao: int
 
@@ -84,7 +93,7 @@ class TransferEvent:
 
 @dataclass(slots=True)
 class AlphaDeposit:
-    coldkey: str
+    coldkey: str          # *origin* cold‑key (credited miner)
     subnet_id: int
     alpha_raw: int
 
@@ -173,7 +182,7 @@ def cast_events(events: Sequence[TransferEvent]) -> List[AlphaDeposit]:
             continue
         kept.append(
             AlphaDeposit(
-                coldkey=ev.coldkey,
+                coldkey=ev.src_coldkey,     # reward goes to *origin* miner
                 subnet_id=ev.subnet_id,
                 alpha_raw=ev.amount_rao,
             )
@@ -300,7 +309,7 @@ def aggregate_miner_rewards(
     deposits: Iterable[AlphaDeposit],
 ) -> Dict[int, Decimal]:
     """
-    Map of {uid → SN‑73}.  
+    Map of {uid → SN‑73}.
     Unknown miners’ awards are burned (UID 0).
     """
     by_uid: Dict[int, Decimal] = {}
@@ -394,40 +403,54 @@ async def compute_epoch_rewards(
             f"[rewards] Scanning transfers on‑chain "
             f"({start_block}-{end_block})…"
         )
-        raw = await scan_transfers(scanner=scanner,
-                                   from_block=start_block,
-                                   to_block=end_block)
+        start_time = time.time()
+        raw = await scan_transfers(
+            scanner=scanner,
+            from_block=start_block,
+            to_block=end_block,
+        )
+        bt.logging.info(f"Time took to scan transfers: {time.time() - start_time}s")
 
     # 2. CAST (forbidden subnet filter) ------------------------------------ #
     bt.logging.info("[rewards] Casting events…")
     deposits = cast_events(raw)
+    bt.logging.info(f"[rewards] Deposits: {deposits}")
 
     # 3. RESOLVE MINERS ----------------------------------------------------- #
     bt.logging.info("[rewards] Resolving miner UIDs…")
     await resolve_miners(deposits, uid_of_coldkey=uid_of_coldkey)
+    bt.logging.info(f"[rewards] Deposits with miners: {deposits}")
 
     # 4. COMBINE ------------------------------------------------------------ #
     bt.logging.info("[rewards] Combining deposits per miner/subnet…")
     deposits = _combine_deposits_by_miner_subnet(deposits)
+    bt.logging.info(f"[rewards] Combined deposits: {deposits}")
 
     # 5. PRICE -------------------------------------------------------------- #
     bt.logging.info("[rewards] Attaching prices…")
-    await attach_prices(deposits,
-                        pricing=pricing,
-                        epoch_start=start_block,
-                        epoch_end=end_block)
+    await attach_prices(
+        deposits,
+        pricing=pricing,
+        epoch_start=start_block,
+        epoch_end=end_block,
+    )
+    bt.logging.info(f"[rewards] Deposits with prices attached: {deposits}")
 
     # 6. SLIPPAGE ----------------------------------------------------------- #
     bt.logging.info("[rewards] Applying slippage with averaged depths…")
     await apply_slippage(deposits, pool_depth_of=pool_depth_of)
+    bt.logging.info(f"[rewards] Deposits with slippages attached: {deposits}")
 
     # 7. BOND CURVE --------------------------------------------------------- #
     bt.logging.info("[rewards] Applying bond curve…")
-    allocate_bond_curve(deposits=deposits,
-                        bag_sn73=bag_sn73,
-                        c0=c0,
-                        beta=beta,
-                        r_min=r_min)
+    allocate_bond_curve(
+        deposits=deposits,
+        bag_sn73=bag_sn73,
+        c0=c0,
+        beta=beta,
+        r_min=r_min,
+    )
+    bt.logging.info(f"[rewards] Deposits Bond Curve applied: {deposits}")
 
     # 8. AGGREGATION -------------------------------------------------------- #
     rewards_per_miner = aggregate_miner_rewards(deposits)
@@ -439,14 +462,15 @@ async def compute_epoch_rewards(
     surplus = bag - sum(rewards_per_miner.values())
     if surplus > 0:
         rewards_per_miner[0] = rewards_per_miner.get(0, Decimal(0)) + surplus
-    bt.logging.info(
-        f"[rewards] Surplus to burn: {surplus} (bag {bag})"
-    )
+    bt.logging.info(f"[rewards] Surplus to burn: {surplus} (bag {bag})")
 
     # 9. NORMALISATION ------------------------------------------------------ #
-    weights = build_weights(rewards=rewards_per_miner,
-                            miner_uids=miner_uids,
-                            burn_uid=0)
+    weights = build_weights(
+        rewards=rewards_per_miner,
+        miner_uids=miner_uids,
+        burn_uid=0,
+    )
+    bt.logging.info(f"[rewards] Weights: {weights}")
 
     issued = float(sum(rewards_per_miner.values()))
     (log or bt.logging.info)(
