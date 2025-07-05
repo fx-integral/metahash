@@ -209,7 +209,7 @@ class Validator(EpochValidatorNeuron):
 
         # Normal path
         self.update_scores(rewards, miner_uids)
-        # self.set_weights()
+        self.set_weights()
 
         # Any additional controller logic
         self._last_validated_epoch = prev_epoch_index
