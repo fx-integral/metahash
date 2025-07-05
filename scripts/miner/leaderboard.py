@@ -122,7 +122,7 @@ async def _snapshot(args):
 
     # ---------- chain state ----------
     head = await st.get_current_block()
-    tempo = await st.tempo(args.meta_netuid)           # tempo = epoch_len − 1
+    tempo = await st.tempo(args.meta_netuid)           
     epoch_len = tempo + 1
     epoch_start = head - (head % epoch_len)
     auction_open = epoch_start + args.delay

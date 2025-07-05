@@ -130,7 +130,7 @@ def _parse_stake_transferred(
     hotkey_staked_to = _account_id(_f(params, 2))  # noqa: F841 – kept for dbg
 
     subnet_id = int(_f(params, 3, -1))
-    from_uid = subnet_id  # kept for backward compat
+    from_uid = subnet_id  
     to_uid = int(_f(params, 4, -1))
     amount_placeholder = int(_f(params, 5, 0))  # TAO amount – **will be patched**
 
