@@ -66,30 +66,30 @@ class EpochValidatorNeuron(BaseValidatorNeuron):
 
     # ------------------------ wait‑loop (patched) ---------------------- #
     async def _wait_for_next_head(self):
-        """Sleep until the *locally derived* next epoch head.
+        """Sleep until the *first block* of the next epoch.
 
-        We do **not** trust the RPC’s `get_next_epoch_start_block` value
-        because it sometimes jumps ahead by an extra epoch and prevents
-        `forward()` from ever firing. By relying solely on local math we
-        guarantee exactly one execution per epoch.
+        We compute the target head **once**, outside the loop, so that the
+        comparison remains stable and we return exactly at the epoch head.
         """
+        head_block = self.subtensor.get_current_block()
+        ep_l = self._epoch_len or self._discover_epoch_length()
+
+        # first block of the next epoch
+        target_head = head_block - (head_block % ep_l) + ep_l
+
         while not self.should_exit:
             blk = self.subtensor.get_current_block()
-            ep_l = self._epoch_len or self._discover_epoch_length()
+            if blk >= target_head:
+                return  # ← will be True exactly ONCE, at the head
 
-            # first block of next epoch
-            next_head = blk - (blk % ep_l) + ep_l
-            if blk >= next_head:
-                return
-
-            remain = next_head - blk
+            remain = target_head - blk
             eta_s = remain * BLOCKTIME
             bt.logging.info(
                 f"[status] Block {blk:,} | {remain} blocks → next epoch "
                 f"(~{eta_s // 60:.0f} m {eta_s % 60:02.0f} s)"
             )
 
-            # Sleep a fraction of remaining blocks (1–30)
+            # Sleep a fraction of remaining blocks (1–30) to keep logs fresh
             sleep_blocks = max(1, min(30, remain // 2))
             await asyncio.sleep(sleep_blocks * BLOCKTIME * 0.95)
 

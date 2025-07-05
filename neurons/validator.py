@@ -11,7 +11,7 @@ from typing import Optional, Callable, List, Union
 
 import bittensor as bt
 from metahash.base.utils.logging import ColoredLogger as clog
-from metahash.config import (                      # project‑level constants
+from metahash.config import (             # project‑level constants
     TREASURY_COLDKEY,
     AUCTION_DELAY_BLOCKS,
     FORCE_BURN_WEIGHTS,
@@ -28,8 +28,8 @@ STATE_KEY = "last_validated_epoch"
 
 class Validator(EpochValidatorNeuron):
     """
-    Adaptive validator – executes exactly **once** per epoch head, even across
-    restarts, thanks to disk‑based epoch de‑duplication.
+    Adaptive validator – executes exactly **once** per epoch head, even
+    across restarts, thanks to disk‑based epoch de‑duplication.
     """
 
     # ───────────────────────── initialization ───────────────────────── #
@@ -57,19 +57,17 @@ class Validator(EpochValidatorNeuron):
         """
         hotkey_file: Union[str, Path, "bt.Keyfile"] = self.wallet.hotkey_file
 
-        # ••• FIX ••• --------------------------------------------------- #
+        # The hotkey may be a plain path or a `bittensor.Keyfile` object.
         if isinstance(hotkey_file, (str, Path)):
             hotkey_path = Path(hotkey_file)
-        else:
-            # Newer bittensor returns a Keyfile object
+        else:  # Newer bittensor returns a Keyfile object
             try:
                 hotkey_path = Path(hotkey_file.path)      # preferred
             except AttributeError:
                 hotkey_path = Path(str(hotkey_file))      # best‑effort
-        # --------------------------------------------------------------- #
 
         wallet_root = hotkey_path.expanduser().parent
-        wallet_root.mkdir(parents=True, exist_ok=True)     # ensure dir exists
+        wallet_root.mkdir(parents=True, exist_ok=True)    # ensure dir exists
         return wallet_root / STATE_FILE
 
     def _load_last_epoch(self) -> Optional[int]:
@@ -265,8 +263,6 @@ class Validator(EpochValidatorNeuron):
         await self._ensure_async_subtensor()
         current_start = self.epoch_start_block
         prev_start_block = current_start - self.epoch_tempo
-        if prev_start_block is None:
-            prev_start_block = current_start - (self.epoch_tempo + 1)
         prev_end_block = current_start - 1
         prev_epoch_index = self.epoch_index - 1
 

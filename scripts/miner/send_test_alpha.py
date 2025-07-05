@@ -12,6 +12,10 @@ from metahash.utils.wallet_utils import transfer_alpha
 from dotenv import load_dotenv
 from loguru import logger
 from metahash.config import TREASURY_COLDKEY
+from metahash.config import (
+    DEFAULT_BITTENSOR_NETWORK,
+)
+
 
 load_dotenv()
 
@@ -107,7 +111,7 @@ if __name__ == "__main__":
     p.add_argument("--dest", default=TREASURY_COLDKEY)
     p.add_argument("--amount", type=float, default=10)
     p.add_argument("--netuid",type=int)
-    p.add_argument("--network", default="test")
+    p.add_argument("--network", default=DEFAULT_BITTENSOR_NETWORK)
     p.add_argument("--wait-final", action="store_true")
     p.add_argument("--log-level", default="DEBUG", help="DEBUG, INFO, WARNING …")
     args = p.parse_args()
