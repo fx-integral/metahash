@@ -160,7 +160,7 @@ class Validator(EpochValidatorNeuron):
         Reward accounting for the *previous* epoch and score update.
         """
         if prev_epoch_index < 0 or prev_epoch_index == self._last_validated_epoch:
-            bt.logging.error("Phase 1 skipped – epoch calculation mismatch")
+            bt.logging.error("Phase 1 skipped – epoch already evaluated")
             return
 
         miner_uids: list[int] = list(self.get_miner_uids())

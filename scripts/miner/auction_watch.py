@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 # --------------------------------------------------------------------------- #
-#  auction_watch.py – v7  (rich margin logging)                               #
+#  auction_watch.py – v8  (Rich table output)                                 #
 # --------------------------------------------------------------------------- #
 from __future__ import annotations
 
 import argparse
 import asyncio
 import math
-import time
-from collections import defaultdict
 from decimal import Decimal, getcontext
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 import bittensor as bt
 from metahash.config import (
@@ -23,6 +21,13 @@ from metahash.utils.colors import ColoredLogger as clog
 from metahash.utils.subnet_utils import average_price, average_depth, subnet_price
 from metahash.validator.rewards import compute_epoch_rewards, TransferEvent
 from metahash.utils.wallet_utils import load_wallet, transfer_alpha
+
+# ───── Rich for pretty tables ───── #
+from rich.console import Console
+from rich.table import Table
+from rich import box
+
+console = Console()
 
 # ───────────────────────── precision / constants ────────────────────────── #
 getcontext().prec = 60
@@ -46,7 +51,7 @@ def _arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--network", default=DEFAULT_BITTENSOR_NETWORK)
     p.add_argument("--netuid", type=int, required=True, help="Auction subnet uid")
     p.add_argument("--meta-netuid", type=int, default=73,
-                   help="Subnet uid used for UID look‑ups / reward forecast")
+                   help="Subnet uid for UID look‑ups / reward forecast")
 
     # timing
     p.add_argument("--delay", type=int, default=AUCTION_DELAY_BLOCKS)
@@ -91,10 +96,12 @@ def _status(head: int, open_: int, start: int, length: int) -> str:
             f"(Block {head}) │ {blocks_left} blk left")
 
 
-def _fmt_margin(margin: Decimal) -> str:
-    if margin >= 0:
-        return f"profit {margin:.2%}"
-    return f"discount {(-margin):.2%}"
+def _fmt_margin(m: Decimal, colour=True) -> str:
+    if m >= 0:
+        text = f"profit {m:.2%}"
+        return f"[green]{text}[/green]" if colour else text
+    text = f"discount {(-m):.2%}"
+    return f"[red]{text}[/red]" if colour else text
 
 # ─────────────────── providers (for rewards calc) ─────────────────── #
 
@@ -156,6 +163,7 @@ async def _monitor(args: argparse.Namespace):
         epoch_len = tempo + 1
         epoch_start_now = head - (head % epoch_len)
 
+        # ───────── epoch rollover ─────────
         if epoch_start != epoch_start_now:
             epoch_start = epoch_start_now
             auction_open = epoch_start + args.delay
@@ -179,6 +187,7 @@ async def _monitor(args: argparse.Namespace):
             await asyncio.sleep(args.interval)
             continue
 
+        # ───────── scan unprocessed blocks ─────────
         if next_block <= head:
             info(f"Scanner: frm={next_block}  to={head}")
             raw = await scanner.scan(next_block, head)
@@ -194,6 +203,7 @@ async def _monitor(args: argparse.Namespace):
             next_block = head + 1
             info(f"… scanned {len(raw)} new α‑transfer(s)")
 
+        # ───────── recompute rewards & margins ─────────
         meta = await st.metagraph(args.meta_netuid)
         uid_of = {ck: uid for uid, ck in enumerate(meta.coldkeys)}.get
 
@@ -208,6 +218,7 @@ async def _monitor(args: argparse.Namespace):
             end_block=head,
             pool_depth_of=depth_provider,
         )
+
         tao_by_uid = {uid: Decimal(r) for uid, r in enumerate(rewards)}
         total_tao = sum(tao_by_uid.values())
         my_tao_spent = tao_by_uid.get(my_uid, Decimal(0)) if my_uid is not None else Decimal(0)
@@ -216,12 +227,11 @@ async def _monitor(args: argparse.Namespace):
         sn73_price = Decimal(str(price_bal.tao)) if price_bal else Decimal(0)
         bag_value = BAG_SN73 * sn73_price
 
-        # global & personal margins
         global_margin = (bag_value / total_tao - 1) if total_tao else Decimal(0)
         my_reward_tau = bag_value * (my_tao_spent / total_tao) if total_tao else Decimal(0)
         my_margin = (my_reward_tau / my_tao_spent - 1) if my_tao_spent else Decimal(0)
 
-        # ───── optimal α calculation ─────
+        # ───────── optimal α calculation ─────────
         def _optimal_extra_alpha() -> Decimal:
             others_now = total_tao - my_tao_spent
             others_future = others_now * args.safety_buffer
@@ -233,8 +243,8 @@ async def _monitor(args: argparse.Namespace):
             if m_star < 0:
                 m_star = Decimal(0)
 
-            m_disc = (bag_value / (1 - args.max_discount) -
-                      others_future) if args.max_discount < 1 else Decimal("Infinity")
+            m_disc = (bag_value / (1 - args.max_discount)
+                      - others_future) if args.max_discount < 1 else Decimal("Infinity")
             if m_disc < 0:
                 m_disc = Decimal(0)
 
@@ -253,15 +263,37 @@ async def _monitor(args: argparse.Namespace):
         future_margin = (bag_value / future_total - 1) if future_total else global_margin
         loss_after = max(Decimal(0), 1 - bag_value / future_total) if future_total else Decimal(0)
 
-        # ───── display key stats ─────
-        info(f"GLOBAL | spent {total_tao:.6f} TAO  |  bag {bag_value:.6f} TAO  |  "
-             f"{_fmt_margin(global_margin)}")
-        info(f"MY     | spend {my_tao_spent:.6f} TAO  →  reward {my_reward_tau:.6f} TAO  "
-             f"({_fmt_margin(my_margin)})")
-        info(f"OPTIMAL extra α this round: {extra_alpha}  "
-             f"(future {_fmt_margin(future_margin)})")
+        # ───────── rich table output ─────────
+        table = Table(
+            title=f"Subnet {args.netuid}  |  Block {head}",
+            box=box.MINIMAL_HEAVY_HEAD,
+            show_header=True,
+            header_style="bold magenta",
+        )
+        table.add_column("Category", justify="left")
+        table.add_column("Spend (TAO)", justify="right")
+        table.add_column("Value (TAO)", justify="right")
+        table.add_column("Margin", justify="right")
 
-        # ───── maybe bid ─────
+        table.add_row(
+            "GLOBAL",
+            f"{total_tao:.6f}",
+            f"{bag_value:.6f}",
+            _fmt_margin(global_margin),
+        )
+        table.add_row(
+            "ME",
+            f"{my_tao_spent:.6f}",
+            f"{my_reward_tau:.6f}",
+            _fmt_margin(my_margin),
+        )
+        console.print(table)
+        console.print(
+            f"[cyan]OPTIMAL extra α:[/] {extra_alpha}    "
+            f"(future {_fmt_margin(future_margin)})\n"
+        )
+
+        # ───────── maybe bid ─────────
         if autobid and extra_alpha > 0 and loss_after <= args.max_discount:
             try:
                 ok = await transfer_alpha(
@@ -281,7 +313,7 @@ async def _monitor(args: argparse.Namespace):
                 alpha_sent += extra_alpha
                 clog.success(f"AUTO‑BID sent {extra_alpha} α "
                              f"(cum {alpha_sent}) "
-                             f"{_fmt_margin(future_margin)}")
+                             f"{_fmt_margin(future_margin, colour=False)}")
 
         await asyncio.sleep(args.interval)
 

@@ -358,5 +358,6 @@ async def compute_epoch_rewards(
     ]
     total_value = sum(rewards_list_float)
     bt.logging.info(f"[rewards] total_value: {total_value}")
+    bt.logging.info(f"[rewards] Rewards: {rewards_list_float}")
 
     return rewards_list_float
