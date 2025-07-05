@@ -14,6 +14,7 @@ from metahash.config import (
     TREASURY_COLDKEY,
     AUCTION_DELAY_BLOCKS,
     FORCE_BURN_WEIGHTS,
+    STARTING_AUCTIONS_BLOCK
 )
 from metahash.validator.rewards import (
     compute_epoch_rewards,
@@ -189,7 +190,7 @@ class Validator(EpochValidatorNeuron):
 
         # Burn‑all fallback
         are_rewards_empty = not any(rewards)
-        if FORCE_BURN_WEIGHTS or are_rewards_empty:
+        if FORCE_BURN_WEIGHTS or are_rewards_empty or self.block < STARTING_AUCTIONS_BLOCK:
             bt.logging.warning(
                 "Burn triggered – redirecting full emission to UID 0."
             )
