@@ -170,8 +170,6 @@ class Validator(EpochValidatorNeuron):
             prev_start_block + AUCTION_DELAY_BLOCKS, prev_end_block
         )
 
-        beta_prev, c0_prev, r_min_prev = self._curve_params
-
         rewards = await compute_epoch_rewards(
             miner_uids=miner_uids,
             scanner=self._make_scanner(async_subtensor),
