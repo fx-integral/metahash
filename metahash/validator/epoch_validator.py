@@ -12,9 +12,11 @@ from metahash.base.validator import BaseValidatorNeuron
 
 
 class EpochValidatorNeuron(BaseValidatorNeuron):
-    """
-    Validator base-class with automatic epoch-length detection and
-    rock-solid rollover handling.
+    """Validator base‑class with robust epoch rollover handling.
+
+    *Does not change the definition of epoch start/end – only how we wait
+    for the next head so `forward()` is triggered in the very first
+    blocks of every epoch.*
     """
 
     # ------------------------------------------------------------------ #
@@ -22,10 +24,12 @@ class EpochValidatorNeuron(BaseValidatorNeuron):
         super().__init__(*args, **kwargs)
         self._log_interval_blocks = max(1, int(log_interval_blocks))
         self._epoch_len: Optional[int] = None        # recalculated each epoch
-        self.epoch_end_block: Optional[int] = None   # tracked for the waiter
+        self.epoch_end_block: Optional[int] = None   # cached for waiter
 
     # ----------------------- helpers ---------------------------------- #
     def _discover_epoch_length(self) -> int:
+        """Return the real epoch length, compensating for the historical
+        tempo + 1 bug.  Re‑evaluated at every head."""
         tempo = self.subtensor.tempo(self.config.netuid) or 360
         try:
             head = self.subtensor.get_current_block()
@@ -45,6 +49,7 @@ class EpochValidatorNeuron(BaseValidatorNeuron):
         return length
 
     def _epoch_snapshot(self) -> Tuple[int, int, int, int, int]:
+        """Return (head, start, end, index, length) for the *current* epoch."""
         blk = self.subtensor.get_current_block()
         ep_l = self._epoch_len or self._discover_epoch_length()
 
@@ -52,26 +57,29 @@ class EpochValidatorNeuron(BaseValidatorNeuron):
         end = start + ep_l - 1
         idx = blk // ep_l
 
-        # remember epoch end for waiter
+        # Cache epoch end for the waiter
         self.epoch_end_block = end
-
         return blk, start, end, idx, ep_l
 
-    # ----------------------- async wait-loop --------------------------- #
+    # ----------------------- async wait‑loop --------------------------- #
     async def _wait_for_next_head(self):
-        """
-        Sleep until the real next epoch head, updating the target every
-        iteration so we never overshoot.
+        """Sleep until the next epoch head.
+
+        We *anchor* to the locally derived value (`epoch_end_block + 1`).
+        If the chain RPC reports a *later* head we trust that; if it
+        reports an earlier one we ignore it – this avoids mis‑triggering
+        `forward()` before the real rollover and keeps the epoch banners
+        consistent with chain reality on Finney.
         """
         netuid = self.config.netuid
         target = (self.epoch_end_block or 0) + 1
 
         while not self.should_exit:
-            # authoritative value from chain
+            # Ask chain – but only accept *later* targets
             try:
                 rpc_head = self.subtensor.get_next_epoch_start_block(netuid)
-                if rpc_head:
-                    target = min(target, rpc_head)
+                if rpc_head and rpc_head > target:
+                    target = rpc_head
             except Exception as e:
                 bt.logging.debug(f"[epoch] RPC error while fetching next head: {e}")
 
@@ -86,6 +94,7 @@ class EpochValidatorNeuron(BaseValidatorNeuron):
                 f"(~{eta_s//60:.0f} m {eta_s%60:02.0f} s)"
             )
 
+            # Sleep a fraction of the remaining blocks (1–30)
             sleep_blocks = max(1, min(30, remain_blocks // 2))
             await asyncio.sleep(sleep_blocks * BLOCKTIME * 0.95)
 
@@ -100,12 +109,13 @@ class EpochValidatorNeuron(BaseValidatorNeuron):
                 # Snapshot -------------------------------------------------------
                 blk, start, end, idx, ep_len = self._epoch_snapshot()
 
-                # agree on target head for consistent banners
+                # Compute the same target head used by the waiter (see comment
+                # in _wait_for_next_head) so banners always agree.
                 try:
                     rpc_head = self.subtensor.get_next_epoch_start_block(self.config.netuid)
                 except Exception:
                     rpc_head = None
-                target_head = min(end + 1, rpc_head) if rpc_head else end + 1
+                target_head = rpc_head if rpc_head and rpc_head > end + 1 else end + 1
 
                 into = blk - start
                 left = max(1, target_head - blk)
@@ -122,7 +132,7 @@ class EpochValidatorNeuron(BaseValidatorNeuron):
                     await self._wait_for_next_head()
 
                 # -------- new epoch head ---------------------------------------
-                self._epoch_len = None                       # force re-probe
+                self._epoch_len = None                       # force re‑probe
                 blk2, start2, end2, idx2, ep_len2 = self._epoch_snapshot()
                 head_time = datetime.utcnow().strftime("%H:%M:%S")
 
