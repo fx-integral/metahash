@@ -271,8 +271,8 @@ async def _monitor(args: argparse.Namespace):
             header_style="bold magenta",
         )
         table.add_column("Category", justify="left")
-        table.add_column("Spend (TAO)", justify="right")
-        table.add_column("Value (TAO)", justify="right")
+        table.add_column("Sent (TAO)", justify="right")
+        table.add_column("Auction Value (TAO)", justify="right")
         table.add_column("Margin", justify="right")
 
         table.add_row(
