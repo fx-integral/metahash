@@ -313,4 +313,4 @@ if __name__ == "__main__":
     with Validator(config=config()) as validator:
         while True:
             clog.info("Validator Running…", color="gray")
-            time.sleep(15)
+            time.sleep(120)
