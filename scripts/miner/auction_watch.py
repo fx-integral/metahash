@@ -12,6 +12,8 @@
 #               (e.g. 10 == 10 %), not as a fraction (0.1)                    #
 #             • 2025‑07‑05 (UI) status line now shows                         #
 #               <auction‑state> | Epoch <id> [start–end] (Block <head>)       #
+#  2025‑07‑05 (REF) introduce --meta-netuid to decouple meta‑subnet from      #
+#               auction subnet; all weight/reward calculations use it.        #
 # --------------------------------------------------------------------------- #
 
 from __future__ import annotations
@@ -39,7 +41,6 @@ from metahash.utils.bond_utils import get_bond_curve, quote_alpha_cost
 from metahash.utils.wallet_utils import load_wallet, transfer_alpha
 from metahash.config import DEFAULT_BITTENSOR_NETWORK
 
-
 # ───────────────────────── precision / constants ────────────────────────── #
 
 getcontext().prec = 60
@@ -54,7 +55,7 @@ def _arg_parser() -> argparse.ArgumentParser:
     """
     Build the argument parser.
 
-    NOTE: --max-discount is now specified in **percent** (e.g. 10, 20),
+    NOTE: --max-discount is specified in **percent** (e.g. 10, 20),
     not as a fraction (0.1, 0.2).  The value is converted to a
     fraction after parsing so all internal code still works on fractions.
     """
@@ -69,7 +70,18 @@ def _arg_parser() -> argparse.ArgumentParser:
 
     # subnet / auction timing
     p.add_argument(
-        "--netuid", type=int, default=73, help="Subnet uid whose auction you monitor / bid on"
+        "--netuid",
+        type=int,
+        default=73,
+        help="Subnet uid whose auction you monitor / bid in (α is sold here)",
+    )
+    p.add_argument(
+        "--meta-netuid",
+        type=int,
+        default=73,
+        help="Subnet uid whose metagraph is used for UID look‑ups, weights and "
+             "reward forecasting (defaults to 73).  This may differ from "
+             "--netuid, which is the auction target subnet.",
     )
     p.add_argument(
         "--delay",
@@ -142,7 +154,7 @@ def _arg_parser() -> argparse.ArgumentParser:
 # ──────────────────── helper functions ────────────────────── #
 
 def _format_epoch_range(start: int, length: int) -> str:
-    """`start` and `length` → `"<start>-<end>"`"""
+    """Return formatted epoch range '<start>-<end>'."""
     return f"{start}-{start + length - 1}"
 
 
@@ -171,7 +183,6 @@ def _status_line(
 
 async def _monitor(args: argparse.Namespace):
     # ───────── convert CLI percent → fraction ─────────
-    # (if user typed 10 we want 0.10 internally)
     args.max_discount = args.max_discount / Decimal(100)
 
     # ───────── logging ─────────
@@ -186,7 +197,7 @@ async def _monitor(args: argparse.Namespace):
     def info(m): return clog.info("[auction] " + m, color="cyan")
 
     # ───────── wallet ─────────
-    wallet = load_wallet(coldkey_name=args.wallet_name , hotkey_name=args.wallet_hotkey)
+    wallet = load_wallet(coldkey_name=args.wallet_name, hotkey_name=args.wallet_hotkey)
 
     autobid_enabled = bool(wallet and args.validator_hotkey)
 
@@ -217,19 +228,19 @@ async def _monitor(args: argparse.Namespace):
     step_alpha_tao: Decimal = args.step_alpha
     alpha_sent_tao: Decimal = Decimal(0)
 
-    info(f"Auction target subnet = {args.netuid}")
+    info(f"Auction target subnet = {args.netuid}  |  meta subnet = {args.meta_netuid}")
     if autobid_enabled:
-        info("[auction]"
-             f"Auto‑bid ON → step={step_alpha_tao} α, "
-             f"max={max_alpha_tao or '∞'} α, "
-             f"max_discount={args.max_discount:.2%}"
-             )
+        info(
+            f"Auto‑bid ON → step={step_alpha_tao} α, "
+            f"max={max_alpha_tao or '∞'} α, "
+            f"max_discount={args.max_discount:.2%}"
+        )
 
     # ───────── main loop ─────────
     while True:
         print()
         head = await st.get_current_block()
-        tempo = await st.tempo(args.netuid)
+        tempo = await st.tempo(args.netuid)      # tempo of the **auction subnet**
         epoch_len = tempo + 1
         epoch_start_now = head - (head % epoch_len)
 
@@ -247,9 +258,9 @@ async def _monitor(args: argparse.Namespace):
             pricing_provider = _make_pricing_provider(st, prev_start, prev_end)
             depth_provider = _make_depth_provider(st, prev_start, prev_end)
 
-            meta = await st.metagraph(args.netuid)
-            print(meta.hotkeys)
-            input()
+            # ── metagraph is always taken from *meta‑netuid* ──
+            meta = await st.metagraph(args.meta_netuid)
+            # diagnostic / can be removed
 
             uid_resolver = {ck: uid for uid, ck in enumerate(meta.coldkeys)}.get
             my_uid = uid_resolver(wallet.coldkey.ss58_address) if wallet.coldkey.ss58_address else None
@@ -284,7 +295,7 @@ async def _monitor(args: argparse.Namespace):
             next_block = head + 1
             debug(f"Processed {len(raw)} α‑transfer(s)")
 
-        # reward forecast
+        # reward forecast (always on meta subnet)
         try:
             curve = get_bond_curve()
 
@@ -295,7 +306,7 @@ async def _monitor(args: argparse.Namespace):
                 def get_miner_uids(self):
                     return self._uids
 
-            meta = await st.metagraph(args.netuid)
+            meta = await st.metagraph(args.meta_netuid)
             uid_resolver = {ck: uid for uid, ck in enumerate(meta.coldkeys)}.get
 
             async def _uid_of_ck(ck):
@@ -317,7 +328,9 @@ async def _monitor(args: argparse.Namespace):
             )
             forecast_weights = forecast.weights
             forecast_rewards = forecast.rewards_per_miner
-            my_forecast_reward = forecast_rewards.get(my_uid, Decimal(0)) if my_uid is not None else None
+            my_forecast_reward = (
+                forecast_rewards.get(my_uid, Decimal(0)) if my_uid is not None else None
+            )
         except Exception as e:  # noqa: BLE001
             warn(f"FORECAST failed: {e}")
 
@@ -456,10 +469,15 @@ async def _monitor(args: argparse.Namespace):
                             "disc": f"{(my_disc_tot*100):.2f}%",
                         },
                         "forecast_weights": forecast_weights or [],
-                        "forecast_rewards": {str(k): str(v) for k, v in (forecast_rewards or {}).items()},
+                        "forecast_rewards": {
+                            str(k): str(v) for k, v in (forecast_rewards or {}).items()
+                        },
                         "my_uid": my_uid,
-                        "my_forecast": str(my_forecast_reward) if my_forecast_reward is not None else None,
+                        "my_forecast": (
+                            str(my_forecast_reward) if my_forecast_reward is not None else None
+                        ),
                         "alpha_sent": str(alpha_sent_tao),
+                        "meta_netuid": args.meta_netuid,
                     },
                     separators=(",", ":"),
                 ),
@@ -484,7 +502,7 @@ async def _monitor(args: argparse.Namespace):
                 w = forecast_weights[my_uid]
                 info(
                     f"FORECAST – UID {my_uid} {my_forecast_reward or Decimal(0):.4f} "
-                    f"SN‑{args.netuid} (weight {w:.2%})"
+                    f"SN‑{args.meta_netuid} (weight {w:.2%})"
                 )
             if autobid_enabled:
                 info(

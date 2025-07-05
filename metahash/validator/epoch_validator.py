@@ -1,7 +1,8 @@
 # metahash/validator/epoch_validator.py
 # ─────────────────────────────────────────────────────────────────────────────
 from __future__ import annotations
-import asyncio, traceback
+import asyncio
+import traceback
 from datetime import datetime
 from typing import Optional, Tuple
 
@@ -36,10 +37,10 @@ class EpochValidatorNeuron(BaseValidatorNeuron):
         if self._epoch_len is not None:
             return self._epoch_len
 
-        tempo      = self.subtensor.tempo(self.config.netuid) or 360
-        head       = self.subtensor.get_current_block()
-        next_head  = self.subtensor.get_next_epoch_start_block(self.config.netuid)
-        bslu       = self.subtensor.blocks_since_last_step(self.config.netuid)
+        tempo = self.subtensor.tempo(self.config.netuid) or 360
+        head = self.subtensor.get_current_block()
+        next_head = self.subtensor.get_next_epoch_start_block(self.config.netuid)
+        bslu = self.subtensor.blocks_since_last_step(self.config.netuid)
 
         # Fallbacks: if RPCs mis-behave just assume bug is present
         if next_head is None or bslu is None:
@@ -61,11 +62,11 @@ class EpochValidatorNeuron(BaseValidatorNeuron):
         """
         Returns (head, start, end, index, length) using the *real* epoch length.
         """
-        blk       = self.subtensor.get_current_block()
-        ep_len    = self._discover_epoch_length()
+        blk = self.subtensor.get_current_block()
+        ep_len = self._discover_epoch_length()
         start_blk = blk - (blk % ep_len)
-        end_blk   = start_blk + ep_len - 1
-        ep_idx    = blk // ep_len
+        end_blk = start_blk + ep_len - 1
+        ep_idx = blk // ep_len
         return blk, start_blk, end_blk, ep_idx, ep_len
 
     # ----------------------- async wait-loop ------------------------------ #
@@ -103,8 +104,8 @@ class EpochValidatorNeuron(BaseValidatorNeuron):
         async def _loop():
             while not self.should_exit:
                 blk, start, end, idx, ep_len = self._epoch_snapshot()
-                into  = blk - start
-                left  = end - blk + 1
+                into = blk - start
+                left = end - blk + 1
                 eta_s = left * BLOCKTIME
 
                 bt.logging.info(
@@ -123,9 +124,9 @@ class EpochValidatorNeuron(BaseValidatorNeuron):
 
                 # expose to subclasses
                 self.epoch_start_block = start2
-                self.epoch_end_block   = end2
-                self.epoch_index       = idx2
-                self.epoch_tempo       = ep_len2
+                self.epoch_end_block = end2
+                self.epoch_index = idx2
+                self.epoch_tempo = ep_len2
 
                 bt.logging.success(
                     f"[epoch {idx2}] head at block {blk2:,} "
