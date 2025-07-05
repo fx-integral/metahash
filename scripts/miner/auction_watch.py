@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # --------------------------------------------------------------------------- #
 #  auction_watch.py – Subnet auction monitor with optional automatic bidding  #
-#                                                                             #
+#
 #  2025‑07‑05 • wallet loading uses --wallet.name / --wallet.hotkey           #
 #             • cold‑key defaults to wallet.coldkey.ss58                      #
 #             • validator‑hotkey defaults to wallet.hotkey.ss58               #
@@ -10,6 +10,8 @@
 #               use bt.Balance.from_rao(...)                                  #
 #             • 2025‑07‑05 (CHANGE) --max-discount is now given in PERCENT    #
 #               (e.g. 10 == 10 %), not as a fraction (0.1)                    #
+#             • 2025‑07‑05 (UI) status line now shows                         #
+#               <auction‑state> | Epoch <id> [start–end] (Block <head>)       #
 # --------------------------------------------------------------------------- #
 
 from __future__ import annotations
@@ -140,34 +142,33 @@ def _arg_parser() -> argparse.ArgumentParser:
 
 # ──────────────────── helper functions ────────────────────── #
 
-
-def _status_line(head: int, auction_open: int) -> str:
-    if head >= auction_open:
-        return f"Block {head} | Auction Active (started {head - auction_open} blocks ago)"
-    return f"Block {head} | Auction Waiting ({auction_open - head} blocks to start)"
+def _format_epoch_range(start: int, length: int) -> str:
+    """`start` and `length` → `"<start>-<end>"`"""
+    return f"{start}-{start + length - 1}"
 
 
-def _epoch_line(head: int, start: int, length: int) -> str:
-    return f"Block {head} | Epoch start={start} end={start + length - 1}"
+def _status_line(
+    head: int,
+    auction_open: int,
+    epoch_start: int,
+    epoch_len: int,
+) -> str:
+    """
+    Compose a human‑readable status line:
 
-
-def _make_pricing_provider(st: bt.AsyncSubtensor, start: int, end: int):
-    async def _pricing(subnet_id: int, *_):
-        return await average_price(subnet_id, start_block=start, end_block=end, st=st)
-
-    return _pricing
-
-
-def _make_depth_provider(st: bt.AsyncSubtensor, start: int, end: int):
-    async def _depth(subnet_id: int):
-        d = await average_depth(subnet_id, start_block=start, end_block=end, st=st)
-        return int(getattr(d, "rao", d or 0))
-
-    return _depth
+        <Auction Waiting/Active …> │ Epoch <id> [<start>-<end>] (Block <head>)
+    """
+    state = (
+        f"Auction Active (started {head - auction_open} blocks ago)"
+        if head >= auction_open
+        else f"Auction Waiting ({auction_open - head} blocks to start)"
+    )
+    epoch_id = head // epoch_len
+    epoch_range = _format_epoch_range(epoch_start, epoch_len)
+    return f"{state} │ Epoch {epoch_id} [{epoch_range}] (Block {head})"
 
 
 # ─────────────────────────── main coroutine ──────────────────────────── #
-
 
 async def _monitor(args: argparse.Namespace):
     # ───────── convert CLI percent → fraction ─────────
@@ -182,8 +183,8 @@ async def _monitor(args: argparse.Namespace):
     )
     debug = logging.getLogger("watch").debug
 
-    def warn(m): return clog.warning("[auction]" + m)  # colored warning
-    def info(m): return clog.info("[auction]" + m, color="cyan")
+    def warn(m): return clog.warning(m)  # colored warning
+    def info(m): return clog.info(m, color="cyan")
 
     # ───────── wallet ─────────
     wallet = load_wallet(coldkey_name=args.wallet_name , hotkey_name=args.wallet_hotkey)
@@ -219,11 +220,11 @@ async def _monitor(args: argparse.Namespace):
 
     info(f"Auction target subnet = {args.netuid}")
     if autobid_enabled:
-        info(
-            f"Auto‑bid ON → step={step_alpha_tao} α, "
-            f"max={max_alpha_tao or '∞'} α, "
-            f"max_discount={args.max_discount:.2%}"
-        )
+        info("[auction]"
+             f"Auto‑bid ON → step={step_alpha_tao} α, "
+             f"max={max_alpha_tao or '∞'} α, "
+             f"max_discount={args.max_discount:.2%}"
+             )
 
     # ───────── main loop ─────────
     while True:
@@ -250,9 +251,10 @@ async def _monitor(args: argparse.Namespace):
             meta = await st.metagraph(args.netuid)
             uid_resolver = {ck: uid for uid, ck in enumerate(meta.coldkeys)}.get
             my_uid = uid_resolver(wallet.coldkey.ss58_address) if wallet.coldkey.ss58_address else None
-            info(_epoch_line(head, epoch_start, epoch_len))
+            info(f"⟫ NEW EPOCH {epoch_start // epoch_len} [{_format_epoch_range(epoch_start, epoch_len)}]")
 
-        info(_status_line(head, auction_open))
+        # combined status banner (new order & contents)
+        info(_status_line(head, auction_open, epoch_start, epoch_len))
 
         # wait for auction open
         if head < auction_open:
@@ -490,6 +492,25 @@ async def _monitor(args: argparse.Namespace):
 
         await asyncio.sleep(args.interval)
 
+
+# ────────────────────────── providers (defined late) ───────────────────── #
+
+def _make_pricing_provider(st: bt.AsyncSubtensor, start: int, end: int):
+    async def _pricing(subnet_id: int, *_):
+        return await average_price(subnet_id, start_block=start, end_block=end, st=st)
+
+    return _pricing
+
+
+def _make_depth_provider(st: bt.AsyncSubtensor, start: int, end: int):
+    async def _depth(subnet_id: int):
+        d = await average_depth(subnet_id, start_block=start, end_block=end, st=st)
+        return int(getattr(d, "rao", d or 0))
+
+    return _depth
+
+
+# ───────────────────────── entrypoints ──────────────────────── #
 
 def main() -> None:
     asyncio.run(_monitor(_arg_parser().parse_args()))
