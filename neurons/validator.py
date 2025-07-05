@@ -162,6 +162,8 @@ class Validator(EpochValidatorNeuron):
         """
         if prev_epoch_index < 0 or prev_epoch_index == self._last_validated_epoch:
             bt.logging.error("Phase 1 skipped – epoch already evaluated")
+            bt.logging.info("Sleeping 60 seconds")
+            await asyncio.sleep(60)
             return
 
         miner_uids: list[int] = list(self.get_miner_uids())
