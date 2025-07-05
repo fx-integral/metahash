@@ -1,16 +1,14 @@
 # ╭────────────────────────────────────────────────────────────────────────╮
 # neurons/validator.py                                                     #
-# Patched 2025‑07‑05 – passes miner_uids to rewards + safer update_scores #
 # ╰────────────────────────────────────────────────────────────────────────╯
+
+
 from __future__ import annotations
 
 import asyncio
 import time
-from typing import Optional, Sequence, Callable
-from builtins import min as get_min        # aggregator for burn path
-
+from typing import Optional
 import bittensor as bt
-from decimal import Decimal
 from metahash.base.utils.logging import ColoredLogger as clog
 from metahash.config import (
     BAG_SN73, P_S_PAR,
@@ -123,7 +121,6 @@ class Validator(EpochValidatorNeuron):
 
         return _Scanner()
 
-    # ------------ NEW: always‑supplied Pricing & Depth providers ------------- #
     def _make_pricing_provider(
         self,
         async_subtensor: bt.AsyncSubtensor,
@@ -174,30 +171,8 @@ class Validator(EpochValidatorNeuron):
         self._ck_cache_size = len(self.metagraph.coldkeys)
         return _resolver
 
-    # ╭─────────────────────────── update_scores proxy ─────────────────────╮
-    def update_scores(
-        self,
-        scores: Sequence[Decimal | float],
-        miner_uids: Sequence[int],
-        aggregator: Optional[Callable] = None,
-    ) -> None:
-        """
-        Wrapper ensuring **scores↔UID** alignment before delegating to the
-        parent implementation.
-
-        The parent class (EpochValidatorNeuron) expects a score list that
-        already matches its internal UID ordering, so the only sanity check
-        we need here is a length match.
-        """
-        if len(scores) != len(miner_uids):
-            raise ValueError("Mismatch between rewards and miner UID array")
-
-        if aggregator is None:
-            super().update_scores(scores)
-        else:
-            super().update_scores(scores, aggregator)
-
     # ╭────────────────────────────── PHASE 1 ─────────────────────────────╮
+
     async def _set_weights_for_previous_epoch(
         self,
         prev_epoch_index: int,
@@ -239,12 +214,17 @@ class Validator(EpochValidatorNeuron):
         self._last_epoch_rewards = rewards
 
         # Burn‑all fallback
-        if FORCE_BURN_WEIGHTS or not any(rewards):
+        are_rewards_empty = not any(rewards)
+        if FORCE_BURN_WEIGHTS or are_rewards_empty:
             bt.logging.warning(
                 "Burn triggered – redirecting full emission to UID 0."
             )
+            bt.logging.debug(
+                f"FORCE_BURN_WEIGHTS: {FORCE_BURN_WEIGHTS}. are_rewards_empty: {are_rewards_empty}"
+            )
+
             burn_weights = [1.0 if uid == 0 else 0.0 for uid in miner_uids]
-            self.update_scores(burn_weights, miner_uids, get_min)
+            self.update_scores(burn_weights, miner_uids)
             if hasattr(self, "set_weights"):
                 self.set_weights()
             self._last_validated_epoch = prev_epoch_index

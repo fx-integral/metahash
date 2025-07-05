@@ -9,12 +9,10 @@ import time
 from dataclasses import dataclass
 from decimal import Decimal, getcontext
 from typing import (
-    Any,
     Callable,
     Dict,
     Iterable,
     List,
-    Mapping,
     Optional,
     Protocol,
     Sequence,
@@ -301,8 +299,6 @@ async def compute_epoch_rewards(
     `miner_uids` defines the order of the resulting list; every position `i`
     in the returned array corresponds to `miner_uids[i]`.
     """
-
-    metagraph_size = len(miner_uids)
 
     # 1. TRANSFER COLLECTION ------------------------------------------------ #
     if events is not None:
