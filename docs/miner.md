@@ -41,6 +41,9 @@ git clone https://github.com/fx-integral/metahash.git && cd metahash
 python3 -m venv .venv && source .venv/bin/activate
 pip install uv && uv pip install -e .
 
+#Install btcli followng https://docs.learnbittensor.org/getting-started/install-btcli
+pip install bittensor-cli # Use latest or desired version
+
 # 🔐 One-time miner registration
 btcli s register \
     --netuid 73 \
