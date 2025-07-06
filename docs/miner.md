@@ -14,7 +14,7 @@ Before you spin up a miner in **Subnet 73 (SN73)**, ask yourself:
 
 ## ⚙️ How Subnet 73 Mining Works
 
-Each epoch (~1 hour) an on-chain auction distributes **148 SN73 α-tokens** to miners, proportional to the total **τ-value** of α-tokens they supply from other subnets.
+Each epoch (~1 hour // 361 blocks x 12s) an on-chain auction distributes **148 SN73 α-tokens** to miners, proportional to the total **τ-value** of α-tokens they supply from other subnets.
 
 ### 🔑 Key Points
 - 🪙 You bid with α-tokens *from any subnet except 73*
