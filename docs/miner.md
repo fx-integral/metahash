@@ -42,7 +42,7 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install uv && uv pip install -e .
 
 #Install btcli followng https://docs.learnbittensor.org/getting-started/install-btcli
-pip install bittensor-cli # Use latest or desired version
+uv pip install bittensor-cli # Use latest or desired version
 
 # 🔐 One-time miner registration
 btcli s register \
@@ -59,6 +59,20 @@ btcli s register \
 |---------|------------|------------|
 | **📊 Leaderboard** | Monitor current and historical winners | `python scripts/miner/leaderboard.py --meta-netuid 73 --wallet.name YOUR_WALLET --wallet.hotkey YOUR_HOTKEY` |
 | **🤖 Auto-Bidder** | Automatically watch auctions and place incremental bids while respecting a minimum discount | `python scripts/miner/auction_watch.py --netuid SOURCE_SUBNET_ID --validator-hotkey VALIDATOR_HOTKEY_ADDRESS --wallet.name YOUR_WALLET --wallet.hotkey YOUR_HOTKEY --max-alpha 100 --step-alpha 5 --max-discount 8` |
+
+## 📥 Command-line Syntax
+- Leaderboard:
+```bash
+python scripts/miner/leaderboard.py --meta-netuid 73 --wallet.name YOUR_WALLET --wallet.hotkey YOUR_HOTKEY --network archive
+```
+- Automatic Bidder
+```bash
+python scripts/miner/auction_watch.py --netuid SOURCE_SUBNET_ID --validator-hotkey VALIDATOR_HOTKEY_ADDRESS --wallet.name YOUR_WALLET --wallet.hotkey YOUR_HOTKEY --max-alpha 100 --step-alpha 5 --max-discount 8
+```
+
+```bash
+NOTE: "WALLET_PASSWORD" is an environment variable that can be used to automate wallet operations.  
+```
 
 ### 🤖 Auto-Bidder Workflow
 - ▶️ Starts bidding when a new auction opens
@@ -148,4 +162,4 @@ btcli s register \
 
 - 📁 **GitHub**: https://github.com/fx-integral/metahash/
 - 📚 **Bittensor Docs**: https://docs.bittensor.com/
-- 📋 **SN73 Technical Specs**: https://github.com/fx-integral/metahash/blob/main/docs/sn73-specs.md
+- 🔐 **Coldkey and Hotkey Workstation Security**: https://docs.learnbittensor.org/getting-started/coldkey-hotkey-security/
