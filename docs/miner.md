@@ -45,7 +45,7 @@ pip install uv && uv pip install -e .
 uv pip install bittensor-cli # Use latest or desired version
 
 # 🔐 One-time miner registration
-btcli s register \
+btcli subnets register \
     --netuid 73 \
     --wallet.name YOUR_WALLET \
     --wallet.hotkey YOUR_HOTKEY
