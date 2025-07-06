@@ -156,3 +156,8 @@ Once running, your validator:
 - Incentivizes contributors with appropriately priced SN73 rewards
 - Builds the MetaHash alpha treasury to benefit all SN73 holders
 
+## 🔗 Resources
+
+- 📁 **GitHub**: https://github.com/fx-integral/metahash/
+- 📚 **Bittensor Docs**: https://docs.bittensor.com/
+- 🔐 **Coldkey and Hotkey Workstation Security**: https://docs.learnbittensor.org/getting-started/coldkey-hotkey-security/
