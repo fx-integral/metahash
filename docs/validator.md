@@ -70,13 +70,13 @@ btcli subnets register --wallet.name mywallet --wallet.hotkey myhotkey --netuid 
 ### ✅ Using PM2 (recommended)
 
 ```bash
-pm2 start python --name metahash-validator -- neurons/validator.py -- --netuid 73 --subtensor.network finney --wallet.name validator-wallet --wallet.hotkey validator-hotkey --axon.port 8080 --logging.debug
+pm2 start python --name metahash-validator -- neurons/validator.py --netuid 73 --subtensor.network finney --wallet.name validator-wallet --wallet.hotkey validator-hotkey --logging.debug
 ```
 
 ### 🔁 Development Mode
 
 ```bash
-python neurons/validator.py --netuid 73 --subtensor.network finney --wallet.name validator-wallet --wallet.hotkey validator-hotkey --axon.port 8080 --logging.debug
+python neurons/validator.py --netuid 73 --subtensor.network finney --wallet.name validator-wallet --wallet.hotkey validator-hotkey --logging.debug
 ```
 
 This validator will:
