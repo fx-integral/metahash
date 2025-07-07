@@ -105,7 +105,6 @@ Validators apply:
 | Mechanism        | Purpose                                             |
 |------------------|-----------------------------------------------------|
 | Slippage Curve   | Discounts alpha based on pool depth                |
-| Bonding Curve    | Prices SN73 rewards against alpha input            |
 | Finality Lag     | Ensures event stability before reward distribution |
 | Price Oracle     | Retrieves TAO/alpha price for reward conversion    |
 
