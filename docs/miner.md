@@ -61,10 +61,10 @@ btcli subnets register \
 
 ## 🔧 Mining Tools
 
-| 🛠️ Tool | 📋 Purpose | 💻 Example |
-|---------|------------|------------|
-| **📊 Leaderboard** | Monitor current and historical winners | `python scripts/miner/leaderboard.py --meta-netuid 73 --wallet.name YOUR_WALLET --wallet.hotkey YOUR_HOTKEY` |
-| **🤖 Auto-Bidder** | Automatically watch auctions and place incremental bids while respecting a minimum discount | `python scripts/miner/auction_watch.py --netuid SOURCE_SUBNET_ID --validator-hotkey VALIDATOR_HOTKEY_ADDRESS --wallet.name YOUR_WALLET --wallet.hotkey YOUR_HOTKEY --max-alpha 100 --step-alpha 5 --max-discount 8` |
+| 🛠️ Tool | 📋 Purpose | 💻 Example                                                                                                                                                                                                    |
+|---------|------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **📊 Leaderboard** | Monitor current and historical winners | `python scripts/miner/leaderboard.py --meta-netuid 73 --wallet.name YOUR_WALLET --wallet.hotkey YOUR_HOTKEY --network archive`                                                                                |
+| **🤖 Auto-Bidder** | Automatically watch auctions and place incremental bids while respecting a minimum discount | `python scripts/miner/auction_watch.py --netuid SOURCE_SUBNET_ID --source-hotkey SOURCE_HOTKEY_ADDRESS --wallet.name YOUR_WALLET --wallet.hotkey YOUR_HOTKEY --max-alpha 100 --step-alpha 5 --max-discount 8` |
 
 ## 📥 Command-line Syntax
 - Leaderboard:
@@ -73,7 +73,7 @@ python scripts/miner/leaderboard.py --meta-netuid 73 --wallet.name YOUR_WALLET -
 ```
 - Automatic Bidder
 ```bash
-python scripts/miner/auction_watch.py --netuid SOURCE_SUBNET_ID --validator-hotkey VALIDATOR_HOTKEY_ADDRESS --wallet.name YOUR_WALLET --wallet.hotkey YOUR_HOTKEY --max-alpha 100 --step-alpha 5 --max-discount 8
+python scripts/miner/auction_watch.py --netuid SOURCE_SUBNET_ID --source-hotkey SOURCE_HOTKEY_ADDRESS --wallet.name YOUR_WALLET --wallet.hotkey YOUR_HOTKEY --max-alpha 100 --step-alpha 5 --max-discount 8
 ```
 
 ```bash

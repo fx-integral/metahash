@@ -61,7 +61,8 @@ def _arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--treasury", default=TREASURY_COLDKEY)
 
     # bidding
-    p.add_argument("--validator-hotkey", required=True)
+    p.add_argument("--source-hotkey", required=True,
+                   help="Hotkey where alpha will be transferred from.")
     p.add_argument("--max-alpha", type=Decimal, default=Decimal("0"),
                    help="Absolute cap on α you are willing to spend this epoch.")
     p.add_argument("--step-alpha", type=Decimal, default=DEFAULT_STEP_ALPHA,
