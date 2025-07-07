@@ -1,7 +1,7 @@
 # ====================================================================== #
 #  metahash/validator/alpha_transfers.py                                 #
-#  Patched 2025‑07‑07 – close cross‑subnet α‑swap loophole                #
-#                           • track   src_netuid  via companion events    #
+#  Patched 2025‑07‑07 – close cross‑subnet α‑swap loophole               #
+#                           • track   src_netuid  via companion events   #
 #                           • discard src_netuid ≠ dest_netuid transfers #
 #                           • keep API 100 % backward‑compatible         #
 # ====================================================================== #
@@ -27,6 +27,7 @@ LOG_EVERY = 50
 DUMP_LAST = 5
 
 # ── dataclasses ───────────────────────────────────────────────────────── #
+
 
 @dataclass(slots=True, frozen=True)
 class TransferEvent:
@@ -130,17 +131,18 @@ def _parse_stake_transferred(
     params, fmt: int
 ) -> TransferEvent:                                           # noqa: ANN001
     """
-    Parse StakeTransferred event parameters (chain v8 & v9+).
+    Parse StakeTransferred event parameters (chain v9 & v10).
 
     Expected layout (v9+):
         0  from_coldkey
         1  dest_coldkey           (treasury)
         2  hotkey_staked_to
-        3  dest_netuid            ←── our `subnet_id`
+        3  dest_netuid            ←── our subnet_id
         4  to_uid
         5  amount (TAO)           ←── patched later with α
 
-    Old‑chain variants fall back gracefully.
+    **origin netuid is *not* included** in this event and is picked
+    up from the companion StakeRemoved emitted in the same extrinsic.
     """
     from_coldkey_raw = _account_id(_f(params, 0))
     dest_coldkey_raw = _account_id(_f(params, 1))
@@ -153,7 +155,7 @@ def _parse_stake_transferred(
         from_uid=-1,                               # origin UID not provided
         to_uid=to_uid,
         subnet_id=subnet_id,                       # = dest netuid
-        amount_rao=int(_f(params, 5, 0)),          # placeholder
+        amount_rao=int(_f(params, 5, 0)),          # placeholder, fixed later
         src_coldkey=_encode_ss58(from_coldkey_raw, fmt),
         dest_coldkey=_encode_ss58(dest_coldkey_raw, fmt),
         src_coldkey_raw=from_coldkey_raw,
@@ -161,22 +163,52 @@ def _parse_stake_transferred(
     )
 
 
-def _amount_from_stake_removed(params) -> int:                 # noqa: ANN001
-    return int(_f(params, 2, 0))
+# ── NEW: robust helpers for Add / Remove events (v9+) ─────────────────── #
 
-
-def _amount_from_stake_added(params) -> int:                   # noqa: ANN001
+def _amount_from_stake_removed(params) -> int:
+    """
+    v9+ StakeRemoved layout (6 fields):
+        0  src_coldkey
+        1  hotkey
+        2  from_uid
+        3  amount_rao          ← **this**
+        4  src_netuid          ← paired with TransferEvent
+        5  ...
+    Older networks (≤ v8) used index 2 for the amount.  We keep the fallback.
+    """
     return int(_f(params, 3, _f(params, 2, 0)))
 
 
-def _subnet_from_stake_removed(params) -> int:                 # noqa: ANN001
-    return int(_f(params, 1, -1))      # v9+: [hotkey, netuid, amount]
+def _amount_from_stake_added(params) -> int:                   # noqa: ANN001
+    """
+    v9+ StakeAdded layout (6 fields):
+        0  dest_coldkey        (treasury)
+        1  hotkey
+        2  to_uid
+        3  amount_rao          ← **this**
+        4  dest_netuid
+        5  ...
+    ≤ v8 fallback keeps index 2.
+    """
+    return int(_f(params, 3, _f(params, 2, 0)))
 
 
-def _subnet_from_stake_added(params) -> int:                   # noqa: ANN001
-    return int(_f(params, 1, -1))
+def _subnet_from_stake_removed(params) -> int:
+    """
+    v9+ StakeRemoved: subnet is field 4.
+    ≤ v8 (legacy) keeps field 1.
+    """
+    return int(_f(params, 4, _f(params, 1, -1)))
+
+
+def _subnet_from_stake_added(params) -> int:
+    """
+    v9+ StakeAdded: subnet is field 4.
+    """
+    return int(_f(params, 4, -1))
 
 # ── main scanner class ───────────────────────────────────────────────── #
+
 
 class AlphaTransfersScanner:
     """Scans a block‑range for α‑stake transfers to one treasury cold‑key."""

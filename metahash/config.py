@@ -8,7 +8,7 @@ load_dotenv()
 # ─────────────────── 1.  NETWORK‑LEVEL CONSTANTS  ──────────────────── #
 TREASURY_COLDKEY: str = "5GW6xj5wUpLBz7jCNp38FzkdS6DfeFdUTuvUjcn6uKH5krsn"
 STARTING_AUCTIONS_BLOCK = int(os.getenv("STARTING_ACTIONS_BLOCK","5931900"))
-AUCTION_DELAY_BLOCKS: int = 0
+AUCTION_DELAY_BLOCKS: int = 50
 FORBIDDEN_ALPHA_SUBNETS: list[int] = [73]
 FORCE_BURN_WEIGHTS = False
 DEFAULT_BITTENSOR_NETWORK: str = os.getenv("BITTENSOR_NETWORK","finney")
