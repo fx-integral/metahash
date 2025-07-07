@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # --------------------------------------------------------------------------- #
-#  auction_watch.py – v8  (Rich table output)                                 #
+#  auction_watch.py – v8  (Rich table output) + SECURE WALLET                 #
 # --------------------------------------------------------------------------- #
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ from metahash.utils.colors import ColoredLogger as clog
 from metahash.utils.subnet_utils import average_price, average_depth, subnet_price
 from metahash.validator.rewards import compute_epoch_rewards, TransferEvent
 from metahash.utils.wallet_utils import load_wallet, transfer_alpha
+from metahash.utils.secure_wallet import load_wallet_secure
 
 # ───── Rich for pretty tables ───── #
 from rich.console import Console
@@ -32,7 +33,7 @@ console = Console()
 # ───────────────────────── precision / constants ────────────────────────── #
 getcontext().prec = 60
 RAO_PER_TAO = Decimal(10) ** 9
-MIN_TAO_ONCHAIN = Decimal("0.0005")           # 500 000 RAO
+MIN_TAO_ONCHAIN = Decimal("0.0005")           # 500 000 RAO
 DEFAULT_STEP_ALPHA = Decimal("0.01")
 
 bt.logging.set_info()
@@ -93,8 +94,8 @@ def _status(head: int, open_: int, start: int, length: int) -> str:
         else f"Auction Waiting ({open_ - head} blocks to start)"
     )
     eid = head // length
-    return (f"{state} │ Epoch {eid} [{_format_range(start, length)}] "
-            f"(Block {head}) │ {blocks_left} blk left")
+    return (f"{state} │ Epoch {eid} [{_format_range(start, length)}] "
+            f"(Block {head}) │ {blocks_left} blk left")
 
 
 def _fmt_margin(m: Decimal, colour=True) -> str:
@@ -132,8 +133,21 @@ async def _monitor(args: argparse.Namespace):
         warn("--step-alpha larger than --max-alpha; reducing step-alpha.")
         args.step_alpha = args.max_alpha
 
-    wallet = load_wallet(coldkey_name=args.wallet_name, hotkey_name=args.wallet_hotkey)
-    autobid = bool(wallet and args.source_hotkey)
+    # CHANGE: Using secure manager with error handling
+    print("\n🔒 Secure Wallet Manager Active")
+    print("📝 You will be prompted for password if not stored in keyring\n")
+    
+    try:
+        wallet = load_wallet_secure(args.wallet_name, args.wallet_hotkey)
+        autobid = bool(wallet and args.source_hotkey)
+    except KeyboardInterrupt:
+        info("Password entry cancelled by user")
+        return
+    except Exception as e:
+        warn(f"Failed to load wallet: {e}")
+        warn("Continuing in read-only mode (no auto-bidding)")
+        wallet = None
+        autobid = False
 
     st = bt.AsyncSubtensor(network=args.network)
     await st.initialize()
@@ -153,6 +167,8 @@ async def _monitor(args: argparse.Namespace):
              f"max={args.max_alpha or '∞'} α, "
              f"max_loss={args.max_discount:.2%}, "
              f"buffer={args.safety_buffer}")
+    else:
+        info("Auto-bid OFF (read-only mode)")
 
     def _min_allowed_alpha() -> Decimal:
         return max(args.step_alpha, MIN_TAO_ONCHAIN)
@@ -178,7 +194,7 @@ async def _monitor(args: argparse.Namespace):
 
             meta = await st.metagraph(args.meta_netuid)
             uid_lookup = {ck: uid for uid, ck in enumerate(meta.coldkeys)}
-            my_uid = uid_lookup.get(wallet.coldkey.ss58_address) if wallet.coldkey.ss58_address else None
+            my_uid = uid_lookup.get(wallet.coldkey.ss58_address) if wallet and wallet.coldkey else None
             info(f"⟫ CURRENT EPOCH {epoch_start // epoch_len} "
                  f"[{_format_range(epoch_start, epoch_len)}]")
 
@@ -322,8 +338,16 @@ async def _monitor(args: argparse.Namespace):
 
 
 def main() -> None:
-    asyncio.run(_monitor(_arg_parser().parse_args()))
+    try:
+        asyncio.run(_monitor(_arg_parser().parse_args()))
+    except KeyboardInterrupt:
+        clog.info("\n❌ Auction watch cancelled by user", color="yellow")
+        sys.exit(0)
+    except Exception as e:
+        clog.error(f"Fatal error: {e}", color="red")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
+    import sys
     main()

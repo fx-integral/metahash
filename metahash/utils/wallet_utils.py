@@ -2,7 +2,6 @@
 # metahash/utils/wallet_utils.py                                         #
 # ====================================================================== #
 
-
 from __future__ import annotations
 
 import sys
@@ -12,7 +11,9 @@ from bittensor import AsyncSubtensor
 from substrateinterface import Keypair, KeypairType
 from metahash.base.utils.logging import ColoredLogger as clog
 import bittensor as bt
-import os
+
+# Import secure manager
+from metahash.utils.secure_wallet import load_wallet_secure, load_wallet
 
 
 def verify_coldkey(
@@ -25,7 +26,7 @@ def verify_coldkey(
 
     sig = bytes.fromhex(signature_hex)
 
-    # SR25519 primero, ED25519 como respaldo
+    # SR25519 first, ED25519 as fallback
     for crypto in (KeypairType.SR25519, KeypairType.ED25519):
         try:
             kp = Keypair(ss58_address=cold_ss58, crypto_type=crypto)
@@ -42,25 +43,24 @@ def check_coldkeys_and_signatures(
     message: Union[str, bytes] | None = None,
 ) -> list[dict]:
     """
-    Comprueba que cada firma sea válida.
+    Verify that each signature is valid.
 
     Parameters
     ----------
     entries
-        Secuencia de dicts con ``address`` (cold‑key SS58) y ``signature`` (hex).
+        Sequence of dicts with ``address`` (cold-key SS58) and ``signature`` (hex).
     message
-        **Nuevo (opcional)**.  Si se pasa, *todas* las firmas se verifican contra
-        ese mensaje (p. ej. el hot‑key del miner).  
-        Si se deja en ``None`` se usa, como antes, la propia dirección del
-        cold‑key.
+        **New (optional)**. If provided, *all* signatures are verified against
+        this message (e.g. the miner's hot-key).
+        If left as ``None``, the cold-key's own address is used.
     """
     verified: list[dict] = []
 
-    # Normalizar el mensaje una sola vez
+    # Normalize the message once
     if message is not None and isinstance(message, str):
         message_bytes = message.encode()
     else:
-        message_bytes = None  # se calculará por entrada
+        message_bytes = None  # will be calculated per entry
 
     for idx, item in enumerate(entries, 1):
         addr = item.get("address") or item.get("coldkey")
@@ -80,7 +80,7 @@ def check_coldkeys_and_signatures(
 
         verified.append({"address": addr, "signature": sig_hex})
 
-    clog.success(f"✓ All {len(verified)} cold‑keys verified", color="green")
+    clog.success(f"✓ All {len(verified)} cold-keys verified", color="green")
     return verified
 
 
@@ -96,8 +96,8 @@ async def transfer_alpha(
     wait_for_finalization: bool = False,
     period: int = 256,           # safer default on slow nodes
 ) -> bool:
-    # The bittensor SDK seems to have a wrong check only allowing transfrers of alpha staked to a hotkey owned by the coldkey. So random. 
-    # Lets use directly the extrinsics
+    # The bittensor SDK seems to have a wrong check only allowing transfers of alpha staked to a hotkey owned by the coldkey. So random. 
+    # Let's use directly the extrinsics
 
     try:
         bt.logging.info(
@@ -142,27 +142,11 @@ async def transfer_alpha(
         return False
 
 
-def load_wallet(coldkey_name: str, hotkey_name: str, unlock:bool = True, raise_exception:bool = True) -> bt.wallet:
-    bt.logging.debug(f"Loading wallet coldkey: {coldkey_name} hotkey: {hotkey_name}")
-    pwd = os.getenv("WALLET_PASSWORD")
-
-    if not pwd and raise_exception:
-        bt.logging.error("WALLET_PASSWORD not set in .env")
-        return None
-    else:
-        w = bt.wallet(name=coldkey_name, hotkey=hotkey_name)
-        w.coldkey_file.save_password_to_env(pwd)
-        if unlock:
-            try:
-                w.unlock_coldkey()
-            except Exception as e:  # noqa: BLE001
-                bt.logging.error(f"cannot unlock cold-key: {e}")
-                if raise_exception:
-                    raise Exception("Unable to unlock wallet with: coldkey name: cold, hotkey name: {hot}")
-
-        bt.logging.debug(
-            "Wallet unlocked (cold=%s hot=%s)",
-            w.coldkey.ss58_address,
-            w.hotkey.ss58_address,
-        )
-        return w
+# Export both functions for compatibility
+__all__ = [
+    "load_wallet",
+    "load_wallet_secure",
+    "verify_coldkey",
+    "check_coldkeys_and_signatures",
+    "transfer_alpha",
+]
