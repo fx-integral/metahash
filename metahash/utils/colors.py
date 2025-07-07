@@ -46,6 +46,10 @@ class ColoredLogger:
         )
 
     @staticmethod
+    def debug(message: str, color: str = "gray") -> None:
+        bt.logging.debug(ColoredLogger._colored_msg(message, color))
+
+    @staticmethod
     def info(message: str, color: str = "blue") -> None:
         bt.logging.info(ColoredLogger._colored_msg(message, color))
 

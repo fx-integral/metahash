@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-# --------------------------------------------------------------------------- #
-#  auction_leaderboard.py – v2.2 (07 Jul 2025)                                #
-#                                                                              #
-#  Realtime subnet‑auction dashboard (read‑only)                               #
-#  • Better Rich formatting: clearer panels, bold labels, zebra rows           #
-#  • Still auto‑detects auction subnet; no --netuid flag                       #
-# --------------------------------------------------------------------------- #
+# ─────────────────────────────────────────────────────────────────────── #
+#  scripts/leaderboard.py – v1.2                                          #
+#                                                                          #
+#  Compact, real‑time Rich dashboard for the Bittensor subnet auction.     #
+#  • Updated 2025‑07‑07 to support the new TransferEvent signature         #
+#    introduced in alpha_transfers.py (cross‑subnet α‑swap patch).         #
+#                                                                          #
+#  Author: <you> – 07 Jul 2025                                             #
+# ─────────────────────────────────────────────────────────────────────── #
 from __future__ import annotations
 
 import argparse
@@ -16,10 +18,9 @@ from typing import Dict, List, Optional
 import bittensor as bt
 from rich import box
 from rich.console import Console
-from rich.table import Table
 from rich.panel import Panel
+from rich.table import Table
 from rich.text import Text
-from rich.style import Style
 
 from metahash.config import (
     AUCTION_DELAY_BLOCKS,
@@ -29,91 +30,120 @@ from metahash.config import (
 )
 from metahash.utils.subnet_utils import average_price, average_depth, subnet_price
 from metahash.utils.wallet_utils import load_wallet
+from metahash.validator.rewards import compute_epoch_rewards, TransferEvent
+from metahash.validator.alpha_transfers import AlphaTransfersScanner
 
-from metahash.validator.alpha_transfers import AlphaTransfersScanner, TransferEvent
-from metahash.validator.rewards import compute_epoch_rewards
-
-# ─────────── precision & console ─────────── #
+# ───────────────────────── precision & constants ─────────────────────── #
 getcontext().prec = 60
+RAO_PER_TAO = Decimal(10) ** 9  # 1 TAO  = 1e9 RAO
+
 console = Console()
-bt.logging.set_warning()                 # suppress bittensor debug chatter
+bt.logging.set_info()            # use set_debug() for verbose tracing
 
 
-# ═════════════════ CLI ═════════════════ #
+# ═════════════════════════ CLI ═════════════════════════════════════════ #
 def _arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Realtime subnet‑auction leaderboard (read‑only)",
+        description="Realtime Bittensor subnet‑auction dashboard",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--network", default=DEFAULT_BITTENSOR_NETWORK,
-                   help="Bittensor network name or websocket endpoint")
+    # network / subnets
+    p.add_argument("--network", default=DEFAULT_BITTENSOR_NETWORK)
     p.add_argument("--meta-netuid", type=int, default=73,
-                   help="Subnet whose bag is distributed to winners (default 73)")
+                   help="Subnet whose bag is auctioned (SN‑73 by default)")
+    # timing
     p.add_argument("--delay", type=int, default=AUCTION_DELAY_BLOCKS,
                    help="Blocks from epoch start until auction opens")
     p.add_argument("--interval", type=float, default=12.0,
-                   help="Refresh interval when --watch is set (seconds)")
+                   help="Refresh seconds when --watch is set")
     p.add_argument("--watch", action="store_true",
-                   help="Continuously refresh until Ctrl‑C")
-    # highlight
-    p.add_argument("--treasury", default=TREASURY_COLDKEY,
-                   help="Coldkey that receives α bids (treasury)")
+                   help="Continuously refresh until interrupted")
+    # treasury & wallet / highlighting
+    p.add_argument("--treasury", default=TREASURY_COLDKEY)
     p.add_argument("--my-coldkey", default=None,
-                   help="Highlight this coldkey’s row")
-    # wallet (optional autodetect of --my-coldkey)
+                   help="Coldkey to highlight (auto‑detected from wallet if omitted)")
     p.add_argument("--wallet.name", dest="wallet_name", default=None)
     p.add_argument("--wallet.hotkey", dest="wallet_hotkey", default=None)
     return p
 
 
-# ═════════════ helpers ═════════════ #
-def _range_str(start: int, length: int) -> str:
+# ═══════════════════ helper formatting ═════════════════════════════════ #
+def _format_range(start: int, length: int) -> str:
     return f"{start}-{start + length - 1}"
 
 
-def _fmt_num(v: Decimal | int, prec: int = 6) -> str:
-    return f"{Decimal(v):>{prec + 3}.{prec}f}"  # pad for alignment
+def _fmt_tao(v: Decimal | int, prec: int = 6) -> str:
+    """
+    Pretty‑print TAO (or token counts) with `prec` decimal places.
+    Use prec=0 for integer‑only display (e.g. BAG_SN73).
+    """
+    return f"{Decimal(v):.{prec}f}"
 
 
-def _pct(x: Decimal) -> str:
-    return f"{x * 100:>6.2f}%"
+def _fmt_pct(x: Decimal, width: int = 7) -> str:
+    return f"{x * 100:>{width}.2f}%"
 
 
-def _margin_txt(m: Decimal) -> Text:
-    t = Text(f"{m * 100:+6.2f}%")
-    t.style = "green" if m >= 0 else "red"
-    return t
+def _fmt_margin_table(m: Decimal) -> Text:
+    """
+    Margin cell for the *leaderboard* (numeric only, colour coded).
+    """
+    txt = Text(f"{m * 100:+.2f}%")
+    txt.style = "green" if m >= 0 else "red"
+    return txt
 
 
-def _short(addr: str, n: int = 6) -> str:
-    return addr[:n] + "…" + addr[-n:]
+def _fmt_margin_overview(m: Decimal) -> Text:
+    """
+    Margin for the *overview* with “profit” / “discount” wording.
+    """
+    txt = Text()
+    label = "profit" if m >= 0 else "discount"
+    txt.append(f"{m * 100:+.2f}% {label}")
+    txt.style = "green" if m >= 0 else "red"
+    return txt
 
 
-# provider factories (no async lambda allowed)
-def _pricing_provider(st: bt.AsyncSubtensor, b0: int, b1: int):
-    async def _p(sid: int, *_):
-        return await average_price(sid, start_block=b0, end_block=b1, st=st)
-    return _p
+def _ellips(addr: str, n: int = 8) -> str:
+    """Abbreviate an ss58 address to `5Gw6xj…Ptao` style."""
+    return addr if len(addr) <= 2 * n + 1 else f"{addr[:n]}…{addr[-n:]}"
 
 
-def _depth_provider(st: bt.AsyncSubtensor, b0: int, b1: int):
-    async def _d(sid: int):
-        d = await average_depth(sid, start_block=b0, end_block=b1, st=st)
+# ═════════ provider factories (async lambdas are illegal) ══════════════ #
+def _make_pricing_provider(st: bt.AsyncSubtensor, start: int, end: int):
+    async def _pricing(sid: int, *_):
+        return await average_price(sid, start_block=start, end_block=end, st=st)
+
+    return _pricing
+
+
+def _make_depth_provider(st: bt.AsyncSubtensor, start: int, end: int):
+    async def _depth(sid: int):
+        d = await average_depth(sid, start_block=start, end_block=end, st=st)
         return int(getattr(d, "rao", d or 0))
-    return _d
+
+    return _depth
 
 
-# ═════════════ snapshot ═════════════ #
-async def _snapshot(st: bt.AsyncSubtensor, cache: Dict[str, object], args):
+# ═════════════════ snapshot (single render) ════════════════════════════ #
+async def _snapshot(
+    st: bt.AsyncSubtensor,
+    cache: Dict[str, object],
+    args: argparse.Namespace,
+):
+    """
+    Pull on‑chain data **once** and render banner, overview, and leaderboard.
+    A tiny in‑mem cache ensures we *only* query blocks we haven’t seen yet.
+    """
+    # ───── chain state ───── #
     head = await st.get_current_block()
     tempo = await st.tempo(args.meta_netuid)
     epoch_len = tempo + 1
     epoch_start = head - (head % epoch_len)
     auction_open = epoch_start + args.delay
     eid = epoch_start // epoch_len
-    blocks_left = epoch_start + epoch_len - head - 1
 
-    # reset on new epoch
+    # New epoch? → reset cache
     if cache.get("epoch_start") != epoch_start:
         cache.clear()
         cache.update({
@@ -123,45 +153,62 @@ async def _snapshot(st: bt.AsyncSubtensor, cache: Dict[str, object], args):
             "last_scanned": auction_open - 1,
             "scanner": None,
             "meta": None,
-            "auction_netuid": None,
         })
 
-    # banner
-    banner_style = "green" if head >= auction_open else "yellow"
-    console.rule(Text(
-        f"{'🟢' if head >= auction_open else '⏳'} "
-        f"Epoch {eid} [{_range_str(epoch_start, epoch_len)}] · "
-        f"Block {head} (left {blocks_left})",
-        style=banner_style,
-    ))
+    # ───── status banner ───── #
+    status_emoji = "🟢" if head >= auction_open else "⏳"
+    banner_txt = (
+        f"{status_emoji}  "
+        f"Epoch {eid}  "
+        f"[{_format_range(epoch_start, epoch_len)}]  ·  "
+        f"Block {head}"
+    )
+    console.rule(Text(banner_txt, style="cyan"))
 
     if head < auction_open:
-        console.print("Auction has not opened yet.", style="yellow")
+        console.print(Panel("Auction has not opened yet.", style="yellow"))
         return
 
-    # scanner
+    # ───── scanner (re‑use across refreshes) ───── #
     if cache["scanner"] is None:
         cache["scanner"] = AlphaTransfersScanner(st, dest_coldkey=args.treasury)
     scanner: AlphaTransfersScanner = cache["scanner"]  # type: ignore
 
-    # scan new blocks only
+    # ───── scan only NEW blocks ───── #
     start_blk = cache["last_scanned"] + 1
     if start_blk <= head:
-        fresh = await scanner.scan(start_blk, head)
-        cache["events"].extend(fresh)
+        # Raw events from the patched scanner
+        new_raw = await scanner.scan(start_blk, head)
+
+        # ‼️  Re‑wrap into the *rewards* TransferEvent dataclass ‼️
+        #     (compute_epoch_rewards expects this type)
+        new_events = [
+            TransferEvent(
+                block=ev.block,
+                from_uid=ev.from_uid,
+                to_uid=ev.to_uid,
+                subnet_id=ev.subnet_id,
+                amount_rao=ev.amount_rao,
+                src_coldkey=ev.src_coldkey,
+                dest_coldkey=ev.dest_coldkey or args.treasury,
+                src_coldkey_raw=ev.src_coldkey_raw,
+                dest_coldkey_raw=ev.dest_coldkey_raw,
+                src_subnet_id=ev.src_subnet_id,
+            )
+            for ev in new_raw
+        ]
+
+        cache["events"].extend(new_events)
         cache["last_scanned"] = head
-        if fresh and cache["auction_netuid"] is None:
-            cache["auction_netuid"] = fresh[0].subnet_id
 
     events: List[TransferEvent] = cache["events"]
-    auction_netuid: Optional[int] = cache.get("auction_netuid")
 
-    # providers for previous epoch averages
-    prev_start, prev_end = max(0, epoch_start - epoch_len), epoch_start - 1
-    pricing = _pricing_provider(st, prev_start, prev_end)
-    depth = _depth_provider(st, prev_start, prev_end)
+    # ───── providers (avg over previous epoch) ───── #
+    start_prev, end_prev = max(0, epoch_start - epoch_len), epoch_start - 1
+    pricing_provider = _make_pricing_provider(st, start_prev, end_prev)
+    depth_provider = _make_depth_provider(st, start_prev, end_prev)
 
-    # metagraph
+    # ───── metagraph & rewards ───── #
     if cache["meta"] is None:
         cache["meta"] = await st.metagraph(args.meta_netuid)
     meta = cache["meta"]  # type: ignore
@@ -173,102 +220,90 @@ async def _snapshot(st: bt.AsyncSubtensor, cache: Dict[str, object], args):
     rewards = await compute_epoch_rewards(
         miner_uids=list(range(len(meta.coldkeys))),
         events=events,
-        pricing=pricing,
+        pricing=pricing_provider,
         uid_of_coldkey=_uid_of_ck,
         start_block=auction_open,
         end_block=head,
-        pool_depth_of=depth,
+        pool_depth_of=depth_provider,
     )
-    tao_by_uid = {u: Decimal(r) for u, r in enumerate(rewards) if r}
-    total_tao = sum(tao_by_uid.values())
+    tao_by_uid = {uid: Decimal(r) for uid, r in enumerate(rewards) if r}
+    total_tao = sum(tao_by_uid.values())        # “Total value sent”
+    bidders = len(tao_by_uid)
 
-    # prices
-    alpha_price = Decimal(0)
-    if auction_netuid is not None:
-        p = await subnet_price(auction_netuid, st=st)
-        alpha_price = Decimal(str(p.tao)) if p else Decimal(0)
-    sn73_bal = await subnet_price(args.meta_netuid, st=st)
-    sn73_price = Decimal(str(sn73_bal.tao)) if sn73_bal else Decimal(0)
+    # ───── price feed & bag value ───── #
+    price_bal = await subnet_price(args.meta_netuid, st=st)
+    sn73_price = Decimal(str(price_bal.tao)) if price_bal else Decimal(0)
+    bag_value = Decimal(BAG_SN73) * sn73_price
+    margin = (bag_value / total_tao - 1) if total_tao else Decimal(0)
 
-    bag_value = BAG_SN73 * sn73_price
-    global_margin = (bag_value / total_tao - 1) if total_tao else Decimal(0)
-    total_alpha = (total_tao / alpha_price) if alpha_price else None
+    # ═════════ Overview panel ═════════ #
+    overview = Table.grid(expand=False)
+    overview.add_column(justify="right")
+    overview.add_column(justify="left")
 
-    # ── overview panel ── #
-    overview = Table.grid(padding=(0, 2))
-    overview.add_column(justify="right", style="bold bright_cyan")
-    overview.add_column(justify="left", style="white")
-    overview.add_row("α total (TAO):", _fmt_num(total_tao))
-    overview.add_row("α total (tokens):",
-                     _fmt_num(total_alpha) if total_alpha else "—")
-    overview.add_row("# bidders:", f"{len(tao_by_uid):>6}")
-    overview.add_row("α price (TAO):",
-                     _fmt_num(alpha_price, 8) if alpha_price else "—")
-    overview.add_row("SN‑73 price:", _fmt_num(sn73_price, 8))
-    overview.add_row("Bag value:", _fmt_num(bag_value))
-    overview.add_row("Global margin:", _margin_txt(global_margin))
-    if auction_netuid is not None:
-        overview.add_row("Auction subnet:", str(auction_netuid))
+    overview.add_row("Bag of SN‑73 α:", _fmt_tao(BAG_SN73, prec=0))
+    overview.add_row("Bag value (TAO):", _fmt_tao(bag_value))
+    overview.add_row("Total value sent:", _fmt_tao(total_tao))
+    overview.add_row("Margin:", _fmt_margin_overview(margin))
+    overview.add_row("# bidders:", str(bidders))
 
-    print()
-    print("==============================================")
-    print()
-    console.print(Panel(overview, title="Auction Overview",
-                        title_align="left", box=box.ROUNDED))
+    console.print(Panel(overview, title="Auction Overview", box=box.SIMPLE_HEAVY))
 
     if not tao_by_uid:
         console.print("No bids recorded yet.", style="yellow")
         return
 
-    # ── leaderboard ── #
+    # ═════════ leaderboard table ══════ #
     lb = Table(
-        title=f"Subnet {args.meta_netuid} Leaderboard – Epoch {eid}",
-        box=box.ROUNDED,
+        title=f"Subnet {args.meta_netuid} Leaderboard – Epoch {eid}",
         header_style="bold magenta",
-        show_edge=False,
-        padding=(0, 1),
-        row_styles=[Style(dim=False), Style(dim=True)],   # zebra stripes
+        box=box.SIMPLE_HEAVY,
+        show_lines=False,
+        expand=True,
     )
-    lb.add_column("#", justify="right", style="bright_cyan", no_wrap=True)
-    lb.add_column("UID", justify="right", style="bright_cyan", no_wrap=True)
-    lb.add_column("Hotkey", justify="left", no_wrap=True)
-    lb.add_column("Coldkey", justify="left", no_wrap=True)
-    lb.add_column("Spent TAO", justify="right", style="white", no_wrap=True)
-    lb.add_column("Share", justify="right", style="white", no_wrap=True)
-    lb.add_column("Margin", justify="right", no_wrap=True)
+    lb.add_column("#", justify="right")
+    lb.add_column("UID", justify="right")
+    lb.add_column("Hotkey", overflow="ellipsis")
+    lb.add_column("Coldkey", overflow="ellipsis")
+    lb.add_column("Spent TAO", justify="right")
+    lb.add_column("Share", justify="right")
+    lb.add_column("Margin", justify="right")
 
     rows = sorted(tao_by_uid.items(), key=lambda kv: kv[1], reverse=True)
-    for rk, (uid, tao) in enumerate(rows, 1):
+    for rank, (uid, tao) in enumerate(rows, start=1):
         share = tao / total_tao
-        margin = (bag_value * share / tao - 1) if tao else Decimal(0)
-        highlight = meta.coldkeys[uid] == args.my_coldkey
+        row_margin = (bag_value * share / tao - 1) if tao else Decimal(0)
+        style = "bold cyan" if meta.coldkeys[uid] == args.my_coldkey else ""
+
         lb.add_row(
-            str(rk),
+            str(rank),
             str(uid),
-            _short(meta.hotkeys[uid]),
-            _short(meta.coldkeys[uid]),
-            _fmt_num(tao),
-            _pct(share),
-            _margin_txt(margin),
-            style="bold yellow" if highlight else "",
+            _ellips(meta.hotkeys[uid]),
+            _ellips(meta.coldkeys[uid]),
+            _fmt_tao(tao),
+            _fmt_pct(share),
+            _fmt_margin_table(row_margin),
+            style=style,
         )
+
     console.print(lb)
 
 
-# ═════════════ runner ═════════════ #
-async def _runner(args):
+# ═════════════════════ runner (loop if --watch) ════════════════════════ #
+async def _runner(args: argparse.Namespace):
+    # Highlight your own coldkey automatically if wallet provided
     if not args.my_coldkey and (args.wallet_name or args.wallet_hotkey):
         try:
             w = load_wallet(args.wallet_name, args.wallet_hotkey, unlock=False)
-            if w and w.coldkey:
-                args.my_coldkey = w.coldkey.ss58_address
+            if w and w.coldkeypub:
+                args.my_coldkey = w.coldkeypub
         except Exception:
-            pass
+            pass  # ignore wallet load errors
 
     st = bt.AsyncSubtensor(network=args.network)
     await st.initialize()
-
     cache: Dict[str, object] = {}
+
     while True:
         console.clear()
         await _snapshot(st, cache, args)
@@ -277,7 +312,7 @@ async def _runner(args):
         await asyncio.sleep(args.interval)
 
 
-# ═════════ entry‑point ═════════ #
+# ═══════════════════ entry‑point ═══════════════════════════════════════ #
 def main() -> None:
     asyncio.run(_runner(_arg_parser().parse_args()))
 

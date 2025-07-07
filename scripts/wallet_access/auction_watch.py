@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # --------------------------------------------------------------------------- #
-#  auto-bidder.py – v8  (Rich table output)                                 #
+#  auction_watch.py – v8  (Rich table output)                                 #
 # --------------------------------------------------------------------------- #
 from __future__ import annotations
 
@@ -61,7 +61,8 @@ def _arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--treasury", default=TREASURY_COLDKEY)
 
     # bidding
-    p.add_argument("--validator-hotkey", required=True)
+    p.add_argument("--source-hotkey", required=True,
+                   help="Hotkey where alpha will be transferred from.")
     p.add_argument("--max-alpha", type=Decimal, default=Decimal("0"),
                    help="Absolute cap on α you are willing to spend this epoch.")
     p.add_argument("--step-alpha", type=Decimal, default=DEFAULT_STEP_ALPHA,
@@ -132,7 +133,7 @@ async def _monitor(args: argparse.Namespace):
         args.step_alpha = args.max_alpha
 
     wallet = load_wallet(coldkey_name=args.wallet_name, hotkey_name=args.wallet_hotkey)
-    autobid = bool(wallet and args.validator_hotkey)
+    autobid = bool(wallet and args.source_hotkey)
 
     st = bt.AsyncSubtensor(network=args.network)
     await st.initialize()
@@ -299,7 +300,7 @@ async def _monitor(args: argparse.Namespace):
                 ok = await transfer_alpha(
                     subtensor=st,
                     wallet=wallet,
-                    hotkey_ss58=args.validator_hotkey,
+                    hotkey_ss58=args.source_hotkey,
                     origin_and_dest_netuid=args.netuid,
                     dest_coldkey_ss58=args.treasury,
                     amount=bt.Balance.from_tao(extra_alpha),

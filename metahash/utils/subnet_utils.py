@@ -16,6 +16,9 @@ from bittensor.utils.balance import Balance
 import time
 from typing import List
 import random
+import bittensor as bt
+from substrateinterface.exceptions import SubstrateRequestException
+
 
 # ── project‑specific constants (keep or replace) ────────────────────────────
 from metahash.config import (
@@ -157,17 +160,21 @@ async def average_price(
 
     prices: List[int] = []
     async with _with_subtensor(st) as sub:
-        t0 = time.time()
         # ───────────────────────────── batched concurrency ──────────────────────
         for i in range(0, len(block_sample), concurrent):
             batch = block_sample[i : i + concurrent]
             prices.extend(await asyncio.gather(*(_price_at(sub, b) for b in batch)))
-        print(
-            f"Sampled {len(prices)} of {total} blocks "
-            f"in {time.time() - t0:.2f}s (concurrency={concurrent})"
-        )
 
     return Balance.from_rao(int(mean(prices))) if prices else Balance.tao(0)
+
+
+# Choose ONE of the two depending on the policy you want:
+# 1)  No slippage ever
+FALLBACK_DEPTH_RAO: int = 10 ** 30            # ~1e21 TAO
+# 2)  Max ~3 % slippage
+# FALLBACK_DEPTH_RAO: int = 2 ** 200          # ~1.6e60 planck
+
+_warned = False
 
 
 async def average_depth(
@@ -217,19 +224,14 @@ async def average_depth(
         block_sample.sort()
 
     async def _depth_at(sub: AsyncSubtensor, blk: int) -> int:
-        """Depth of α‑stake for *netuid* at a single block."""
+        """
+        Return α-depth in planck for *netuid* at block *blk*.
+
+        • Normal path: pallet storage         (always exists)
+        • On any error: emit one CRITICAL log and return FALLBACK_DEPTH_RAO
+        """
+        global _warned
         try:
-            # Fast runtime API path (≥1.4.0 subtensor runtimes)
-            depth_rao = await sub.query_runtime_api(
-                "StakeInfoRuntimeApi",
-                "get_subnet_alpha_in_at",
-                params=[netuid, blk],
-            )
-            print(depth_rao)
-            input()
-            return int(depth_rao)
-        except Exception:
-            # Fallback to storage query (slower, but exists everywhere)
             bh = await sub.substrate.get_block_hash(block_id=blk)
             storage = await sub.substrate.query(
                 "SubtensorModule",
@@ -237,19 +239,26 @@ async def average_depth(
                 [netuid],
                 block_hash=bh,
             )
-            value = getattr(storage, "value", storage)
-            return int(value) if value is not None else 0
+            val = getattr(storage, "value", storage)
+            return int(val) if val is not None else 0
+
+        except (SubstrateRequestException, Exception) as err:
+            if not _warned:
+                bt.logging.critical(
+                    f"[depth_at] Failed to read SubnetAlphaIn (netuid={netuid}, "
+                    f"block={blk}): {err}\n"
+                    f"          Using FALLBACK_DEPTH_RAO = {FALLBACK_DEPTH_RAO:,}. "
+                    f"Slippage will be {'disabled' if FALLBACK_DEPTH_RAO==10**30 else 'capped at ≈3%'} "
+                    f"until restart."
+                )
+                _warned = True
+            return FALLBACK_DEPTH_RAO
 
     depths: List[int] = []
     async with _with_subtensor(st) as sub:
-        t0 = time.time()
         for i in range(0, len(block_sample), concurrent):
             batch = block_sample[i : i + concurrent]
             depths.extend(await asyncio.gather(*(_depth_at(sub, b) for b in batch)))
-        print(
-            f"[depth] Sampled {len(depths)} of {total} blocks "
-            f"in {time.time() - t0:.2f}s (concurrency={concurrent})"
-        )
 
     return int(mean(depths)) if depths else 0
 # ╭────────────────────────────── NEW helper ────────────────────────────────╮
