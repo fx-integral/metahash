@@ -13,9 +13,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import statistics
 from decimal import Decimal, getcontext
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 import bittensor as bt
 from metahash.config import (
@@ -24,7 +23,6 @@ from metahash.config import (
     DEFAULT_BITTENSOR_NETWORK,
     TREASURY_COLDKEY,
 )
-from metahash.utils.colors import ColoredLogger as clog
 from metahash.utils.subnet_utils import average_price, average_depth, subnet_price
 from metahash.validator.rewards import compute_epoch_rewards, TransferEvent
 from metahash.utils.wallet_utils import load_wallet

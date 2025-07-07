@@ -142,27 +142,23 @@ async def transfer_alpha(
         return False
 
 
-def load_wallet(coldkey_name: str, hotkey_name: str, unlock:bool = True, raise_exception:bool = True) -> bt.wallet:
+def load_wallet(coldkey_name: str, hotkey_name: str, unlock:bool = True) -> bt.wallet:
     bt.logging.debug(f"Loading wallet coldkey: {coldkey_name} hotkey: {hotkey_name}")
-    pwd = os.getenv("WALLET_PASSWORD")
+    w = bt.wallet(name=coldkey_name, hotkey=hotkey_name)
 
-    if not pwd and raise_exception:
-        bt.logging.error("WALLET_PASSWORD not set in .env")
-        return None
-    else:
-        w = bt.wallet(name=coldkey_name, hotkey=hotkey_name)
-        w.coldkey_file.save_password_to_env(pwd)
-        if unlock:
-            try:
-                w.unlock_coldkey()
-            except Exception as e:  # noqa: BLE001
-                bt.logging.error(f"cannot unlock cold-key: {e}")
-                if raise_exception:
-                    raise Exception("Unable to unlock wallet with: coldkey name: cold, hotkey name: {hot}")
+    if unlock:
+        pwd = os.getenv("WALLET_PASSWORD")
 
-        bt.logging.debug(
-            "Wallet unlocked (cold=%s hot=%s)",
-            w.coldkey.ss58_address,
-            w.hotkey.ss58_address,
-        )
-        return w
+        if not pwd:
+            bt.logging.error("WALLET_PASSWORD not set in .env")
+            return None
+        try:
+            w.coldkey_file.save_password_to_env(pwd)
+            w.unlock_coldkey()
+        except Exception as e:  # noqa: BLE001
+            bt.logging.error(f"cannot unlock cold-key: {e}")
+            raise Exception("Unable to unlock wallet with: coldkey name: cold, hotkey name: {hot}")
+
+        bt.logging.debug(f"Wallet unlocked {w.coldkey.ss58_address} {w.hotkey.ss58_address}")
+
+    return w

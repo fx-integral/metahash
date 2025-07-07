@@ -1,7 +1,11 @@
 # ╭────────────────────────────────────────────────────────────────────────╮
-# metahash/validator/rewards.py        Epoch reward-calculation logic
-# Patched 2025-07-05 – explicit miner_uids, no validator dependency
-# Patched 2025-07-06 – drop normalisation, return float rewards_list
+# metahash/validator/rewards.py        Epoch reward‑calculation logic      #
+#                                                                           #
+# Patched 2025‑07‑07                                                        #
+#   • Imports the enhanced `TransferEvent` that now carries `src_subnet_id` #
+#     (defined in metahash.validator.alpha_transfers).                      #
+#   • All reward‑calculation semantics are unchanged; cross‑net events      #
+#     have already been stripped out by the scanner.                        #
 # ╰────────────────────────────────────────────────────────────────────────╯
 from __future__ import annotations
 
@@ -21,7 +25,6 @@ from typing import (
     runtime_checkable,
 )
 
-import numpy as np
 import bittensor as bt
 from metahash.config import (
     K_SLIP,
@@ -29,9 +32,12 @@ from metahash.config import (
     FORBIDDEN_ALPHA_SUBNETS,
 )
 
-# ───────────────────────────── GLOBAL CONSTANTS ────────────────────────── #
+# ↓ NEW – use the single authoritative definition
+from metahash.validator.alpha_transfers import TransferEvent
 
-getcontext().prec = 60                         # 60-digit arithmetic precision
+# ───────────────────────────── GLOBAL CONSTANTS ───────────────────────── #
+
+getcontext().prec = 60                          # 60‑digit arithmetic precision
 
 PLANCK: int = 10**9
 DECIMALS: Decimal = Decimal(10) ** 9
@@ -50,7 +56,7 @@ class TransferScanner(Protocol):
 
 @runtime_checkable
 class BalanceLike(Protocol):
-    tao: float          # TAO price of 1 α
+    tao: float          # TAO price of 1 α
     rao: int | None     # current pool depth (planck)
 
 
@@ -68,34 +74,20 @@ class PoolDepthProvider(Protocol):
 class MinerResolver(Protocol):
     async def __call__(self, coldkey: str) -> int | None: ...
 
-# ──────────────────────────────── EVENTS ──────────────────────────────── #
-
-
-@dataclass(slots=True, frozen=True)
-class TransferEvent:
-    """
-    A single α-stake transfer credited to the treasury.
-
-    • **src_coldkey**  – cold-key that *paid* the α (miner’s key)
-    • **dest_coldkey** – cold-key that *received* the α (treasury)
-    • **subnet_id**    – originating subnet
-    • **amount_rao**   – α amount in planck (RAO)
-    """
-    src_coldkey: str
-    dest_coldkey: str
-    subnet_id: int
-    amount_rao: int
 
 # ──────────────────────────────── MODEL ───────────────────────────────── #
 
-
 @dataclass(slots=True)
 class AlphaDeposit:
-    coldkey: str          # *origin* cold-key (credited miner)
+    """
+    Intermediate representation: aggregated α coming **into the treasury**
+    from a single cold‑key on a single subnet during an epoch.
+    """
+    coldkey: str          # origin miner cold‑key
     subnet_id: int
     alpha_raw: int
 
-    # Runtime-enriched fields
+    # Runtime‑enriched fields
     miner_uid: int | None = None
     avg_price: Decimal | None = None
     tao_value: Decimal | None = None
@@ -117,8 +109,8 @@ class AlphaDeposit:
 
 def _apply_slippage(alpha_raw: int, price: Decimal, depth_rao: int) -> Decimal:
     """
-    Convert raw α (planck) to **post-slippage TAO**.
-    All arithmetic stays in Decimal space.
+    Convert raw α (planck) to **post‑slippage TAO**.
+    All arithmetic is done in Decimal space.
     """
     if depth_rao <= 0:
         return Decimal(0)
@@ -132,7 +124,7 @@ def _apply_slippage(alpha_raw: int, price: Decimal, depth_rao: int) -> Decimal:
 
     return Decimal(alpha_raw) * price * (Decimal(1) - slip) / DECIMALS
 
-# ╭──────────────────────── PHASE 0 – COMBINE ─────────────────────────────╯
+# ╭──────────────────────── PHASE 0 – COMBINE ─────────────────────────────╯
 
 
 def _combine_deposits_by_miner_subnet(
@@ -140,17 +132,18 @@ def _combine_deposits_by_miner_subnet(
 ) -> List[AlphaDeposit]:
     """
     Aggregate raw α per **(miner_uid | coldkey, subnet)**.
-    Unknown miners are keyed by coldkey to avoid coalescing unrelated
-    addresses under a single (None, subnet) bucket.
+
+    Unknown miners get bucketed by cold‑key so we don’t accidentally merge
+    unrelated addresses under a single `(None, subnet)` key.
     """
     merged: Dict[Tuple[str | int, int], AlphaDeposit] = {}
     for d in deposits:
-        uid_or_ck = d.miner_uid if d.miner_uid is not None else d.coldkey
-        key = (uid_or_ck, d.subnet_id)
-        if key in merged:
-            merged[key].merge_from(d)
+        uid_or_ck: str | int = d.miner_uid if d.miner_uid is not None else d.coldkey
+        k = (uid_or_ck, d.subnet_id)
+        if k in merged:
+            merged[k].merge_from(d)
         else:
-            merged[key] = d
+            merged[k] = d
     return list(merged.values())
 
 # ╭──────────────────────────── CAST EVENTS ───────────────────────────────╯
@@ -158,8 +151,8 @@ def _combine_deposits_by_miner_subnet(
 
 def cast_events(events: Sequence[TransferEvent]) -> List[AlphaDeposit]:
     """
-    Convert raw TransferEvents → AlphaDeposits, *dropping* any event whose
-    `subnet_id` is listed in FORBIDDEN_ALPHA_SUBNETS.
+    Convert TransferEvents → AlphaDeposits, *dropping* any event whose
+    destination subnet is listed in `FORBIDDEN_ALPHA_SUBNETS`.
     """
     kept: List[AlphaDeposit] = []
     dropped = 0
@@ -169,19 +162,19 @@ def cast_events(events: Sequence[TransferEvent]) -> List[AlphaDeposit]:
             continue
         kept.append(
             AlphaDeposit(
-                coldkey=ev.src_coldkey,     # reward goes to *origin* miner
+                coldkey=ev.src_coldkey,
                 subnet_id=ev.subnet_id,
                 alpha_raw=ev.amount_rao,
             )
         )
     if dropped:
         bt.logging.debug(
-            f"[rewards] {dropped} α-transfers ignored "
+            f"[rewards] {dropped} α‑transfers ignored "
             f"(forbidden subnets: {FORBIDDEN_ALPHA_SUBNETS})"
         )
     return kept
 
-# ╭────────────────────────────── PHASE 1 ─────────────────────────────────╯
+# ╭────────────────────────────── PHASE 1 ─────────────────────────────────╯
 
 
 async def scan_transfers(
@@ -189,18 +182,25 @@ async def scan_transfers(
 ) -> List[TransferEvent]:
     return await scanner.scan(from_block, to_block)
 
-# ╭────────────────────────────── PHASE 3 ─────────────────────────────────╯
+# ╭────────────────────────────── PHASE 2 ─────────────────────────────────╯
+# (no dedicated phase 2 – handled in cast/resolve)
+
+# ╭────────────────────────────── PHASE 3 ─────────────────────────────────╯
 
 
 async def resolve_miners(
     deposits: List[AlphaDeposit], *, uid_of_coldkey: MinerResolver
 ) -> None:
+    """
+    Fill `miner_uid` field by mapping cold‑keys → UIDs.
+    Unknown miners stay as `None` and will have their α burned silently.
+    """
     coldkeys = {d.coldkey for d in deposits}
     cache = {ck: await uid_of_coldkey(ck) for ck in coldkeys}
     for d in deposits:
         d.miner_uid = cache[d.coldkey]
 
-# ╭────────────────────────────── PHASE 4 ─────────────────────────────────╯
+# ╭────────────────────────────── PHASE 4 ─────────────────────────────────╯
 
 
 async def attach_prices(
@@ -221,14 +221,14 @@ async def attach_prices(
             raise RuntimeError(f"Price oracle returned None for subnet {sid}")
         price_cache[sid] = Decimal(str(p.tao))
 
-    bt.logging.info(f"Price Cache Dict: {price_cache}")
+    bt.logging.info(f"[rewards] price_cache: {price_cache}")
 
     for d in deposits:
         price = price_cache[d.subnet_id]
         d.avg_price = price
         d.tao_value = Decimal(d.alpha_raw) * price / DECIMALS
 
-# ╭────────────────────────────── PHASE 5 ─────────────────────────────────╯
+# ╭────────────────────────────── PHASE 5 ─────────────────────────────────╯
 
 
 async def apply_slippage(
@@ -244,7 +244,7 @@ async def apply_slippage(
 
     depth_pairs = await asyncio.gather(*(_gather(s) for s in subnets))
     depth_cache = dict(depth_pairs)
-    bt.logging.info(f"Depth Cache Dict: {depth_cache}")
+    bt.logging.info(f"[rewards] depth_cache: {depth_cache}")
 
     for d in deposits:
         depth = depth_cache[d.subnet_id]
@@ -252,20 +252,20 @@ async def apply_slippage(
             d.alpha_raw, d.avg_price, depth
         )
 
-# ╭────────────────────────────── PHASE 6 ─────────────────────────────────╯
+# ╭────────────────────────────── PHASE 6 ─────────────────────────────────╯
 
 
 def _aggregate_post_slip_tao(
     deposits: Iterable[AlphaDeposit],
 ) -> Dict[int, Decimal]:
     """
-    Map of {uid → post-slippage TAO}.
+    Map of {uid → post‑slippage TAO}.  
     Deposits whose miner UID could not be resolved are **ignored**.
     """
     by_uid: Dict[int, Decimal] = {}
     for d in deposits:
         if d.miner_uid is None:
-            continue  # skip unknown miners instead of burning
+            continue
         if d.tao_value_post_slip is None:
             continue
         by_uid[d.miner_uid] = (
@@ -289,23 +289,23 @@ async def compute_epoch_rewards(
     log: Callable[[str], None] | None = None,
 ) -> List[float]:
     """
-    Calculate **post-slippage TAO rewards** for each `miner_uid`.
+    Calculate **post‑slippage TAO rewards** for each `miner_uid`.
 
     Parameters
     ----------
     miner_uids
-        Order of miners to appear in the output list.
+        Order of miners that must appear in the output list.
     start_block / end_block
         Inclusive block range to inspect.
 
     Returns
     -------
-    rewards_list : List[float]
-        Post-slippage TAO amounts per miner **as native floats**,
-        aligned with `miner_uids`.
+    List[float]
+        Post‑slippage TAO amounts per miner **as native floats**
+        (aligned with `miner_uids`).
     """
 
-    # 1. TRANSFER COLLECTION ------------------------------------------------ #
+    # 1. TRANSFER COLLECTION ------------------------------------------- #
     if events is not None:
         raw = list(events)
         bt.logging.info(
@@ -316,7 +316,7 @@ async def compute_epoch_rewards(
         if scanner is None:
             raise ValueError("compute_epoch_rewards: need either events or scanner")
         bt.logging.info(
-            f"[rewards] Scanning transfers on-chain "
+            f"[rewards] Scanning transfers on‑chain "
             f"({start_block}-{end_block})…"
         )
         t0 = time.time()
@@ -325,19 +325,19 @@ async def compute_epoch_rewards(
             from_block=start_block,
             to_block=end_block,
         )
-        bt.logging.info(f"Scan finished in {time.time() - t0:.2f}s")
+        bt.logging.info(f"[rewards] scan finished in {time.time() - t0:.2f}s")
 
-    # 2. CAST -------------------------------------------------------------- #
+    # 2. CAST ----------------------------------------------------------- #
     deposits = cast_events(raw)
-    bt.logging.info(f"[rewards] Deposits (after cast): {deposits}")
+    bt.logging.info(f"[rewards] deposits(after cast): {deposits}")
 
-    # 3. RESOLVE MINERS ---------------------------------------------------- #
+    # 3. RESOLVE MINERS ------------------------------------------------- #
     await resolve_miners(deposits, uid_of_coldkey=uid_of_coldkey)
 
-    # 4. COMBINE ----------------------------------------------------------- #
+    # 4. COMBINE -------------------------------------------------------- #
     deposits = _combine_deposits_by_miner_subnet(deposits)
 
-    # 5. PRICE ------------------------------------------------------------- #
+    # 5. PRICE ---------------------------------------------------------- #
     await attach_prices(
         deposits,
         pricing=pricing,
@@ -345,19 +345,19 @@ async def compute_epoch_rewards(
         epoch_end=end_block,
     )
 
-    # 6. SLIPPAGE ---------------------------------------------------------- #
+    # 6. SLIPPAGE ------------------------------------------------------- #
     await apply_slippage(deposits, pool_depth_of=pool_depth_of)
 
-    # 7. AGGREGATE --------------------------------------------------------- #
-    rewards_dics_decimals = _aggregate_post_slip_tao(deposits)
-    bt.logging.info(f"[rewards] value_per_miner_dict: {rewards_dics_decimals}")
+    # 7. AGGREGATE ------------------------------------------------------ #
+    rewards_dec = _aggregate_post_slip_tao(deposits)
+    bt.logging.info(f"[rewards] value_per_miner_dict: {rewards_dec}")
 
-    # 8. BUILD FLOAT LIST -------------------------------------------------- #
+    # 8. BUILD FLOAT LIST ---------------------------------------------- #
     rewards_list_float: List[float] = [
-        float(rewards_dics_decimals.get(uid, Decimal(0))) for uid in miner_uids
+        float(rewards_dec.get(uid, Decimal(0))) for uid in miner_uids
     ]
     total_value = sum(rewards_list_float)
     bt.logging.info(f"[rewards] total_value: {total_value}")
-    bt.logging.info(f"[rewards] Rewards: {rewards_list_float}")
+    bt.logging.info(f"[rewards] rewards_list_float: {rewards_list_float}")
 
     return rewards_list_float

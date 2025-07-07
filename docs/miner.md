@@ -16,6 +16,7 @@ Before you spin up a miner in **Subnet 73 (SN73)**, ask yourself:
 
 Each epoch (~1 hour) an on-chain auction distributes **148 SN73 α-tokens** to miners, proportional to the total **τ-value** of α-tokens they supply from other subnets.
 
+
 ### 🔑 Key Points
 - 🪙 You bid with α-tokens *from any subnet except 73*
 - 📊 Your share of the 148 prize tokens is **proportional to your τ-value** at auction close
@@ -27,12 +28,35 @@ Each epoch (~1 hour) an on-chain auction distributes **148 SN73 α-tokens** to m
 
 ---
 
+## 🚀 How to Participate in Auctions
+
+**Send α (alpha) from any subnet _except 73_** to the **Treasury Address**:
+
+`5GW6xj5wUpLBz7jCNp38FzkdS6DfeFdUTuvUjcn6uKH5krsn`
+
+
+You may do this **manually**, or by using the **mining tools provided** – which automate stake transfers and require access to an **unlocked coldkey**.
+
+> ⚠️ **Important:**  
+> These tools are provided _as reference only_. Use them **at your own risk and responsibility**. Miners are **fully responsible** for the security of their wallets and funds. If you choose to use or adapt the tools, **ensure you follow best practices for key management and operational security**.
+
+### 🔐 Security Recommendations
+
+- Review and understand the code before use  
+- Dont have all the funds on hot coldkeys use for mining 
+- Use airgapped or hardware-enforced setups whenever possible
+- When using automtion scripts for bittensor use firewalled systems and inyect PASSWORD via environment variables or more advance SECRET handling systems.  
+
+Your security is paramount – treat your coldkeys with the same caution as your private bank credent
+
+---
+
 ## 🚀 Quick Start
 
 1. **🎯 Decide** which subnet's α you want to sell  
 2. **📥 Install** the MetaHash tooling and dependencies  
 3. **📝 Register** your miner (one-time per `coldkey`)  
-4. **💰 Fund** the same `coldkey` with the α you intend to bid  
+4. **💰 Fund** the miner `coldkey` you registered with the α you intend to bid  
 5. **🎲 Bid** manually or automate with the provided scripts
 
 ```bash
@@ -57,8 +81,8 @@ btcli s register \
 
 | 🛠️ Tool | 📋 Purpose | 💻 Example |
 |---------|------------|------------|
-| **📊 Leaderboard** | Monitor current and historical winners | `python scripts/miner/leaderboard.py --meta-netuid 73 --wallet.name YOUR_WALLET --wallet.hotkey YOUR_HOTKEY` |
-| **🤖 Auto-Bidder** | Automatically watch auctions and place incremental bids while respecting a minimum discount | `python scripts/miner/auction_watch.py --netuid SOURCE_SUBNET_ID --validator-hotkey VALIDATOR_HOTKEY_ADDRESS --wallet.name YOUR_WALLET --wallet.hotkey YOUR_HOTKEY --max-alpha 100 --step-alpha 5 --max-discount 8` |
+| **📊 Leaderboard** | Monitor current and historical winners | `python scripts/leaderboard.py --meta-netuid 73 --wallet.name YOUR_WALLET --wallet.hotkey YOUR_HOTKEY` |
+| **🤖 Auto-Bidder** | Automatically watch auctions and place incremental bids while respecting a minimum discount | `python scripts/wallet_access/auto-bidder.py --netuid SOURCE_SUBNET_ID --validator-hotkey VALIDATOR_HOTKEY_ADDRESS --wallet.name YOUR_WALLET --wallet.hotkey YOUR_HOTKEY --max-alpha 100 --step-alpha 5 --max-discount 8` |
 
 ### 🤖 Auto-Bidder Workflow
 - ▶️ Starts bidding when a new auction opens
@@ -89,28 +113,9 @@ btcli s register \
 | ✅ **Allowed** | ❌ **Forbidden** |
 |----------------|------------------|
 | 🪙 α-tokens from any subnet except 73 | 🚫 Sending SN73 α back into the auction |
-| 🔄 Multiple concurrent auctions | 🚫 More than one registration per coldkey |
-| 🤖 Automation and custom scripts | — |
+| 🔄 Multiple hotkeys per coldkey | 🚫 YOu can register them but they will not receive incentive |
 
 > 🎯 **Goal**: Maximise the τ-value you send while paying the lowest discount.
-
----
-
-## 🏆 Winning Strategies
-
-### ⚡ Be Fast
-- 🚀 Bid early to lock higher discounts
-- 🤖 Automate to stay ahead of manual competitors
-
-### 🧠 Be Smart
-- 🎯 Define a minimum acceptable discount and step-alpha to avoid over-bidding
-- 👀 Monitor the leaderboard before each auction to gauge competition
-- 💡 Only bid surplus α to avoid harming your main subnet
-
-### 🛡️ Be Safe
-- 🛑 Abort when an auction becomes over-subscribed—late bids can dilute everyone's discount
-- 📊 Track your ROI across multiple epochs; refine parameters gradually
-- 🐣 Start small; scale after several successful runs
 
 ---
 
@@ -118,29 +123,9 @@ btcli s register \
 
 | 🎯 Scenario | 🔍 Indicators | 📈 Outcome |
 |-------------|---------------|------------|
-| 🟢 **Low Competition** | 👥 Few miners, thin τ-value | 💰 Deep discount, high returns |
-| 🟡 **Moderate Competition** | 👥👥 Several miners, rising τ-value | 📊 Reduced but still positive discount |
-| 🔴 **Over-Subscribed** | 👥👥👥 Many miners join late | 💸 Discount collapses; you may earn nothing |
-
----
-
-## ✅ Getting Started Checklist
-
-- [ ] 🪙 Acquire α-tokens on other subnets
-- [ ] 👛 Prepare a wallet (wallet.name) and hotkey (wallet.hotkey)
-- [ ] 📝 Register on SN73 once
-- [ ] 👀 Observe several auctions via the leaderboard
-- [ ] ⚙️ Configure and dry-run the auto-bidder
-- [ ] 📈 Scale up bids as confidence grows
-
----
-
-## 📋 Requirements
-
-- 🐍 Python ≥ 3.10
-- 👛 btcli wallet set up
-- 🪙 α-tokens from subnets other than 73
-- 🧠 Basic understanding of Dutch/weighted auctions
+| 🟢 **Low Competition** | 👥 Few miners, thin τ-value | 💰 Profit, high returns |
+| 🟡 **Moderate Competition** | 👥👥 Several miners, rising τ-value | 📊 Reduced but still positive profits for miners |
+| 🔴 **Over-Subscribed** | 👥👥👥 Many miners join late | 💸 Profit collapses; Discount on alpha sent. Expected equilibrium |
 
 ---
 

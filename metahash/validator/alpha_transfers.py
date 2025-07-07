@@ -1,10 +1,10 @@
 # ====================================================================== #
 #  metahash/validator/alpha_transfers.py                                 #
-#  Patched 2025‑07‑03 – explicit src/dest cold‑keys in TransferEvent     #
-#                        – serialise every RPC call via an asyncio.Lock  #
-#                        – use α‑amount from StakeAdded instead of TAO   #
+#  Patched 2025‑07‑07 – close cross‑subnet α‑swap loophole                #
+#                           • track   src_netuid  via companion events    #
+#                           • discard src_netuid ≠ dest_netuid transfers #
+#                           • keep API 100 % backward‑compatible         #
 # ====================================================================== #
-
 from __future__ import annotations
 
 import asyncio
@@ -12,7 +12,7 @@ from dataclasses import dataclass, replace
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import bittensor as bt
-import websockets  # needed for WebSocketException subclasses
+import websockets                                           # WS errors
 from substrateinterface.utils.ss58 import (
     ss58_decode as _ss58_decode_generic,
     ss58_encode as _ss58_encode_generic,
@@ -28,44 +28,50 @@ DUMP_LAST = 5
 
 # ── dataclasses ───────────────────────────────────────────────────────── #
 
-
 @dataclass(slots=True, frozen=True)
 class TransferEvent:
-    """Container for a single α‑stake transfer."""
+    """
+    Container for a single α‑stake transfer.
 
+    • **subnet_id**      – destination netuid (unchanged public API)
+    • **src_subnet_id**  – origin netuid            (new, may be None)
+    • **from_uid / to_uid** – UIDs in the *destination* subnet
+    • **amount_rao**     – α amount in planck
+    • **src_coldkey / dest_coldkey** – 32 byte SS58
+    """
     block: int
     from_uid: int
     to_uid: int
-    subnet_id: int
-    # NOTE: Despite the name this now carries the amount of **α** (in RAO).
+
+    subnet_id: int             # ← destination (kept for API compatibility)
     amount_rao: int
-    # Explicit cold‑keys
+
     src_coldkey: Optional[str]
     dest_coldkey: Optional[str]
     src_coldkey_raw: Optional[bytes]
     dest_coldkey_raw: Optional[bytes]
 
+    # NEW – origin netuid (None if companion StakeRemoved is missing)
+    src_subnet_id: Optional[int] = None
 
-# ── SS58 helpers ──────────────────────────────────────────────────────── #
 
-def _encode_ss58(raw: bytes, fmt: int) -> str:  # noqa: D401
-    """Encode 32‑byte account‐ID using Substrate’s SS58 format *fmt*."""
+# ── SS58 helpers (unchanged) ──────────────────────────────────────────── #
+
+def _encode_ss58(raw: bytes, fmt: int) -> str:                # noqa: D401
     try:
         return _ss58_encode_generic(raw, fmt)
-    except TypeError:  # very old substrate‑interface
+    except TypeError:
         return _ss58_encode_generic(raw, address_type=fmt)
 
 
-def _decode_ss58(addr: str) -> bytes:  # noqa: D401
-    """Inverse of :func:`_encode_ss58`."""
+def _decode_ss58(addr: str) -> bytes:                         # noqa: D401
     try:
         return _ss58_decode_generic(addr)
-    except TypeError:  # very old substrate‑interface
+    except TypeError:
         return _ss58_decode_generic(addr, valid_ss58_format=True)
 
 
-def _account_id(obj) -> bytes | None:  # noqa: ANN001,D401
-    """Best‑effort extraction of a 32‑byte *AccountId* from various shapes."""
+def _account_id(obj) -> bytes | None:                         # noqa: ANN001,D401
     if isinstance(obj, (bytes, bytearray)) and len(obj) == 32:
         return bytes(obj)
     if isinstance(obj, (list, tuple)):
@@ -83,18 +89,18 @@ def _account_id(obj) -> bytes | None:  # noqa: ANN001,D401
     return None
 
 
-# ── generic event accessors ───────────────────────────────────────────── #
+# ── generic event accessors (unchanged) ───────────────────────────────── #
 
-def _event_name(ev) -> str:  # noqa: ANN001
+def _event_name(ev) -> str:                                   # noqa: ANN001
     ev = ev.get("event", ev) if isinstance(ev, dict) else getattr(ev, "event", ev)
-    if hasattr(ev, "method"):  # object style
+    if hasattr(ev, "method"):
         return str(ev.method)
     if isinstance(ev, dict):
         return str(ev.get("event_id") or ev.get("name", "<unknown>"))
     return "<unknown>"
 
 
-def _event_fields(ev) -> Sequence:  # noqa: ANN001
+def _event_fields(ev) -> Sequence:                            # noqa: ANN001
     ev = ev.get("event", ev) if isinstance(ev, dict) else getattr(ev, "event", ev)
     if isinstance(ev, dict):
         return ev.get("attributes") or ev.get("params") or ev.get("data") or ()
@@ -106,7 +112,7 @@ def _event_fields(ev) -> Sequence:  # noqa: ANN001
     )
 
 
-def _f(params, idx, default=None):  # noqa: ANN001
+def _f(params, idx, default=None):                            # noqa: ANN001
     try:
         val = params[idx]
         return val["value"] if isinstance(val, dict) and "value" in val else val
@@ -121,25 +127,33 @@ def _mask(ck: Optional[str]) -> str:
 # ── parser helpers ────────────────────────────────────────────────────── #
 
 def _parse_stake_transferred(
-    params, fmt: int, treasury_raw: Optional[bytes]
-) -> TransferEvent:  # noqa: ANN001
-    """Parse *StakeTransferred* event parameters (legacy ≤ v8 *or* v9+)."""
+    params, fmt: int
+) -> TransferEvent:                                           # noqa: ANN001
+    """
+    Parse StakeTransferred event parameters (chain v8 & v9+).
 
+    Expected layout (v9+):
+        0  from_coldkey
+        1  dest_coldkey           (treasury)
+        2  hotkey_staked_to
+        3  dest_netuid            ←── our `subnet_id`
+        4  to_uid
+        5  amount (TAO)           ←── patched later with α
+
+    Old‑chain variants fall back gracefully.
+    """
     from_coldkey_raw = _account_id(_f(params, 0))
     dest_coldkey_raw = _account_id(_f(params, 1))
-    hotkey_staked_to = _account_id(_f(params, 2))  # noqa: F841 – kept for dbg
 
-    subnet_id = int(_f(params, 3, -1))
-    from_uid = subnet_id  
+    subnet_id = int(_f(params, 3, -1))            # destination netuid
     to_uid = int(_f(params, 4, -1))
-    amount_placeholder = int(_f(params, 5, 0))  # TAO amount – **will be patched**
 
     return TransferEvent(
         block=-1,
-        from_uid=from_uid,
+        from_uid=-1,                               # origin UID not provided
         to_uid=to_uid,
-        subnet_id=subnet_id,
-        amount_rao=amount_placeholder,
+        subnet_id=subnet_id,                       # = dest netuid
+        amount_rao=int(_f(params, 5, 0)),          # placeholder
         src_coldkey=_encode_ss58(from_coldkey_raw, fmt),
         dest_coldkey=_encode_ss58(dest_coldkey_raw, fmt),
         src_coldkey_raw=from_coldkey_raw,
@@ -147,25 +161,25 @@ def _parse_stake_transferred(
     )
 
 
-def _amount_from_stake_removed(params) -> int:  # noqa: ANN001
-    """Return TAO amount from *StakeRemoved* (index 2)."""
+def _amount_from_stake_removed(params) -> int:                 # noqa: ANN001
     return int(_f(params, 2, 0))
 
 
-def _amount_from_stake_added(params) -> int:  # noqa: ANN001
-    """Return **α** amount from *StakeAdded*.
-
-    Empirically the amount sits at index 3 for v9+ chains; if that fails we
-    fall back to index 2 for older chains.
-    """
+def _amount_from_stake_added(params) -> int:                   # noqa: ANN001
     return int(_f(params, 3, _f(params, 2, 0)))
 
 
-# ── main scanner class (async) ────────────────────────────────────────── #
+def _subnet_from_stake_removed(params) -> int:                 # noqa: ANN001
+    return int(_f(params, 1, -1))      # v9+: [hotkey, netuid, amount]
 
+
+def _subnet_from_stake_added(params) -> int:                   # noqa: ANN001
+    return int(_f(params, 1, -1))
+
+# ── main scanner class ───────────────────────────────────────────────── #
 
 class AlphaTransfersScanner:
-    """Scans a block‑range for α‑stake transfers to *one* treasury cold‑key."""
+    """Scans a block‑range for α‑stake transfers to one treasury cold‑key."""
 
     def __init__(
         self,
@@ -186,13 +200,10 @@ class AlphaTransfersScanner:
         self.on_progress = on_progress
         self.max_conc = max_concurrency
         self.ss58_format = subtensor.substrate.ss58_format
-
-        # One shared lock per websocket connection – injected by Validator.
         self._rpc_lock: asyncio.Lock = rpc_lock or asyncio.Lock()
 
     # ------------------------------------------------------------------ #
     async def _rpc(self, fn, *a, **kw):
-        """Helper that serialises **all** RPC calls hitting the websocket."""
         async with self._rpc_lock:
             return await maybe_async(fn, *a, **kw)
 
@@ -202,16 +213,10 @@ class AlphaTransfersScanner:
 
     # ------------------------------------------------------------------ #
     async def scan(self, frm: int, to: int) -> List[TransferEvent]:
-        """Return all α‑stake transfers in the **safe** range *[frm, to]*."""
-
         if frm > to:
             return []
 
-        safe_to = to
-        if safe_to < frm:
-            return []
-
-        total = safe_to - frm + 1
+        total = to - frm + 1
         bt.logging.info(f"Scanner: frm={frm}  to={to}  ({total} blocks)")
 
         q: asyncio.Queue[int | None] = asyncio.Queue()
@@ -222,14 +227,14 @@ class AlphaTransfersScanner:
             if self.on_progress:
                 self.on_progress(blk_cnt, ev_cnt, keep_cnt)
 
-        # ── producer ───────────────────────────────────────────────────
+        # producer ----------------------------------------------------- #
         async def producer():
-            for bn in range(frm, safe_to + 1):
+            for bn in range(frm, to + 1):
                 await q.put(bn)
             for _ in range(self.max_conc):
-                await q.put(None)  # sentinel
+                await q.put(None)
 
-        # ── worker ─────────────────────────────────────────────────────
+        # worker ------------------------------------------------------- #
         async def worker():
             nonlocal blk_cnt, ev_cnt, keep_cnt
             while True:
@@ -239,10 +244,7 @@ class AlphaTransfersScanner:
                 try:
                     raw_events = await self._get_events_at(bn)
                 except websockets.exceptions.WebSocketException as err:
-                    # Reconnect once, then retry the block.
-                    bt.logging.warning(
-                        f"RPC error at block {bn}: {err}; reconnecting…"
-                    )
+                    bt.logging.warning(f"RPC error at block {bn}: {err}; reconnecting…")
                     async with self._rpc_lock:
                         await self.st.__aexit__(None, None, None)
                         await self.st.initialize()
@@ -253,7 +255,7 @@ class AlphaTransfersScanner:
                     raw_events,
                     bucket,
                     block_hint_single=bn,
-                    dump=self.dump_events and bn >= safe_to - self.dump_last + 1,
+                    dump=self.dump_events and bn >= to - self.dump_last + 1,
                 )
                 ev_cnt += seen
                 keep_cnt += kept
@@ -262,7 +264,6 @@ class AlphaTransfersScanner:
                     bt.logging.info(f"… scanned {blk_cnt} / {total} blocks")
                 await _flush_progress()
 
-        # ── run producer & N workers ───────────────────────────────────
         await asyncio.gather(
             producer(),
             *[asyncio.create_task(worker()) for _ in range(self.max_conc)],
@@ -273,7 +274,7 @@ class AlphaTransfersScanner:
         )
         await _flush_progress()
 
-        # ── flatten deterministically ──────────────────────────────────
+        # deterministic order ----------------------------------------- #
         ordered_events: List[TransferEvent] = []
         for bn in sorted(events_by_block.keys()):
             ordered_events.extend(events_by_block[bn])
@@ -288,45 +289,73 @@ class AlphaTransfersScanner:
         block_hint_single: int,
         dump: bool,
     ) -> Tuple[int, int]:
-        """Filters one block’s events; mutates *out*; returns *(seen, kept)*."""
+        """
+        Filters one block’s events; mutates *out*; returns (seen, kept).
+
+        • src_netuid is picked from companion StakeRemoved (if present)
+        • amount_rao is replaced by α from companion StakeAdded (preferred)
+        • Cross‑net transfers (src_netuid ≠ dest_netuid) are **dropped**
+        """
 
         seen = kept = 0
-        removed_by_x: Dict[int, int] = {}
-        added_by_x: Dict[int, int] = {}
+        rem_amount: Dict[int, int] = {}
+        add_amount: Dict[int, int] = {}
+        rem_netuid: Dict[int, int] = {}
+        add_netuid: Dict[int, int] = {}
 
-        # ── first pass: map companion events by *extrinsic_idx* ────────
+        # pass‑1: collect companion data ------------------------------ #
         for ev in raw_events:
-            name = _event_name(ev)
             x = ev.get("extrinsic_idx")
             if x is None:
                 continue
+            name = _event_name(ev)
             fields = _event_fields(ev)
-            if name == "StakeRemoved":
-                removed_by_x[x] = _amount_from_stake_removed(fields)
-            elif name == "StakeAdded":
-                added_by_x[x] = _amount_from_stake_added(fields)
 
-        # ── second pass: process *StakeTransferred* ────────────────────
+            if name == "StakeRemoved":
+                rem_amount[x] = _amount_from_stake_removed(fields)
+                rem_netuid[x] = _subnet_from_stake_removed(fields)
+
+            elif name == "StakeAdded":
+                add_amount[x] = _amount_from_stake_added(fields)
+                add_netuid[x] = _subnet_from_stake_added(fields)
+
+        # pass‑2: process StakeTransferred ---------------------------- #
         for ev in raw_events:
             if _event_name(ev) != "StakeTransferred":
                 continue
             seen += 1
             fields = _event_fields(ev)
+
             try:
-                te = _parse_stake_transferred(
-                    fields, self.ss58_format, self.dest_ck_raw
-                )
+                te = _parse_stake_transferred(fields, self.ss58_format)
             except Exception as exc:  # pragma: no cover
                 bt.logging.debug(f"Malformed event skipped: {exc}")
                 continue
 
-            # Patch amount – prefer α from *StakeAdded*, else token burn, else raw
             x = ev.get("extrinsic_idx")
+
+            # enrich amount + netuid data from pass‑1
             if x is not None:
-                if x in added_by_x:
-                    te = replace(te, amount_rao=added_by_x[x])
-                elif x in removed_by_x:  # legacy burn‑companion
-                    te = replace(te, amount_rao=removed_by_x[x])
+                if x in add_amount:
+                    te = replace(te, amount_rao=add_amount[x])
+                if x in rem_netuid:
+                    te = replace(te, src_subnet_id=rem_netuid[x])
+                if x in add_netuid and add_netuid[x] != te.subnet_id:
+                    # metadata mismatch (should **never** happen) – log & continue
+                    bt.logging.warning(
+                        f"Inconsistent dest netuid in x={x}: "
+                        f"event={te.subnet_id}  add_netuid={add_netuid[x]}"
+                    )
+
+            # ── SECURITY GATE – drop cross‑subnet transfers ───────── #
+            if te.src_subnet_id is not None and te.src_subnet_id != te.subnet_id:
+                if dump:
+                    bt.logging.info(
+                        f"[blk {block_hint_single}] cross‑net α‑transfer "
+                        f"{te.src_subnet_id} ➞ {te.subnet_id}  "
+                        f"(amount={te.amount_rao})  **IGNORED**"
+                    )
+                continue
 
             te = replace(te, block=block_hint_single)
 
@@ -338,12 +367,12 @@ class AlphaTransfersScanner:
                 kept += 1
                 out.append(te)
 
-            if dump:
+            if dump and matches:
                 bt.logging.info(
-                    f"[blk {block_hint_single}] StakeTransferred uid={te.from_uid}→{te.to_uid} "
+                    f"[blk {block_hint_single}] StakeTransferred "
+                    f"net={te.subnet_id} uid={te.from_uid}->{te.to_uid}  "
                     f"src={_mask(te.src_coldkey)} dest={_mask(te.dest_coldkey)} "
-                    f"amt={te.amount_rao} "
-                    f"{'KEPT' if matches else 'SKIP'}"
+                    f"α={te.amount_rao}  **KEPT**"
                 )
 
         return seen, kept

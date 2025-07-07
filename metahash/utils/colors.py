@@ -32,6 +32,10 @@ class ColoredLogger:
     }
 
     @staticmethod
+    def set_level(level) -> str:
+        bt.logging.setLevel(level)
+
+    @staticmethod
     def _colored_msg(message: str, color: str) -> str:
         """Return the colored message based on the color provided."""
         if color not in ColoredLogger._COLORS:

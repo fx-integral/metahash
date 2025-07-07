@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # --------------------------------------------------------------------------- #
-#  auction_watch.py – v8  (Rich table output)                                 #
+#  auto-bidder.py – v8  (Rich table output)                                 #
 # --------------------------------------------------------------------------- #
 from __future__ import annotations
 
