@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
 send_test_alpha.py – One-shot Alpha transfer helper
+Now with secure password management!
 """
 import argparse
 import asyncio
-import os
 import sys
 
 import bittensor as bt
 from metahash.utils.wallet_utils import transfer_alpha
+from metahash.utils.secure_wallet import load_wallet_secure
 from dotenv import load_dotenv
 from loguru import logger
 from metahash.config import TREASURY_COLDKEY
@@ -25,7 +26,7 @@ load_dotenv()
 
 def setup_logging(level: str = "INFO") -> None:
     """
-    Configure Loguru **once** and then point Bittensor’s helper
+    Configure Loguru **once** and then point Bittensor's helper
     (`bt.logging`) at the very same Loguru logger.
     """
     fmt = (
@@ -45,34 +46,16 @@ def die(msg: str) -> None:
     sys.exit(1)
 
 
-def load_wallet(cold: str, hot: str) -> bt.wallet:
-    logger.debug("Loading wallet cold=%s hot=%s", cold, hot)
-    pwd = os.getenv("WALLET_PASSWORD")
-    if not pwd:
-        die("WALLET_PASSWORD not set")
-
-    w = bt.wallet(name=cold, hotkey=hot)
-    w.coldkey_file.save_password_to_env(pwd)
-    try:
-        w.unlock_coldkey()
-    except Exception as e:  # noqa: BLE001
-        die(f"cannot unlock cold-key: {e}")
-
-    logger.debug(
-        "Wallet unlocked (cold=%s hot=%s)",
-        w.coldkey.ss58_address,
-        w.hotkey.ss58_address,
-    )
-    return w
-
-
 async def run(args: argparse.Namespace) -> None:
     # 1. Connect
     subtensor = bt.AsyncSubtensor(network=args.network)
     await subtensor.initialize()
 
-    # 2. Wallet
-    wallet = load_wallet(args.coldkey, args.hotkey)
+    # 2. Wallet - using secure manager
+    try:
+        wallet = load_wallet_secure(args.coldkey, args.hotkey)
+    except Exception as e:
+        die(f"Failed to load wallet: {e}")
 
     dest = args.dest or TREASURY_COLDKEY
     logger.info(  # ← now logger, not bt.logging
@@ -104,18 +87,25 @@ async def run(args: argparse.Namespace) -> None:
 
 # ────────────────────────── CLI ────────────────────────────
 if __name__ == "__main__":
-    p = argparse.ArgumentParser(description="Send Alpha from any wallet to a coldkey")
-    p.add_argument("--coldkey", required=True)
-    p.add_argument("--hotkey", required=True)
-    p.add_argument("--validator_hotkey", required=True)
-    p.add_argument("--dest", default=TREASURY_COLDKEY)
-    p.add_argument("--amount", type=float, default=10)
-    p.add_argument("--netuid",type=int)
-    p.add_argument("--network", default=DEFAULT_BITTENSOR_NETWORK)
-    p.add_argument("--wait-final", action="store_true")
+    p = argparse.ArgumentParser(
+        description="Send Alpha from any wallet to a coldkey (secure version)"
+    )
+    p.add_argument("--coldkey", required=True, help="Coldkey name")
+    p.add_argument("--hotkey", required=True, help="Hotkey name")
+    p.add_argument("--validator_hotkey", required=True, help="Validator hotkey address")
+    p.add_argument("--dest", default=TREASURY_COLDKEY, help="Destination coldkey")
+    p.add_argument("--amount", type=float, default=10, help="Amount of ALPHA to send")
+    p.add_argument("--netuid", type=int, help="Subnet ID")
+    p.add_argument("--network", default=DEFAULT_BITTENSOR_NETWORK, help="Network to use")
+    p.add_argument("--wait-final", action="store_true", help="Wait for finalization")
     p.add_argument("--log-level", default="DEBUG", help="DEBUG, INFO, WARNING …")
+    
     args = p.parse_args()
 
     # configure sinks *before* anything logs
     setup_logging(args.log_level)
+    
+    print("\n🔒 Secure Wallet Manager Active")
+    print("📝 You will be prompted for password if not stored in keyring\n")
+    
     asyncio.run(run(args))
