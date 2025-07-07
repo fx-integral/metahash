@@ -191,6 +191,7 @@ class Validator(EpochValidatorNeuron):
         """
         Reward accounting for the **previous** epoch, then weight update.
         """
+        self._last_validated_epoch = 1
         if prev_epoch_index < 0 or prev_epoch_index == self._last_validated_epoch:
             bt.logging.error(
                 f"Phase 1 skipped – epoch {prev_epoch_index} already evaluated"
@@ -233,7 +234,7 @@ class Validator(EpochValidatorNeuron):
         else:
             self.update_scores(rewards, miner_uids)
 
-        # ── ✅  setting weights on-chain  ────────────────────────── #
+        # ── ✅  broadcast weights on-chain  ────────────────────────── #
         if not self.config.no_epoch:          # honour --no-epoch flag
             self.set_weights()               
 
