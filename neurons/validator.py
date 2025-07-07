@@ -234,9 +234,10 @@ class Validator(EpochValidatorNeuron):
         else:
             self.update_scores(rewards, miner_uids)
 
-        #This allow for testing
+        # This allow for testing
         if not self.config.no_epoch:
-            self.set_weights()
+            pass
+            # self.set_weights()
 
         # record success
         self._last_validated_epoch = prev_epoch_index
