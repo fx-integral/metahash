@@ -1,13 +1,16 @@
 # ╭──────────────────────────────────────────────────────────────────────╮
 # neurons/validator.py                                                   #
-# Patched 2025‑07‑07 – complies with new TransferEvent signature         #
+# Patched 2025‑07‑07 – persists *all* validated epochs for easy editing  #
+#                                                                       #
+#  * Complies with new TransferEvent signature                           #
+#  * Disk‑deduplicates epochs across restarts via JSON array persistence #
 # ╰──────────────────────────────────────────────────────────────────────╯
 from __future__ import annotations
 
 import asyncio
 import json
 import time
-from dataclasses import replace               # ← NEW
+from dataclasses import replace
 from pathlib import Path
 from typing import Callable, List, Optional, Union
 
@@ -24,14 +27,14 @@ from metahash.validator.epoch_validator import EpochValidatorNeuron
 from metahash.utils.subnet_utils import average_depth, average_price
 
 # ────────────────────────── persistence constants ────────────────────── #
-STATE_FILE = "last_epoch_state.json"
-STATE_KEY = "last_validated_epoch"
+STATE_FILE = "validated_epochs.json"
+STATE_KEY = "validated_epochs"
 
 
 class Validator(EpochValidatorNeuron):
     """
-    Adaptive validator – executes exactly **once** per epoch head, even
-    across restarts, thanks to disk‑based epoch de‑duplication.
+    Adaptive validator – guarantees **exactly one** execution per epoch head,
+    even across restarts, by persisting the set of validated epochs to disk.
     """
 
     # ───────────────────────── initialization ───────────────────────── #
@@ -46,11 +49,14 @@ class Validator(EpochValidatorNeuron):
 
         # Runtime state
         self._async_subtensor: Optional[bt.AsyncSubtensor] = None
-        self._last_validated_epoch: Optional[int] = self._load_last_epoch()
+        self._validated_epochs: set[int] = self._load_validated_epochs()
 
     # ╭─────────────────────── persistence helpers ─────────────────────╮
     def _state_path(self) -> Path:
-        """Derive the JSON state‑file path next to the wallet hot‑key file."""
+        """
+        Return the JSON state‑file path (next to wallet hot‑key file).
+        Creates the parent folder if needed.
+        """
         hotkey_file: Union[str, Path, "bt.Keyfile"] = self.wallet.hotkey_file
         if isinstance(hotkey_file, (str, Path)):
             hotkey_path = Path(hotkey_file)
@@ -61,20 +67,32 @@ class Validator(EpochValidatorNeuron):
         wallet_root.mkdir(parents=True, exist_ok=True)
         return wallet_root / STATE_FILE
 
-    def _load_last_epoch(self) -> Optional[int]:
+    def _load_validated_epochs(self) -> set[int]:
+        """
+        Returns a *set* with all epochs already validated, or an empty set.
+        Expected on‑disk schema:  {"validated_epochs": [0, 1, 2, …]}
+        """
         try:
-            val = int(json.loads(self._state_path().read_text()).get(STATE_KEY))
-            bt.logging.info(f"[state] loaded last epoch = {val}")
-            return val
+            data = json.loads(self._state_path().read_text())
+            epochs = set(int(x) for x in data.get(STATE_KEY, []))
+            bt.logging.info(f"[state] loaded {len(epochs)} validated epochs")
+            return epochs
         except Exception:
-            return None
+            return set()
 
-    def _save_last_epoch(self, idx: int):
+    def _save_validated_epochs(self):
+        """
+        Atomically writes the set of validated epochs back to disk.
+        """
         try:
-            self._state_path().write_text(json.dumps({STATE_KEY: idx}))
-            bt.logging.debug(f"[state] wrote last epoch = {idx}")
+            tmp_path = self._state_path().with_suffix(".tmp")
+            tmp_path.write_text(json.dumps({STATE_KEY: sorted(self._validated_epochs)}))
+            tmp_path.replace(self._state_path())
+            bt.logging.debug(
+                f"[state] stored {len(self._validated_epochs)} validated epochs"
+            )
         except Exception as e:
-            bt.logging.warning(f"[state] failed to store epoch {idx}: {e}")
+            bt.logging.warning(f"[state] failed to persist epochs: {e}")
 
     # ╭────────────────── async‑substrate helper ───────────────────────╮
     async def _ensure_async_subtensor(self):
@@ -87,7 +105,7 @@ class Validator(EpochValidatorNeuron):
     def _make_scanner(self, async_subtensor: bt.AsyncSubtensor):
         """
         Returns an object that conforms to the TransferScanner Protocol
-        expected by `compute_epoch_rewards`.
+        expected by compute_epoch_rewards.
         """
         from metahash.validator.alpha_transfers import (
             AlphaTransfersScanner as _AlphaScanner,
@@ -189,10 +207,9 @@ class Validator(EpochValidatorNeuron):
         async_subtensor: bt.AsyncSubtensor,
     ) -> None:
         """
-        Reward accounting for the **previous** epoch, then weight update.
+        Reward accounting for the **previous** epoch, followed by weight update.
         """
-        self._last_validated_epoch = 1
-        if prev_epoch_index < 0 or prev_epoch_index == self._last_validated_epoch:
+        if prev_epoch_index < 0 or prev_epoch_index in self._validated_epochs:
             bt.logging.error(
                 f"Phase 1 skipped – epoch {prev_epoch_index} already evaluated"
             )
@@ -236,11 +253,11 @@ class Validator(EpochValidatorNeuron):
 
         # ── ✅  broadcast weights on-chain  ────────────────────────── #
         if not self.config.no_epoch:          # honour --no-epoch flag
-            self.set_weights()               
+            self.set_weights()
 
-        # record success
-        self._last_validated_epoch = prev_epoch_index
-        self._save_last_epoch(prev_epoch_index)
+        # record success and persist
+        self._validated_epochs.add(prev_epoch_index)
+        self._save_validated_epochs()
 
     # ╭──────────────────────────── main loop ──────────────────────────╮
     async def forward(self) -> None:
@@ -256,7 +273,7 @@ class Validator(EpochValidatorNeuron):
         prev_end_block = current_start - 1
         prev_epoch_index = self.epoch_index - 1
 
-        if False and prev_epoch_index == self._last_validated_epoch:
+        if prev_epoch_index in self._validated_epochs:
             bt.logging.info(
                 f"[forward] epoch {prev_epoch_index} already done – nothing to do."
             )
