@@ -1,17 +1,19 @@
 # ╭──────────────────────────────────────────────────────────────────────╮
 # neurons/validator.py                                                   #
+# Patched 2025‑07‑07 – complies with new TransferEvent signature         #
 # ╰──────────────────────────────────────────────────────────────────────╯
 from __future__ import annotations
 
 import asyncio
 import json
 import time
+from dataclasses import replace               # ← NEW
 from pathlib import Path
 from typing import Callable, List, Optional, Union
 
 import bittensor as bt
 from metahash.base.utils.logging import ColoredLogger as clog
-from metahash.config import (                 # project‑level constants
+from metahash.config import (
     TREASURY_COLDKEY,
     AUCTION_DELAY_BLOCKS,
     FORCE_BURN_WEIGHTS,
@@ -48,9 +50,7 @@ class Validator(EpochValidatorNeuron):
 
     # ╭─────────────────────── persistence helpers ─────────────────────╮
     def _state_path(self) -> Path:
-        """
-        Derive the JSON state‑file path next to the wallet hot‑key file.
-        """
+        """Derive the JSON state‑file path next to the wallet hot‑key file."""
         hotkey_file: Union[str, Path, "bt.Keyfile"] = self.wallet.hotkey_file
         if isinstance(hotkey_file, (str, Path)):
             hotkey_path = Path(hotkey_file)
@@ -117,12 +117,12 @@ class Validator(EpochValidatorNeuron):
                     except IndexError:
                         return None
 
+                # ── FIX: clone each event, override only missing fields ── #
                 return [
-                    TransferEvent(
+                    replace(
+                        ev,
                         src_coldkey=ev.src_coldkey or _uid_to_ck(ev.from_uid),
                         dest_coldkey=ev.dest_coldkey or outer.treasury_coldkey,
-                        subnet_id=ev.subnet_id,
-                        amount_rao=ev.amount_rao,
                     )
                     for ev in raw
                     if (ev.src_coldkey or _uid_to_ck(ev.from_uid)) is not None
@@ -165,7 +165,6 @@ class Validator(EpochValidatorNeuron):
 
     def _make_uid_resolver(self) -> Callable[[str], asyncio.Future]:
         """Cold‑key → UID resolver, refreshed each epoch."""
-
         async def _resolver(coldkey: str) -> Optional[int]:
             if len(self.metagraph.coldkeys) != getattr(self, "_ck_cache_size", 0):
                 self._cold_to_uid_cache = {
@@ -233,11 +232,6 @@ class Validator(EpochValidatorNeuron):
             )
         else:
             self.update_scores(rewards, miner_uids)
-
-        # This allow for testing
-        if not self.config.no_epoch:
-            pass
-            # self.set_weights()
 
         # record success
         self._last_validated_epoch = prev_epoch_index
