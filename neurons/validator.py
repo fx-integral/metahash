@@ -233,6 +233,10 @@ class Validator(EpochValidatorNeuron):
         else:
             self.update_scores(rewards, miner_uids)
 
+        # ── ✅  broadcast weights on-chain  ────────────────────────── #
+        if not self.config.no_epoch:          # honour --no-epoch flag
+            self.set_weights()               
+
         # record success
         self._last_validated_epoch = prev_epoch_index
         self._save_last_epoch(prev_epoch_index)
