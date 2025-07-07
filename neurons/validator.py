@@ -256,7 +256,7 @@ class Validator(EpochValidatorNeuron):
         prev_end_block = current_start - 1
         prev_epoch_index = self.epoch_index - 1
 
-        if prev_epoch_index == self._last_validated_epoch:
+        if False and prev_epoch_index == self._last_validated_epoch:
             bt.logging.info(
                 f"[forward] epoch {prev_epoch_index} already done – nothing to do."
             )
