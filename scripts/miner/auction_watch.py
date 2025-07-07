@@ -20,9 +20,7 @@ from metahash.config import (
 from metahash.utils.colors import ColoredLogger as clog
 from metahash.utils.subnet_utils import average_price, average_depth, subnet_price
 from metahash.validator.rewards import compute_epoch_rewards, TransferEvent
-from metahash.utils.wallet_utils import transfer_alpha
-
-# Import secure manager
+from metahash.utils.wallet_utils import load_wallet, transfer_alpha
 from metahash.utils.secure_wallet import load_wallet_secure
 
 # ───── Rich for pretty tables ───── #
@@ -40,7 +38,7 @@ DEFAULT_STEP_ALPHA = Decimal("0.01")
 
 bt.logging.set_info()
 
-# ───────────────────────────── CLI ────────────────────────────────────────── #
+# ───────────────────────────── CLI ────────────────────────────── #
 
 
 def _arg_parser() -> argparse.ArgumentParser:
