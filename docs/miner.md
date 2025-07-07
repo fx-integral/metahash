@@ -36,10 +36,9 @@ Each epoch (~1 hour // 361 blocks x 12s) an on-chain auction distributes **148 S
 5. **🎲 Bid** manually or automate with the provided scripts
 
 ## 📦 Prerequisites
-1. **Subtensor lite node with `--pruning=2000`** configured (this is needed for leaderboard) or use Archive node (--network archive)
+1. **Subtensor lite node with `--pruning=2000`** configured (this is needed for leaderboard or use Archive node (--network archive))
 2. **Python 3.10+** installed
 3. **pip/venv** for isolated environment
-4. A funded coldkey/hotkey wallet with stake registered in Subnet 73
 
 
 ```bash
