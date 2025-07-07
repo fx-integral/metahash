@@ -41,7 +41,7 @@ Introduce a lightweight buy-offer protocol over HTTP:
 Each validator has a budget:
 
 ```math
-Validator Budget = (360 × 0.41) × (Validator Stake / Total Stake)
+Validator Budget = (361 × 0.41) × (Validator Stake / Total Stake)
 ```
 
 - Miners **route alpha** based on validator performance

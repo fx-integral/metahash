@@ -8,7 +8,7 @@ This guide outlines how to set up and operate a **MetaHash SN73 Validator**, whi
 ---
 
 ## 📦 Prerequisites
-1. **Subtensor lite node with `--prune=2000`** configured
+1. **Subtensor lite node with `--pruning=2000`** configured
 2. **Python 3.10+** installed
 3. **pip/venv** for isolated environment
 4. A funded coldkey/hotkey wallet with stake registered in Subnet 73
@@ -70,13 +70,13 @@ btcli subnets register --wallet.name mywallet --wallet.hotkey myhotkey --netuid 
 ### ✅ Using PM2 (recommended)
 
 ```bash
-pm2 start python --name metahash-validator -- neurons/validator.py -- --netuid 73 --subtensor.network finney --wallet.name validator-wallet --wallet.hotkey validator-hotkey --axon.port 8080 --logging.debug
+pm2 start python --name metahash-validator -- neurons/validator.py --netuid 73 --subtensor.network finney --wallet.name validator-wallet --wallet.hotkey validator-hotkey --logging.debug
 ```
 
 ### 🔁 Development Mode
 
 ```bash
-python neurons/validator.py --netuid 73 --subtensor.network finney --wallet.name validator-wallet --wallet.hotkey validator-hotkey --axon.port 8080 --logging.debug
+python neurons/validator.py --netuid 73 --subtensor.network finney --wallet.name validator-wallet --wallet.hotkey validator-hotkey --logging.debug
 ```
 
 This validator will:
@@ -156,3 +156,8 @@ Once running, your validator:
 - Incentivizes contributors with appropriately priced SN73 rewards
 - Builds the MetaHash alpha treasury to benefit all SN73 holders
 
+## 🔗 Resources
+
+- 📁 **GitHub**: https://github.com/fx-integral/metahash/
+- 📚 **Bittensor Docs**: https://docs.bittensor.com/
+- 🔐 **Coldkey and Hotkey Workstation Security**: https://docs.learnbittensor.org/getting-started/coldkey-hotkey-security/
