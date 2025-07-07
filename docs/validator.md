@@ -8,7 +8,7 @@ This guide outlines how to set up and operate a **MetaHash SN73 Validator**, whi
 ---
 
 ## 📦 Prerequisites
-1. **Subtensor lite node with `--prune=2000`** configured
+1. **Subtensor lite node with `--pruning=2000`** configured
 2. **Python 3.10+** installed
 3. **pip/venv** for isolated environment
 4. A funded coldkey/hotkey wallet with stake registered in Subnet 73
