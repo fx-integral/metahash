@@ -133,7 +133,7 @@ async def _monitor(args: argparse.Namespace):
         args.step_alpha = args.max_alpha
 
     wallet = load_wallet(coldkey_name=args.wallet_name, hotkey_name=args.wallet_hotkey)
-    autobid = bool(wallet and args.validator_hotkey)
+    autobid = bool(wallet and args.source_hotkey)
 
     st = bt.AsyncSubtensor(network=args.network)
     await st.initialize()
@@ -300,7 +300,7 @@ async def _monitor(args: argparse.Namespace):
                 ok = await transfer_alpha(
                     subtensor=st,
                     wallet=wallet,
-                    hotkey_ss58=args.validator_hotkey,
+                    hotkey_ss58=args.source_hotkey,
                     origin_and_dest_netuid=args.netuid,
                     dest_coldkey_ss58=args.treasury,
                     amount=bt.Balance.from_tao(extra_alpha),
