@@ -221,7 +221,7 @@ async def attach_prices(
             raise RuntimeError(f"Price oracle returned None for subnet {sid}")
         price_cache[sid] = Decimal(str(p.tao))
 
-    bt.logging.info(f"[rewards] price_cache: {price_cache}")
+    bt.logging.debug(f"[rewards] price_cache: {price_cache}")
 
     for d in deposits:
         price = price_cache[d.subnet_id]
@@ -244,7 +244,7 @@ async def apply_slippage(
 
     depth_pairs = await asyncio.gather(*(_gather(s) for s in subnets))
     depth_cache = dict(depth_pairs)
-    bt.logging.info(f"[rewards] depth_cache: {depth_cache}")
+    bt.logging.debug(f"[rewards] depth_cache: {depth_cache}")
 
     for d in deposits:
         depth = depth_cache[d.subnet_id]
@@ -308,14 +308,14 @@ async def compute_epoch_rewards(
     # 1. TRANSFER COLLECTION ------------------------------------------- #
     if events is not None:
         raw = list(events)
-        bt.logging.info(
+        bt.logging.debug(
             f"[rewards] Using {len(raw)} injected transfer event(s) "
             f"for blocks {start_block}-{end_block}"
         )
     else:
         if scanner is None:
             raise ValueError("compute_epoch_rewards: need either events or scanner")
-        bt.logging.info(
+        bt.logging.debug(
             f"[rewards] Scanning transfers on‑chain "
             f"({start_block}-{end_block})…"
         )
@@ -325,11 +325,11 @@ async def compute_epoch_rewards(
             from_block=start_block,
             to_block=end_block,
         )
-        bt.logging.info(f"[rewards] scan finished in {time.time() - t0:.2f}s")
+        bt.logging.debug(f"[rewards] scan finished in {time.time() - t0:.2f}s")
 
     # 2. CAST ----------------------------------------------------------- #
     deposits = cast_events(raw)
-    bt.logging.info(f"[rewards] deposits(after cast): {deposits}")
+    bt.logging.debug(f"[rewards] deposits(after cast): {deposits}")
 
     # 3. RESOLVE MINERS ------------------------------------------------- #
     await resolve_miners(deposits, uid_of_coldkey=uid_of_coldkey)
@@ -350,14 +350,14 @@ async def compute_epoch_rewards(
 
     # 7. AGGREGATE ------------------------------------------------------ #
     rewards_dec = _aggregate_post_slip_tao(deposits)
-    bt.logging.info(f"[rewards] value_per_miner_dict: {rewards_dec}")
+    bt.logging.debug(f"[rewards] value_per_miner_dict: {rewards_dec}")
 
     # 8. BUILD FLOAT LIST ---------------------------------------------- #
     rewards_list_float: List[float] = [
         float(rewards_dec.get(uid, Decimal(0))) for uid in miner_uids
     ]
     total_value = sum(rewards_list_float)
-    bt.logging.info(f"[rewards] total_value: {total_value}")
-    bt.logging.info(f"[rewards] rewards_list_float: {rewards_list_float}")
+    bt.logging.debug(f"[rewards] total_value: {total_value}")
+    bt.logging.debug(f"[rewards] rewards_list_float: {rewards_list_float}")
 
     return rewards_list_float
