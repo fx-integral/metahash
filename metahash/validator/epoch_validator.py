@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import asyncio
-import traceback
 from datetime import datetime
 from typing import Optional, Tuple
 
@@ -159,9 +158,7 @@ class EpochValidatorNeuron(BaseValidatorNeuron):
                     await self.concurrent_forward()
                 except Exception as err:
                     bt.logging.error(f"forward() raised: {err}")
-                    bt.logging.debug(
-                        "".join(traceback.format_exception(err))
-                    )
+
                 finally:
                     try:
                         self.sync()

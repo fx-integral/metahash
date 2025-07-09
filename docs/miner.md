@@ -4,8 +4,8 @@
 
 Before you spin up a miner in **Subnet 73 (SN73)**, ask yourself:
 
-> 💰 **Do I want to sell OTC α-tokens from other subnets?**  
-> Mining SN73 only makes sense if you hold surplus α-tokens from other subnets that you wish to liquidate at a discount instead of impacting their on-chain liquidity pools.
+> 💰 **Do I want to sell OTC α-tokens from other subnets possibly at a loss?**  
+> Mining SN73 only makes sense if you hold surplus α-tokens from other subnets that you wish to liquidate at a DISCOUNT instead of impacting their on-chain liquidity pools.
 
 **✅ If YES** → Proceed with this guide!  
 **❌ If NO** → Mining SN73 won't add value for you.

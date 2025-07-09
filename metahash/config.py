@@ -1,54 +1,45 @@
+"""
+metahash/config.py — global constants  (patched 2025‑07‑09)
+"""
+
 from __future__ import annotations
-from decimal import Decimal
 import os
+from decimal import Decimal
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# ─────────────────── 1.  NETWORK‑LEVEL CONSTANTS  ──────────────────── #
+# ───────────────────────────  Network  ────────────────────────────── #
+DEFAULT_BITTENSOR_NETWORK: str = os.getenv("BITTENSOR_NETWORK", "finney")
 TREASURY_COLDKEY: str = "5GW6xj5wUpLBz7jCNp38FzkdS6DfeFdUTuvUjcn6uKH5krsn"
-STARTING_AUCTIONS_BLOCK = int(os.getenv("STARTING_ACTIONS_BLOCK","5931900"))
-AUCTION_DELAY_BLOCKS: int = 50
-FORBIDDEN_ALPHA_SUBNETS: list[int] = [73]
-FORCE_BURN_WEIGHTS = False
-DEFAULT_BITTENSOR_NETWORK: str = os.getenv("BITTENSOR_NETWORK","finney")
-PLANCK = 10**9
+STARTING_AUCTIONS_BLOCK: int = int(os.getenv("STARTING_AUCTIONS_BLOCK", "5931900"))
+AUCTION_DELAY_BLOCKS: int = 50                    # blocks to skip after epoch end
+FORBIDDEN_ALPHA_SUBNETS: list[int] = [73, 0]         # cannot dump α onto these
+PLANCK: int = 10**9                                   # RAW per α
 
-# ─────────────────── 2.  BOND‑CURVE DESIGN TARGETS  ────────────────── #
-P_S_PAR: float = 1.0                       # spot‑parity (TAO ⇄ SN‑73)
-D_START: float = 0.1                      # 10 % apex discount
-D_TAIL_TARGET: float = 0.2               # 10 % tail discount just to start for simplicity
-GAMMA_TARGET: float = 1.18                 # ≈ 15 % average discount
-GAMMA_TOL: float = 0.02
-BETA_NUDGE: float = 0.05
-D_TAIL_TOL: float = 0.01
-R_MIN_NUDGE: float = 0.10
+# ───────────────────────────  Auction  ─────────────────────────────── #
+AUCTION_BUDGET_ALPHA: float = 148.0                  # α sold each epoch
+SOFT_QUOTA_LAMBDA: float = 100.0                  # λ penalty per α of stretch
+MAX_BIDS_PER_MINER: int = 10                     # anti‑spam
+PAYMENT_WINDOW_BLOCKS: int = 30                     # ~3 min on Finney
+JAIL_BLOCKS: int = 4_800                  # ≈ 24 h
+S_MIN_ALPHA: float = 5.0                    # stake needed to bid
 
-# ─────────────── 3.  EPOCH EMISSION & AUCTION BUDGET  ──────────────── #
-ALPHA_EMITTED_PER_EPOCH: int = int(round(360 * 0.41))   # 148 α
-AUCTION_BUDGET_PCT: float = 1                           # 100% not burned on SN‑73
-BAG_SN73: int = int(round(ALPHA_EMITTED_PER_EPOCH * AUCTION_BUDGET_PCT))
+# Strategy file (static – restart validator to reload)
+STRATEGY_PATH: str = "weights_bps.yml"
 
-# ──────────────────── 4.  ECONOMIC SWITCHES & DELAYS ────────────────── #
-ADJUST_BOND_CURVE: bool = False
+# Per‑validator treasury addresses (hotkey → coldkey)
+VALIDATOR_TREASURIES: dict[str, str] = {
+    # "hotkey_ss58"          : "coldkey_ss58"
+    # ----------------------------------------
+    "5Ha…Foo": "5Dh…Bar",
+    # add yours here
+}
 
-# ──────────────────── 5.  PRICE / SLIPPAGE CONSTANTS ────────────────── #
-DECIMALS: int = 10**9
-K_SLIP: Decimal = Decimal("1.0")
-CAP_SLIP: float = 1.0
-SLIP_TOLERANCE: Decimal = Decimal("0.001")     
-SAMPLE_POINTS: int = 8  # Sampling interval use for avg price and avg depth
+# ─────────────────────── Economic switches  ───────────────────────── #
+COMMISSION_BPS: int = 3_000     # 30 % of surplus TAO goes to operator
+S_VALI_MIN: float = 1_000.0   # stake to earn a personal treasury
 
-# ─────────────────────── 6.  EVENT‑SCAN RPC TUNING ──────────────────── #
-MAX_CHUNK: int = 512
-FINALITY_LAG: int = 1
-LOG_EVERY: int = 5_000
-
-# ───────────────────────── 7.  ORACLE SAMPLING  ─────────────────────── #
-
-DEFAULT_NETUID: int = 73
-MAX_CONCURRENCY = 5  # Blocks requested in parallel
-
-# ───────────────────────── 7.  Testing  ─────────────────────── #
-
-TEST_TREASURY = "5DLULtxCS9vA3pZRgSTd9gkvGrUwgNje2TNQeLibo9wUWjSS"
+# ───────────────────────  Oracle / Scanner  ───────────────────────── #
+MAX_CHUNK: int = 512           # event‑scan chunk size
+FINALITY_LAG: int = 1           # skip last N blocks for finality

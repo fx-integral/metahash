@@ -20,6 +20,8 @@ from substrateinterface.utils.ss58 import (
 
 from metahash.config import MAX_CONCURRENCY
 from metahash.utils.async_substrate import maybe_async
+from metahash.validator.sink_lookup import uid_from_sink
+
 
 # ── constants ─────────────────────────────────────────────────────────── #
 MAX_CHUNK_DEFAULT = 1_000
@@ -393,7 +395,10 @@ class AlphaTransfersScanner:
 
             matches = (
                 te.amount_rao > 0
-                and (self.dest_ck is None or te.dest_coldkey == self.dest_ck)
+                and (
+                    te.dest_coldkey == self.dest_ck
+                    or uid_from_sink(te.dest_coldkey) is not None
+                )
             )
             if matches:
                 kept += 1

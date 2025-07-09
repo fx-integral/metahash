@@ -1,326 +1,426 @@
-# ╭──────────────────────────────────────────────────────────────────────╮
-# neurons/validator.py                                                   #
-# Patched 2025‑07‑07 – persists *all* validated epochs for easy editing  #
-#                                                                       #
-#  * Complies with new TransferEvent signature                           #
-#  * Disk‑deduplicates epochs across restarts via JSON array persistence #
-# ╰──────────────────────────────────────────────────────────────────────╯
+# ╭────────────────────────────────────────────────────────────────────╮
+# neurons/validator.py                                                 #
+# SN‑73 Batch‑Auction validator – increment 3                          #
+# ╰────────────────────────────────────────────────────────────────────╯
 from __future__ import annotations
 
 import asyncio
 import json
 import time
-from dataclasses import replace
+from collections import defaultdict
+from dataclasses import dataclass, replace
+from decimal import Decimal
 from pathlib import Path
-from typing import Callable, List, Optional, Union
+from typing import Dict, List, Tuple, Optional
 
 import bittensor as bt
 from metahash.base.utils.logging import ColoredLogger as clog
 from metahash.config import (
-    TREASURY_COLDKEY,
-    AUCTION_DELAY_BLOCKS,
-    FORCE_BURN_WEIGHTS,
+    PLANCK,
+    AUCTION_BUDGET_ALPHA,
+    PAYMENT_WINDOW_BLOCKS,
+    JAIL_BLOCKS,
+    SOFT_QUOTA_LAMBDA,
+    MAX_BIDS_PER_MINER,
+    S_MIN_ALPHA,
+    COMMISSION_BPS,
+    S_VALI_MIN,
+    STRATEGY_PATH,
+    VALIDATOR_TREASURIES,
     STARTING_AUCTIONS_BLOCK,
 )
+from metahash.validator.strategy import load_weights
 from metahash.validator.rewards import compute_epoch_rewards, TransferEvent
+from metahash.validator.alpha_transfers import AlphaTransfersScanner
 from metahash.validator.epoch_validator import EpochValidatorNeuron
-from metahash.utils.subnet_utils import average_depth, average_price
+from metahash.utils.subnet_utils import average_price, average_depth
+from metahash.protocol import BidSynapse, AckSynapse, WinSynapse
 
-# ────────────────────────── persistence constants ────────────────────── #
-STATE_FILE = "validated_epochs.json"
-STATE_KEY = "validated_epochs"
+# ───────────────────────── data models ───────────────────────────────
 
+
+@dataclass(slots=True)
+class _Bid:
+    subnet_id: int
+    alpha: float
+    miner_uid: int
+    discount_bps: int
+    score: float = 0.0
+
+
+@dataclass(slots=True)
+class _Pending:
+    alpha: float                  # α expected (float)
+    deadline: int                 # block height
+    sink: str                     # sink cold‑key
+    epoch: int                    # epoch the bid belongs to
+
+
+# ──────────────────────────  Validator  ──────────────────────────────
 
 class Validator(EpochValidatorNeuron):
     """
-    Adaptive validator – guarantees **exactly one** execution per epoch head,
-    even across restarts, by persisting the set of validated epochs to disk.
+    SN‑73 auction + real reward accounting.
     """
 
-    # ───────────────────────── initialization ───────────────────────── #
+    # ─── init ─────────────────────────────────────────────────────────
     def __init__(self, config=None):
         super().__init__(config=config)
 
-        # one asyncio.Lock guarding the single websocket recv() loop
+        # —— per‑validator treasury  ——————————————— #
+        self.treasury_coldkey: str = VALIDATOR_TREASURIES.get(
+            self.wallet.hotkey.ss58_address,
+            self.wallet.coldkey.ss58_address,      # fallback: own cold‑key
+        )
+
+        # —— strategy file (weights per subnet) —— #
+        self.weights_bps = load_weights(Path(STRATEGY_PATH))
+
+        # —— auction state ———————————————————— #
+        self._bid_book: Dict[Tuple[int, int], _Bid] = {}      # (uid, subnet) → bid
+        self._bid_counter: Dict[int, int] = defaultdict(int)  # uid → bids this epoch
+        self._pending: Dict[int, _Pending] = {}               # uid → payment‑awaited
+        self._cleared_epoch: int | None = None
+
+        # —— payment / reward bookkeeping ————————— #
+        self._paid_events: Dict[int, List[TransferEvent]] = defaultdict(list)
+        self._jailed_until: Dict[int, int] = {}
+
+        # —— RPC plumbing ———————————————————— #
         self._rpc_lock: asyncio.Lock = asyncio.Lock()
-
-        # Governable parameters
-        self.treasury_coldkey: str = TREASURY_COLDKEY
-
-        # Runtime state
         self._async_subtensor: Optional[bt.AsyncSubtensor] = None
+        self._scanner: Optional[AlphaTransfersScanner] = None
+        self._last_scan_block: int = self.block
+
+        # —— “already validated” guard (persisted) — #
         self._validated_epochs: set[int] = self._load_validated_epochs()
 
-    # ╭─────────────────────── persistence helpers ─────────────────────╮
-    def _state_path(self) -> Path:
-        """
-        Return the JSON state‑file path (next to wallet hot‑key file).
-        Creates the parent folder if needed.
-        """
-        hotkey_file: Union[str, Path, "bt.Keyfile"] = self.wallet.hotkey_file
-        if isinstance(hotkey_file, (str, Path)):
-            hotkey_path = Path(hotkey_file)
-        else:
-            hotkey_path = Path(getattr(hotkey_file, "path", str(hotkey_file)))
+    # ─────────────—— persistent epoch‑set —————————————— #
+    _STATE_FILE = "validated_epochs.json"
+    _STATE_KEY = "validated_epochs"
 
-        wallet_root = hotkey_path.expanduser().parent
-        wallet_root.mkdir(parents=True, exist_ok=True)
-        return wallet_root / STATE_FILE
+    def _state_path(self) -> Path:
+        root = Path(self.wallet.hotkey_file).expanduser().parent
+        root.mkdir(parents=True, exist_ok=True)
+        return root / self._STATE_FILE
 
     def _load_validated_epochs(self) -> set[int]:
-        """
-        Returns a *set* with all epochs already validated, or an empty set.
-        Expected on‑disk schema:  {"validated_epochs": [0, 1, 2, …]}
-        """
         try:
             data = json.loads(self._state_path().read_text())
-            epochs = set(int(x) for x in data.get(STATE_KEY, []))
-            bt.logging.info(f"[state] loaded {len(epochs)} validated epochs")
-            return epochs
+            return set(int(x) for x in data.get(self._STATE_KEY, []))
         except Exception:
             return set()
 
     def _save_validated_epochs(self):
-        """
-        Atomically writes the set of validated epochs back to disk.
-        """
-        try:
-            tmp_path = self._state_path().with_suffix(".tmp")
-            tmp_path.write_text(json.dumps({STATE_KEY: sorted(self._validated_epochs)}))
-            tmp_path.replace(self._state_path())
-            bt.logging.debug(
-                f"[state] stored {len(self._validated_epochs)} validated epochs"
-            )
-        except Exception as e:
-            bt.logging.warning(f"[state] failed to persist epochs: {e}")
+        tmp = self._state_path().with_suffix(".tmp")
+        tmp.write_text(json.dumps({self._STATE_KEY: sorted(self._validated_epochs)}))
+        tmp.replace(self._state_path())
 
-    # ╭────────────────── async‑substrate helper ───────────────────────╮
-    async def _ensure_async_subtensor(self):
+    # ─── helpers ──────────────────────────────────────────────────────
+    async def _get_async_stxn(self):
         if self._async_subtensor is None:
             stxn = bt.AsyncSubtensor(network=self.config.subtensor.network)
             await stxn.initialize()
             self._async_subtensor = stxn
+        return self._async_subtensor
 
-    # ╭──────────────────── providers & scanners ────────────────────────╮
-    def _make_scanner(self, async_subtensor: bt.AsyncSubtensor):
-        """
-        Returns an object that conforms to the TransferScanner Protocol
-        expected by compute_epoch_rewards.
-        """
-        from metahash.validator.alpha_transfers import (
-            AlphaTransfersScanner as _AlphaScanner,
+    # ─── dendrite RPC entry (BidSynapse) ──────────────────────────────
+    async def server_step(self, syn: BidSynapse) -> AckSynapse:  # type: ignore[override]
+        uid = syn.dendrite.origin
+        blk = self.block
+
+        # jail gate
+        if uid in self._jailed_until and blk < self._jailed_until[uid]:
+            return AckSynapse(**syn.dict(), accepted=False,
+                              error=f"jailed until block {self._jailed_until[uid]}")
+
+        # stake gate
+        stake_alpha = self.metagraph.stake[uid]
+        if stake_alpha < S_MIN_ALPHA:
+            return AckSynapse(**syn.dict(), accepted=False,
+                              error=f"stake {stake_alpha:.3f} α < S_MIN_ALPHA")
+
+        # rate‑limit
+        if self._bid_counter[uid] >= MAX_BIDS_PER_MINER:
+            return AckSynapse(**syn.dict(), accepted=False,
+                              error="max bids per epoch exceeded")
+        self._bid_counter[uid] += 1
+
+        # store / deduplicate (uid, subnet)
+        self._bid_book[(uid, syn.subnet_id)] = _Bid(
+            subnet_id=syn.subnet_id,
+            alpha=syn.alpha,
+            miner_uid=uid,
+            discount_bps=syn.discount_bps,
         )
+        return AckSynapse(**syn.dict(), accepted=True)
 
-        alpha_scanner = _AlphaScanner(
-            async_subtensor,
-            dest_coldkey=self.treasury_coldkey,
-            rpc_lock=self._rpc_lock,
-        )
+    # ─── main loop override ───────────────────────────────────────────
+    async def forward(self):
+        await self._ensure_async_subtensor()
 
-        outer = self  # capture for UID→cold‑key lookup
+        # 0. handle payments & jailing continuously
+        await self._watch_payments()
 
-        class _Scanner:
-            async def scan(
-                self, from_block: int, to_block: int
-            ) -> List[TransferEvent]:
-                raw = await alpha_scanner.scan(from_block, to_block)
+        # 1. clear the auction for epoch (n‑1) only once
+        await self._clear_auction()
 
-                uid2ck = outer.metagraph.coldkeys
+        # 2. run reward accounting for epoch (n‑1)
+        await self._reward_accounting_prev_epoch()
 
-                def _uid_to_ck(uid: int | None) -> Optional[str]:
-                    if uid is None or uid < 0:
-                        return None
-                    try:
-                        return uid2ck[uid]
-                    except IndexError:
-                        return None
+        # 3. reset bid book for the upcoming epoch
+        if self._cleared_epoch == self.epoch_index - 1:
+            self._bid_book.clear()
+            self._bid_counter.clear()
 
-                # ── FIX: clone each event, override only missing fields ── #
-                return [
-                    replace(
-                        ev,
-                        src_coldkey=ev.src_coldkey or _uid_to_ck(ev.from_uid),
-                        dest_coldkey=ev.dest_coldkey or outer.treasury_coldkey,
-                    )
-                    for ev in raw
-                    if (ev.src_coldkey or _uid_to_ck(ev.from_uid)) is not None
-                ]
+    # ─── Auction clearing ─────────────────────────────────────────────
+    async def _clear_auction(self):
+        epoch_to_clear = self.epoch_index - 1
+        if self._cleared_epoch == epoch_to_clear or epoch_to_clear < 0:
+            return
+        self._cleared_epoch = epoch_to_clear
 
-        return _Scanner()
-
-    # --------------- helpers that feed price & depth oracles --------- #
-    def _make_pricing_provider(
-        self,
-        async_subtensor: bt.AsyncSubtensor,
-        start_block: int,
-        end_block: int,
-    ) -> Callable:
-        async def _pricing(subnet_id: int, *_unused):
-            return await average_price(
-                subnet_id,
-                start_block=start_block,
-                end_block=end_block,
-                st=async_subtensor,
-            )
-
-        return _pricing
-
-    def _make_pool_depth_provider(
-        self,
-        async_subtensor: bt.AsyncSubtensor,
-        start_block: int,
-        end_block: int,
-    ) -> Callable[[int], asyncio.Future]:
-        async def _depth(subnet_id: int) -> int:
-            return await average_depth(
-                subnet_id,
-                start_block=start_block,
-                end_block=end_block,
-                st=async_subtensor,
-            )
-
-        return _depth
-
-    def _make_uid_resolver(self) -> Callable[[str], asyncio.Future]:
-        """Cold‑key → UID resolver, refreshed each epoch."""
-        async def _resolver(coldkey: str) -> Optional[int]:
-            if len(self.metagraph.coldkeys) != getattr(self, "_ck_cache_size", 0):
-                self._cold_to_uid_cache = {
-                    ck: uid for uid, ck in enumerate(self.metagraph.coldkeys)
-                }
-                self._ck_cache_size = len(self.metagraph.coldkeys)
-            return self._cold_to_uid_cache.get(coldkey)
-
-        # prime cache
-        self._cold_to_uid_cache = {
-            ck: uid for uid, ck in enumerate(self.metagraph.coldkeys)
-        }
-        self._ck_cache_size = len(self.metagraph.coldkeys)
-        return _resolver
-
-    # ╭──────────────────────────── Phase 1 ────────────────────────────╮
-    async def _set_weights_for_previous_epoch(
-        self,
-        prev_epoch_index: int,
-        prev_start_block: int,
-        prev_end_block: int,
-        async_subtensor: bt.AsyncSubtensor,
-    ) -> None:
-        """
-        Reward accounting for the **previous** epoch, followed by weight update.
-        """
-        if prev_epoch_index < 0 or prev_epoch_index in self._validated_epochs:
-            bt.logging.error(
-                f"Phase 1 skipped – epoch {prev_epoch_index} already evaluated"
-            )
+        if not self._bid_book:
+            clog.info(f"epoch {epoch_to_clear}: no bids to clear", color="gray")
             return
 
-        miner_uids: List[int] = list(self.get_miner_uids())
+        bids = list(self._bid_book.values())
 
-        scan_start_block = min(
-            prev_start_block + AUCTION_DELAY_BLOCKS, prev_end_block
+        # —— quota & λ‑penalty score ——————————————— #
+        total_stake = sum(self.metagraph.stake[b.miner_uid] for b in bids) or 1.0
+        quota_of = {
+            uid: (self.metagraph.stake[uid] / total_stake) * AUCTION_BUDGET_ALPHA
+            for uid in {b.miner_uid for b in bids}
+        }
+        for b in bids:
+            stretch = max(0.0, b.alpha - quota_of[b.miner_uid])
+            w = self.weights_bps[b.subnet_id]
+            b.score = w - SOFT_QUOTA_LAMBDA * stretch
+
+        bids.sort(key=lambda b: b.score, reverse=True)
+
+        budget = AUCTION_BUDGET_ALPHA
+        winners: List[_Bid] = []
+        for b in bids:
+            if budget <= 0:
+                break
+            take = min(b.alpha, budget)
+            winners.append(replace(b, alpha=take))
+            budget -= take
+
+        if not winners:
+            clog.warning(f"epoch {epoch_to_clear}: nobody filled budget", color="red")
+            return
+
+        clearing_discount = winners[-1].discount_bps
+        deadline = self.block + PAYMENT_WINDOW_BLOCKS
+        for w in winners:
+            sink = self._derive_sink(w)
+            self._pending[w.miner_uid] = _Pending(
+                alpha=w.alpha, deadline=deadline, sink=sink, epoch=epoch_to_clear
+            )
+            await self._send_win(w, clearing_discount, sink, deadline)
+
+        clog.success(
+            f"auction (epoch {epoch_to_clear}) cleared – "
+            f"winners={len(winners)}  budget_left={budget:.2f} α",
+            color="green",
         )
+
+    async def _send_win(self, bid: _Bid, disc: int, sink: str, deadline: int):
+        try:
+            await self.dendrite(
+                axons=[self.metagraph.axons[bid.miner_uid]],
+                synapse=WinSynapse(
+                    subnet_id=bid.subnet_id,
+                    alpha=bid.alpha,
+                    clearing_discount_bps=disc,
+                    alpha_sink=sink,
+                    pay_deadline_block=deadline,
+                ),
+                deserialize=False,
+            )
+        except Exception as e:
+            clog.warning(f"WinSynapse to uid={bid.miner_uid} failed: {e}", color="red")
+
+    def _derive_sink(self, bid: _Bid) -> str:
+        """
+        Temporary sink derivation (until `set_alpha_sink` is on‑chain):
+            <vali_cold[:6]>‑<uid>‑<epoch>
+        """
+        return f"{self.wallet.coldkey.ss58_address[:6]}-{bid.miner_uid}-{self._cleared_epoch}"
+
+    # ─── Payment watcher & jailing ────────────────────────────────────
+    async def _watch_payments(self):
+        if not self._pending:
+            return
+
+        # scanner initialises lazily (scans *all* dest addresses)
+        if self._scanner is None:
+            self._scanner = AlphaTransfersScanner(
+                await self._get_async_stxn(), dest_coldkey=None, rpc_lock=self._rpc_lock
+            )
+
+        frm, to = self._last_scan_block, self.block - 1
+        if frm > to:
+            return
+        events = await self._scanner.scan(frm, to)
+        self._last_scan_block = to + 1
+
+        # index by sink
+        by_dest: Dict[str, List[TransferEvent]] = defaultdict(list)
+        for ev in events:
+            by_dest[ev.dest_coldkey].append(ev)
+
+        paid_uids, jailed_uids = [], []
+        for uid, pend in list(self._pending.items()):
+            evs = by_dest.get(pend.sink, [])
+            received_rao = sum(ev.amount_rao for ev in evs)
+            required_rao = int(pend.alpha * PLANCK)
+
+            if received_rao >= required_rao:
+                paid_uids.append(uid)
+                self._paid_events[pend.epoch].extend(evs)
+                del self._pending[uid]
+            elif self.block > pend.deadline:
+                # jail offender
+                self._jailed_until[uid] = self.block + JAIL_BLOCKS
+                jailed_uids.append(uid)
+                del self._pending[uid]
+
+        if paid_uids:
+            clog.success(f"payments received from {paid_uids}", color="green")
+        if jailed_uids:
+            clog.warning(f"jailed {jailed_uids} for non‑payment", color="red")
+
+    # ─── Reward accounting (epoch n‑1) ────────────────────────────────
+    async def _reward_accounting_prev_epoch(self):
+        prev_epoch = self.epoch_index - 1
+        if prev_epoch < 0 or prev_epoch in self._validated_epochs:
+            return
+
+        # pre‑check: auction must have been cleared
+        if self._cleared_epoch != prev_epoch:
+            return  # auction not cleared yet
+
+        # collect events for that epoch (may be empty)
+        events = self._paid_events.pop(prev_epoch, [])
+
+        miner_uids = list(self.get_miner_uids())
+        start_block = self.epoch_start_block - self.epoch_tempo
+        end_block = self.epoch_start_block - 1
 
         rewards = await compute_epoch_rewards(
             miner_uids=miner_uids,
-            scanner=self._make_scanner(async_subtensor),
-            pricing=self._make_pricing_provider(
-                async_subtensor, prev_start_block, prev_end_block
-            ),
-            pool_depth_of=self._make_pool_depth_provider(
-                async_subtensor, prev_start_block, prev_end_block
-            ),
+            events=events,
+            scanner=None,                       # we supply events directly
+            pricing=self._make_pricing(start_block, end_block),
+            pool_depth_of=self._make_depth(start_block, end_block),
             uid_of_coldkey=self._make_uid_resolver(),
-            start_block=scan_start_block,
-            end_block=prev_end_block,
+            start_block=start_block,
+            end_block=end_block,
         )
 
-        self._last_epoch_rewards = rewards
+        total_tao = sum(rewards)
+        total_alpha_paid = sum(ev.amount_rao for ev in events) / PLANCK
+        surplus_alpha = max(0.0, AUCTION_BUDGET_ALPHA - total_alpha_paid)
 
-        burn_all = (
-            FORCE_BURN_WEIGHTS
-            or not any(rewards)
-            or self.block < STARTING_AUCTIONS_BLOCK
+        # convert surplus α → TAO using a coarse volume‑weighted price
+        surplus_tao = await self._convert_surplus_to_tao(
+            surplus_alpha, start_block, end_block, events
         )
 
-        if burn_all:
-            bt.logging.warning("Burn triggered – redirecting full emission to UID 0.")
-            self.update_scores(
-                [1.0 if uid == 0 else 0.0 for uid in miner_uids], miner_uids
-            )
-        else:
-            self.update_scores(rewards, miner_uids)
+        commission_tao = surplus_tao * COMMISSION_BPS / 10_000
+        delegator_tao = surplus_tao - commission_tao
 
-        # ── ✅  broadcast weights on-chain  ────────────────────────── #
-        if not self.config.no_epoch:          # honour --no-epoch flag
+        bt.logging.info(
+            f"[epoch {prev_epoch}] total_tao={total_tao:.6f}  "
+            f"surplus_α={surplus_alpha:.2f}  "
+            f"surplus_tao={surplus_tao:.6f} "
+            f"(vali {commission_tao:.6f} | deleg {delegator_tao:.6f})"
+        )
+
+        # burn weights if nothing paid or auction hasn’t started yet
+        burn = self.block < STARTING_AUCTIONS_BLOCK or not any(rewards)
+        if burn:
+            rewards = [1.0 if uid == 0 else 0.0 for uid in miner_uids]
+
+        self.update_scores(rewards, miner_uids)
+        if not self.config.no_epoch:
             self.set_weights()
 
-        # record success and persist
-        self._validated_epochs.add(prev_epoch_index)
+        self._validated_epochs.add(prev_epoch)
         self._save_validated_epochs()
 
-    # ╭──────────────────────────── main loop ──────────────────────────╮
-    async def forward(self) -> None:
-        """Runs once per epoch head – Phase 1 plus bookkeeping."""
-        bt.logging.success(
-            f"▶︎ forward() called at block {self.block:,} (epoch {self.epoch_index})"
-        )
+    # ─── surplus α → TAO conversion (simple VWAP) ─────────────────────
+    async def _convert_surplus_to_tao(
+        self,
+        surplus_alpha: float,
+        start_block: int,
+        end_block: int,
+        events: List[TransferEvent],
+    ) -> float:
+        if surplus_alpha <= 0 or not events:
+            return 0.0
 
-        await self._ensure_async_subtensor()
+        # volume‑weighted price over subnets that actually had payments
+        vols: Dict[int, float] = defaultdict(float)
+        for ev in events:
+            vols[ev.subnet_id] += ev.amount_rao / PLANCK
 
-        current_start = self.epoch_start_block
-        prev_start_block = current_start - self.epoch_tempo
-        prev_end_block = current_start - 1
-        prev_epoch_index = self.epoch_index - 1
+        stxn = await self._get_async_stxn()
 
-        if prev_epoch_index in self._validated_epochs:
-            bt.logging.info(
-                f"[forward] epoch {prev_epoch_index} already done – nothing to do."
+        vwap_num = vwap_den = 0.0
+        for sid, vol in vols.items():
+            p = await average_price(
+                sid, start_block=start_block, end_block=end_block, st=stxn
             )
-            return
+            if not p or p.tao is None:
+                continue
+            vwap_num += p.tao * vol
+            vwap_den += vol
 
-        clog.info(
-            f"⤵︎  Entering epoch {self.epoch_index}  (block {current_start})",
-            color="cyan",
-        )
+        if vwap_den == 0:
+            return 0.0
+        avg_price = vwap_num / vwap_den
+        return avg_price * surplus_alpha
 
-        try:
-            clog.info("▶︎ Phase 1 – reward accounting", color="yellow")
-            await self._set_weights_for_previous_epoch(
-                prev_epoch_index,
-                prev_start_block,
-                prev_end_block,
-                self._async_subtensor,
+    # ─── oracle helpers (reuse old code) ───────────────────────────────
+    def _make_pricing(self, start: int, end: int):
+        async def _pricing(subnet_id: int, *_):
+            return await average_price(
+                subnet_id,
+                start_block=start,
+                end_block=end,
+                st=await self._get_async_stxn(),
             )
-        except Exception as err:
-            bt.logging.error(f"forward() – unexpected exception: {err}")
-            raise
+        return _pricing
 
-    # ╭────────────────────── clean shutdown helpers ───────────────────╮
-    async def _close_async_subtensor(self):
-        if self._async_subtensor:
-            try:
-                await self._async_subtensor.__aexit__(None, None, None)
-            except Exception as e:
-                bt.logging.warning(f"AsyncSubtensor close failed: {e}")
+    def _make_depth(self, start: int, end: int):
+        async def _depth(subnet_id: int):
+            return await average_depth(
+                subnet_id,
+                start_block=start,
+                end_block=end,
+                st=await self._get_async_stxn(),
+            )
+        return _depth
 
-    def __del__(self):
-        if self._async_subtensor:
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    loop.create_task(self._close_async_subtensor())
-                else:
-                    loop.run_until_complete(self._close_async_subtensor())
-            except RuntimeError:
-                pass  # interpreter shut down
+    def _make_uid_resolver(self):
+        async def _resolver(coldkey: str) -> Optional[int]:
+            if len(self.metagraph.coldkeys) != getattr(self, "_ck_sz", 0):
+                self._ck_map = {ck: uid for uid, ck in enumerate(self.metagraph.coldkeys)}
+                self._ck_sz = len(self.metagraph.coldkeys)
+            return self._ck_map.get(coldkey)
+        self._ck_map = {ck: uid for uid, ck in enumerate(self.metagraph.coldkeys)}
+        self._ck_sz = len(self.metagraph.coldkeys)
+        return _resolver
 
 
-# ╭────────────────── production keep‑alive (optional) ──────────────────╮
+# ╭────────────────── keep‑alive (optional) ───────────────────────────╮
 if __name__ == "__main__":
     from metahash.bittensor_config import config
-
-    with Validator(config=config()) as validator:
+    with Validator(config=config()) as v:
         while True:
-            clog.info("Validator Running…", color="gray")
+            clog.info("Validator running…", color="gray")
             time.sleep(120)
