@@ -1,47 +1,37 @@
 # ========================================================================== #
 # metahash/protocol.py                                                       #
-# New synapses for SN‑73 batch‑auction                                       #
+# (only the new and changed parts are shown)                                 #
 # ========================================================================== #
 from __future__ import annotations
-
 from typing import Optional, Dict, List
 from bittensor import Synapse
 
 
-class StartRegistrationsSynapse(Synapse):       # already existed
-    current_verified_coldkeys: List[str]
-    verified_coldkeys_to_register: Optional[List[str]] = None
-    signatures: Optional[List[str]] = None
+# ─────────────────────── NEW trigger synapse ────────────────────────── #
+class AuctionStartSynapse(Synapse):
+    """
+    Validator → all miners (once per epoch).
+
+    Carries every detail a miner needs to decide whether and how to bid.
+    """
+    epoch_index: int
+    auction_start_block: int          # block height when validator opens bidding
+    min_stake_alpha: float            # S_MIN_ALPHA gate
+    auction_budget_alpha: float       # constant 148 α
+    weights_bps: Dict[int, int]       # subnet→bps map (operator strategy)
+    treasury_coldkey: str             # destination cold‑key for α payments
 
 
-class FinishRegistrationsSynapse(Synapse):      # already existed
-    successfully_verified_coldkeys: Optional[List[str]] = None
-    non_successfully_verified_coldkeys: Optional[List[str]] = None
-    errors: Optional[List[str]] = None
-
-
-# ───────────────────────────────  NEW  ──────────────────────────────── #
-
+# ───────────────────── existing synapses (unchanged) ────────────────── #
 class BidSynapse(Synapse):
-    """
-    Miner → Validator
-
-    A single bid packet.  All numbers are *inclusive* (e.g. 1 TAO = 1e9 RAW).
-    """
     subnet_id: int
-    alpha: float                  # α being offered
-    discount_bps: int             # negative spread in basis‑points (1/10 000)
-    # Populated by validator in the AckSynapse echo
+    alpha: float
+    discount_bps: int
     accepted: Optional[bool] = None
     error: Optional[str] = None
 
 
 class AckSynapse(Synapse):
-    """
-    Validator → Miner
-
-    Mirrors BidSynapse with the decision embedded.
-    """
     subnet_id: int
     alpha: float
     discount_bps: int
@@ -50,13 +40,7 @@ class AckSynapse(Synapse):
 
 
 class WinSynapse(Synapse):
-    """
-    Validator → Miner (only for winning bids)
-
-    Communicates clearing result and full payment instructions.
-    """
     subnet_id: int
-    alpha: float                  # α that must be paid (may be ≤ original bid)
-    clearing_discount_bps: int    # d*   (same for all winners)
-    alpha_sink: str               # cold‑key address (single‑use sink)
-    pay_deadline_block: int       # inclusive
+    alpha: float
+    clearing_discount_bps: int
+    pay_deadline_block: int

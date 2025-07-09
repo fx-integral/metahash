@@ -36,9 +36,6 @@ VALIDATOR_TREASURIES: dict[str, str] = {
     # add yours here
 }
 
-# ─────────────────────── Economic switches  ───────────────────────── #
-COMMISSION_BPS: int = 3_000     # 30 % of surplus TAO goes to operator
-S_VALI_MIN: float = 1_000.0   # stake to earn a personal treasury
 
 # ───────────────────────  Oracle / Scanner  ───────────────────────── #
 MAX_CHUNK: int = 512           # event‑scan chunk size
