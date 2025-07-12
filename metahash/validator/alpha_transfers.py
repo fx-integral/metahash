@@ -86,11 +86,27 @@ def _account_id(obj) -> bytes | None:
 # ───────────────────── generic event accessors ──────────────────────── #
 
 def _event_name(ev) -> str:
+    """Return plain name like 'StakeTransferred'."""
+    # unwrap "outer" dict returned by substrateinterface
     ev = ev.get("event", ev) if isinstance(ev, dict) else getattr(ev, "event", ev)
+
+    # ① modern dict – keys 'method' / 'section'
+    if isinstance(ev, dict) and "method" in ev:
+        return str(ev["method"])
+
+    # ② dicts produced by older runtimes / tests
+    if isinstance(ev, dict):
+        return str(
+            ev.get("event_id")           # substrate ≤1.4
+            or ev.get("name")            # some custom nodes
+            or ev.get("method")          # fallback
+            or "<unknown>"
+        )
+
+    # ③ Py‑substrate object with .method attr
     if hasattr(ev, "method"):
         return str(ev.method)
-    if isinstance(ev, dict):
-        return str(ev.get("event_id") or ev.get("name", "<unknown>"))
+
     return "<unknown>"
 
 
@@ -316,25 +332,24 @@ class AlphaTransfersScanner:
     @staticmethod
     def _pallet_func(ex) -> Tuple[str, str]:
         """
-        Robustly extract (pallet, function) from any extrinsic format
-        produced by substrate‑interface.
+        Robustly extract (pallet, function) from ANY extrinsic format.
+        Handles:
+        • flat dict  {'call_module':…, 'call_function':…}
+        • object     .call_module / .call_function
+        • dict with  {'call': { 'call_module': … }}
         """
-        call_obj = ex
-        if isinstance(ex, dict) and "call" in ex:
-            call_obj = ex["call"]
+        # flat dict (py‑substrate ≥1.7)
+        if isinstance(ex, dict) and "call_module" in ex:
+            return str(ex.get("call_module")), str(ex.get("call_function"))
 
-        if isinstance(call_obj, dict):
-            pallet = call_obj.get("call_module") or call_obj.get("module_name") or ""
-            func = call_obj.get("call_function") or call_obj.get("function_name") or ""
-        else:
-            pallet = (
-                getattr(call_obj, "call_module", "")
-                or getattr(call_obj, "module_name", "")
-            )
-            func = (
-                getattr(call_obj, "call_function", "")
-                or getattr(call_obj, "function_name", "")
-            )
+        # nested dict
+        if isinstance(ex, dict) and "call" in ex:
+            inner = ex["call"]
+            return str(inner.get("call_module", "")), str(inner.get("call_function", ""))
+
+        # object (older versions)
+        pallet = getattr(ex, "call_module", "") or getattr(ex, "module_name", "")
+        func = getattr(ex, "call_function", "") or getattr(ex, "function_name", "")
         return str(pallet), str(func)
 
     def _allowed_extrinsic_indices(self, extrinsics, block_num: int) -> set[int]:
@@ -346,6 +361,10 @@ class AlphaTransfersScanner:
         """
         allowed: set[int] = set()
         for idx, ex in enumerate(extrinsics):
+
+            print()
+            print("Transfer detected")
+            print(idx,ex)
             # ① Nuevo formato (dicts planos)
             if isinstance(ex, dict):
                 pallet = str(ex.get("call_module") or ex.get("module_name") or "")
@@ -362,8 +381,7 @@ class AlphaTransfersScanner:
 
             if self.debug_extr:
                 bt.logging.debug(f"[blk {block_num}] ex#{idx}  {pallet}.{func}")
-            print()
-            print("Transfer detected")
+
             print(pallet, func)
 
             if (pallet, func) == ("SubtensorModule", "transfer_stake"):
