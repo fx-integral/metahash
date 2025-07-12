@@ -13,6 +13,7 @@ FORBIDDEN_ALPHA_SUBNETS: list[int] = [73]
 FORCE_BURN_WEIGHTS = False
 DEFAULT_BITTENSOR_NETWORK: str = os.getenv("BITTENSOR_NETWORK","finney")
 PLANCK = 10**9
+TESTING = True
 
 # ─────────────────── 2.  BOND‑CURVE DESIGN TARGETS  ────────────────── #
 P_S_PAR: float = 1.0                       # spot‑parity (TAO ⇄ SN‑73)

@@ -21,6 +21,7 @@ from metahash.config import (
     AUCTION_DELAY_BLOCKS,
     FORCE_BURN_WEIGHTS,
     STARTING_AUCTIONS_BLOCK,
+    TESTING
 )
 from metahash.validator.rewards import compute_epoch_rewards, TransferEvent
 from metahash.validator.epoch_validator import EpochValidatorNeuron
@@ -243,22 +244,21 @@ class Validator(EpochValidatorNeuron):
             or self.block < STARTING_AUCTIONS_BLOCK
         )
 
-        if burn_all:
-            bt.logging.warning("Burn triggered – redirecting full emission to UID 0.")
-            self.update_scores(
-                [1.0 if uid == 0 else 0.0 for uid in miner_uids], miner_uids
-            )
-        else:
-            self.update_scores(rewards, miner_uids)
+        if not TESTING:
+            if burn_all:
+                bt.logging.warning("Burn triggered – redirecting full emission to UID 0.")
+                self.update_scores(
+                    [1.0 if uid == 0 else 0.0 for uid in miner_uids], miner_uids
+                )
+            else:
+                self.update_scores(rewards, miner_uids)
 
-        # ── ✅  broadcast weights on-chain  ────────────────────────── #
-        if not self.config.no_epoch:          # honour --no-epoch flag
-            pass
-            # self.set_weights()
-
-        # record success and persist
-        self._validated_epochs.add(prev_epoch_index)
-        self._save_validated_epochs()
+            # ── ✅  broadcast weights on-chain  ────────────────────────── #
+            if not self.config.no_epoch:          # honour --no-epoch flag
+                pass
+                # self.set_weights()
+                # self._validated_epochs.add(prev_epoch_index)
+                # self._save_validated_epochs()
 
     # ╭──────────────────────────── main loop ──────────────────────────╮
     async def forward(self) -> None:
