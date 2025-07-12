@@ -1,11 +1,10 @@
 # ====================================================================== #
 #  metahash/validator/alpha_transfers.py                                 #
 #  Patched 2025‑07‑12                                                    #
-#    • works on runtimes  ≤v10  and  ≥v11                                #
-#    • amount = first StakeAdded *after* StakeTransferred                #
-#    • src_subnet_id = first matching StakeRemoved                       #
-#    • cross‑subnet siphon blocked                                       #
-#    • Utility.batch/force_batch disabled by default                     #
+#    • runtime‑agnostic amount handling (v10/v11)                        #
+#    • batch inflation blocked                                           #
+#    • Utility.batch disabled by default (flag allow_utility_batch)      #
+#    • tolerant RPC parsing  +  robust pallet/function detection         #
 # ====================================================================== #
 from __future__ import annotations
 
@@ -169,7 +168,6 @@ def _parse_stake_transferred(params, fmt: int) -> TransferEvent:
 # ─────────────── parsers for StakeAdded / StakeRemoved ─────────────── #
 
 def _amount_from_stake_added(params) -> int:
-    # v9+: 0 dest_ck, 1 hotkey, 2 to_uid, 3 amount, 4 dest_netuid
     return int(_f(params, 3, _f(params, 2, 0)))
 
 
@@ -198,6 +196,7 @@ class AlphaTransfersScanner:
         allow_utility_batch: bool = False,
         dump_events: bool = False,
         dump_last: int = DUMP_LAST,
+        debug_extrinsics: bool = False,
         on_progress: Optional[Callable[[int, int, int], None]] = None,
         max_concurrency: int = MAX_CONCURRENCY,
         rpc_lock: Optional[asyncio.Lock] = None,
@@ -208,6 +207,7 @@ class AlphaTransfersScanner:
         self.allow_batch = allow_utility_batch
         self.dump_events = dump_events
         self.dump_last = dump_last
+        self.debug_extr = debug_extrinsics
         self.on_progress = on_progress
         self.max_conc = max_concurrency
         self.ss58_format = subtensor.substrate.ss58_format
@@ -220,19 +220,22 @@ class AlphaTransfersScanner:
             return await maybe_async(fn, *a, **kw)
 
     async def _get_block(self, bn: int):
+        """
+        Return (events, extrinsics_list) for block *bn* while tolerating
+        several return formats of substrate‑interface.
+        """
         bh = await self._rpc(self.st.substrate.get_block_hash, block_id=bn)
         events = await self._rpc(self.st.substrate.get_events, block_hash=bh)
         blk = await self._rpc(self.st.substrate.get_block, block_hash=bh)
 
-        # -------- extract extrinsics no matter how substrate‑interface formats it
+        # -------- extract extrinsics from every known shape
         if isinstance(blk, dict):
             extrinsics = (
-                blk.get("block", {}).get("extrinsics")      # v1.7+
-                or blk.get("extrinsics")                    # some older forks
+                blk.get("block", {}).get("extrinsics")      # v1.7+ (deep)
+                or blk.get("extrinsics")                    # shallow
                 or []
             )
         else:
-            # older substrate‑interface returns an object with .extrinsics attr
             extrinsics = getattr(blk, "extrinsics", [])
 
         return events, extrinsics
@@ -276,7 +279,7 @@ class AlphaTransfersScanner:
                         await self.st.initialize()
                     raw_events, extrinsics = await self._get_block(bn)
 
-                allowed_idx = self._allowed_extrinsic_indices(extrinsics)
+                allowed_idx = self._allowed_extrinsic_indices(extrinsics, bn)
                 bucket = events_by_block.setdefault(bn, [])
 
                 seen, kept = self._accumulate(
@@ -310,32 +313,47 @@ class AlphaTransfersScanner:
 
     # ──────────────────── extrinsic filtering ─────────────────────── #
 
-    def _allowed_extrinsic_indices(self, extrinsics) -> set[int]:
+    @staticmethod
+    def _pallet_func(ex) -> Tuple[str, str]:
+        """
+        Robustly extract (pallet, function) from any extrinsic format
+        produced by substrate‑interface.
+        """
+        call_obj = ex
+        if isinstance(ex, dict) and "call" in ex:
+            call_obj = ex["call"]
+
+        if isinstance(call_obj, dict):
+            pallet = call_obj.get("call_module") or call_obj.get("module_name") or ""
+            func = call_obj.get("call_function") or call_obj.get("function_name") or ""
+        else:
+            pallet = (
+                getattr(call_obj, "call_module", "")
+                or getattr(call_obj, "module_name", "")
+            )
+            func = (
+                getattr(call_obj, "call_function", "")
+                or getattr(call_obj, "function_name", "")
+            )
+        return str(pallet), str(func)
+
+    def _allowed_extrinsic_indices(self, extrinsics, block_num: int) -> set[int]:
         """
         • Always allow SubtensorModule.transfer_stake
         • Allow Utility.{batch,force_batch,batch_all} only if
           allow_utility_batch=True
+        • Optionally print extrinsics when debug_extrinsics is enabled
         """
         allowed: set[int] = set()
         for idx, ex in enumerate(extrinsics):
-            try:
-                call = ex["call"]
-                pallet = call["call_module"]
-                func = call["call_function"]
-            except Exception:
-                pallet = getattr(ex, "call_module", "")
-                func = getattr(ex, "call_function", "")
+            pallet, func = self._pallet_func(ex)
 
-            pallet = str(pallet)
-            func = str(func)
+            if self.debug_extr:
+                bt.logging.debug(f"[blk {block_num}] ex#{idx}  {pallet}.{func}")
 
             if (pallet, func) == ("SubtensorModule", "transfer_stake"):
                 allowed.add(idx)
-            elif (
-                pallet == "Utility"
-                and func in UTILITY_FUNS
-                and self.allow_batch
-            ):
+            elif pallet == "Utility" and func in UTILITY_FUNS and self.allow_batch:
                 allowed.add(idx)
         return allowed
 
@@ -360,7 +378,6 @@ class AlphaTransfersScanner:
         seen = kept = 0
         fmt = self.ss58_format
 
-        # per‑extrinsic queues of "open" transfers waiting for StakeAdded / Removed
         waiting: Dict[int, List[dict]] = {idx: [] for idx in allowed_idx}
 
         for ev in raw_events:
@@ -398,12 +415,12 @@ class AlphaTransfersScanner:
                 info = waiting[idx]
                 if not info:
                     continue
-                top = info[0]          # first unmatched transfer
+                top = info[0]
                 dest_ck = _account_id(_f(fields, 0)) or b""
                 if dest_ck != top["te"].dest_coldkey_raw:
-                    continue   # belongs to another call later in the batch
+                    continue
                 if top["have_add"]:
-                    continue   # we already paired first add
+                    continue
                 top["amount"] = _amount_from_stake_added(fields)
                 top["have_add"] = True
 
@@ -421,7 +438,7 @@ class AlphaTransfersScanner:
                 top["src_netuid"] = _subnet_from_stake_removed(fields)
                 top["have_rem"] = True
 
-            # whenever the first queued transfer has both pieces, emit it
+            # --- flush when first queued transfer is complete ----------
             while waiting[idx] and waiting[idx][0]["have_add"] and waiting[idx][0]["have_rem"]:
                 entry = waiting[idx].pop(0)
                 te: TransferEvent = entry["te"]
