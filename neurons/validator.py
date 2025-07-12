@@ -253,7 +253,8 @@ class Validator(EpochValidatorNeuron):
 
         # ── ✅  broadcast weights on-chain  ────────────────────────── #
         if not self.config.no_epoch:          # honour --no-epoch flag
-            self.set_weights()
+            pass
+            # self.set_weights()
 
         # record success and persist
         self._validated_epochs.add(prev_epoch_index)
