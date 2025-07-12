@@ -10,10 +10,10 @@ TREASURY_COLDKEY: str = "5GW6xj5wUpLBz7jCNp38FzkdS6DfeFdUTuvUjcn6uKH5krsn"
 STARTING_AUCTIONS_BLOCK = int(os.getenv("STARTING_ACTIONS_BLOCK","5931900"))
 AUCTION_DELAY_BLOCKS: int = 50
 FORBIDDEN_ALPHA_SUBNETS: list[int] = [73]
-FORCE_BURN_WEIGHTS = False
+FORCE_BURN_WEIGHTS = True
 DEFAULT_BITTENSOR_NETWORK: str = os.getenv("BITTENSOR_NETWORK","finney")
 PLANCK = 10**9
-TESTING = True
+TESTING = False
 
 # ─────────────────── 2.  BOND‑CURVE DESIGN TARGETS  ────────────────── #
 P_S_PAR: float = 1.0                       # spot‑parity (TAO ⇄ SN‑73)

@@ -1,11 +1,10 @@
 # ====================================================================== #
 #  metahash/validator/alpha_transfers.py                                 #
-#  Patched 2025-07-12 – forbid non-transfer extrinsics                   #
-#                           • robust extrinsic filter (_allowed_…)       #
-#                           • close cross-subnet α-swap loophole         #
-#                           • keep API 100 % backward-compatible         #
+#  Patched 2025‑07‑07 – close cross‑subnet α‑swap loophole               #
+#                           • track   src_netuid  via companion events   #
+#                           • discard src_netuid ≠ dest_netuid transfers #
+#                           • keep API 100 % backward‑compatible         #
 # ====================================================================== #
-
 from __future__ import annotations
 
 import asyncio
@@ -22,79 +21,6 @@ from substrateinterface.utils.ss58 import (
 from metahash.config import MAX_CONCURRENCY
 from metahash.utils.async_substrate import maybe_async
 
-# ── extrinsic filter ─────────────────────────────────────────────────── #
-UTILITY_FUNS: set[str] = {"batch", "force_batch", "batch_all"}
-
-
-def _name(obj) -> str | None:
-    """
-    Return a *string* name for a call-module / call-function regardless of the
-    exact shape that py-substrate-interface gives us.
-
-        • GenericCallModule / GenericCallFunction → .name attr
-        • str / bytes                             → itself
-        • dict                                    → ["name"]
-        • anything else                           → str(obj)
-    """
-    if obj is None:
-        return None
-    if hasattr(obj, "name"):
-        return obj.name
-    if isinstance(obj, (bytes, str)):
-        return obj.decode() if isinstance(obj, bytes) else obj
-    if isinstance(obj, dict):
-        return obj.get("name")
-    return str(obj)
-
-
-def _allowed_extrinsic_indices(                       # noqa: PLR0911
-    self,
-    extrinsics,
-    block_num: int,
-) -> set[int]:
-    """
-    • *Always* allow SubtensorModule.transfer_stake.
-
-    • Allow Utility.{batch,force_batch,batch_all} **only** when
-      `self.allow_batch` is True.
-
-    The helper is deliberately written to be **robust** against every weird
-    shape of `extrinsic["call"]["call_module"]` that py-substrate-interface
-    might return, so silent failures no longer exclude good transfers.
-    """
-    allowed: set[int] = set()
-
-    for idx, ex in enumerate(extrinsics):
-        # Any error inside this loop should never abort the whole scan – just
-        # skip the offending extrinsic and continue.
-        try:
-            pallet = _name(ex["call"]["call_module"])
-            func = _name(ex["call"]["call_function"])
-
-            if self.debug_extr:
-                bt.logging.debug(f"[blk {block_num}] ex#{idx}  {pallet}.{func}")
-
-            # 1️⃣ direct α-stake transfer
-            if (pallet, func) == ("SubtensorModule", "transfer_stake"):
-                allowed.add(idx)
-
-            # 2️⃣ optional Utility batches
-            elif (
-                pallet == "Utility"
-                and func in UTILITY_FUNS
-                and getattr(self, "allow_batch", False)
-            ):
-                allowed.add(idx)
-
-        except Exception as err:
-            if self.debug_extr:
-                bt.logging.debug(
-                    f"[blk {block_num}] ex#{idx}  unreadable – {err!s}"
-                )
-
-    return allowed
-
-
 # ── constants ─────────────────────────────────────────────────────────── #
 MAX_CHUNK_DEFAULT = 1_000
 LOG_EVERY = 50
@@ -106,13 +32,13 @@ DUMP_LAST = 5
 @dataclass(slots=True, frozen=True)
 class TransferEvent:
     """
-    Container for a single α-stake transfer.
+    Container for a single α‑stake transfer.
 
     • **subnet_id**      – destination netuid (unchanged public API)
     • **src_subnet_id**  – origin netuid            (new, may be None)
     • **from_uid / to_uid** – UIDs in the *destination* subnet
     • **amount_rao**     – α amount in planck
-    • **src_coldkey / dest_coldkey** – 32 byte SS58
+    • **src_coldkey / dest_coldkey** – 32 byte SS58
     """
     block: int
     from_uid: int
@@ -241,43 +167,43 @@ def _parse_stake_transferred(
 
 def _amount_from_stake_removed(params) -> int:
     """
-    v9+ StakeRemoved layout (6 fields):
+    v9+ StakeRemoved layout (6 fields):
         0  src_coldkey
         1  hotkey
         2  from_uid
         3  amount_rao          ← **this**
         4  src_netuid          ← paired with TransferEvent
         5  ...
-    Older networks (≤ v8) used index 2 for the amount.  We keep the fallback.
+    Older networks (≤ v8) used index 2 for the amount.  We keep the fallback.
     """
     return int(_f(params, 3, _f(params, 2, 0)))
 
 
 def _amount_from_stake_added(params) -> int:                   # noqa: ANN001
     """
-    v9+ StakeAdded layout (6 fields):
+    v9+ StakeAdded layout (6 fields):
         0  dest_coldkey        (treasury)
         1  hotkey
         2  to_uid
         3  amount_rao          ← **this**
         4  dest_netuid
         5  ...
-    ≤ v8 fallback keeps index 2.
+    ≤ v8 fallback keeps index 2.
     """
     return int(_f(params, 3, _f(params, 2, 0)))
 
 
 def _subnet_from_stake_removed(params) -> int:
     """
-    v9+ StakeRemoved: subnet is field 4.
-    ≤ v8 (legacy) keeps field 1.
+    v9+ StakeRemoved: subnet is field 4.
+    ≤ v8 (legacy) keeps field 1.
     """
     return int(_f(params, 4, _f(params, 1, -1)))
 
 
 def _subnet_from_stake_added(params) -> int:
     """
-    v9+ StakeAdded: subnet is field 4.
+    v9+ StakeAdded: subnet is field 4.
     """
     return int(_f(params, 4, -1))
 
@@ -285,16 +211,13 @@ def _subnet_from_stake_added(params) -> int:
 
 
 class AlphaTransfersScanner:
-    """Scans a block-range for α-stake transfers to one treasury cold-key."""
+    """Scans a block‑range for α‑stake transfers to one treasury cold‑key."""
 
-    # NB: the constructor is unchanged – only the added flags are documented.
     def __init__(
         self,
         subtensor: bt.Subtensor | bt.AsyncSubtensor,
         *,
         dest_coldkey: Optional[str] = None,
-        allow_batch: bool = False,          # ⬅ enable Utility batch unwrap
-        debug_extr: bool = False,           # ⬅ log every extrinsic inspected
         dump_events: bool = False,
         dump_last: int = DUMP_LAST,
         on_progress: Optional[Callable[[int, int, int], None]] = None,
@@ -304,8 +227,6 @@ class AlphaTransfersScanner:
         self.st = subtensor
         self.dest_ck = dest_coldkey
         self.dest_ck_raw = _decode_ss58(dest_coldkey) if dest_coldkey else None
-        self.allow_batch = allow_batch
-        self.debug_extr = debug_extr
         self.dump_events = dump_events
         self.dump_last = dump_last
         self.on_progress = on_progress
@@ -321,31 +242,6 @@ class AlphaTransfersScanner:
     async def _get_events_at(self, bn: int):
         bh = await self._rpc(self.st.substrate.get_block_hash, block_id=bn)
         return await self._rpc(self.st.substrate.get_events, block_hash=bh)
-
-    async def _get_extrinsics_at(self, bn: int):
-        bh = await self._rpc(self.st.substrate.get_block_hash, block_id=bn)
-        return await self._rpc(self.st.substrate.get_block, block_hash=bh)
-
-    async def _get_block(self, bn: int):
-        """
-        Return (events, extrinsics_list) for block *bn* while tolerating
-        several return formats of substrate‑interface.
-        """
-        bh = await self._rpc(self.st.substrate.get_block_hash, block_id=bn)
-        events = await self._rpc(self.st.substrate.get_events, block_hash=bh)
-        blk = await self._rpc(self.st.substrate.get_block, block_hash=bh)
-
-        # -------- extract extrinsics from every known shape
-        if isinstance(blk, dict):
-            extrinsics = (
-                blk.get("block", {}).get("extrinsics")      # v1.7+ (deep)
-                or blk.get("extrinsics")                    # shallow
-                or []
-            )
-        else:
-            extrinsics = getattr(blk, "extrinsics", [])
-
-        return events, extrinsics
 
     # ------------------------------------------------------------------ #
     async def scan(self, frm: int, to: int) -> List[TransferEvent]:
@@ -379,21 +275,12 @@ class AlphaTransfersScanner:
                     break
                 try:
                     raw_events = await self._get_events_at(bn)
-                    extrinsics = await self._get_block(bn)
-
-                    allowed_idx = _allowed_extrinsic_indices(self, extrinsics, bn)
-
-                    # # Strip events that belong to disallowed extrinsics —— #
-                    # raw_events = [
-                    #     ev
-                    #     for ev in raw_events
-                    #     if ev.get("extrinsic_idx") in allowed_idx
-                    #     or ev.get("extrinsic_idx") is None
-                    # ]
-
                 except websockets.exceptions.WebSocketException as err:
-                    bt.logging.error(f"RPC error at block {bn}: {err}; reconnecting…")
-                    raise err
+                    bt.logging.warning(f"RPC error at block {bn}: {err}; reconnecting…")
+                    async with self._rpc_lock:
+                        await self.st.__aexit__(None, None, None)
+                        await self.st.initialize()
+                    raw_events = await self._get_events_at(bn)
 
                 bucket = events_by_block.setdefault(bn, [])
                 seen, kept = self._accumulate(
@@ -402,7 +289,6 @@ class AlphaTransfersScanner:
                     block_hint_single=bn,
                     dump=self.dump_events and bn >= to - self.dump_last + 1,
                 )
-
                 ev_cnt += seen
                 keep_cnt += kept
                 blk_cnt += 1
@@ -440,7 +326,7 @@ class AlphaTransfersScanner:
 
         • src_netuid is picked from companion StakeRemoved (if present)
         • amount_rao is replaced by α from companion StakeAdded (preferred)
-        • Cross-net transfers (src_netuid ≠ dest_netuid) are **dropped**
+        • Cross‑net transfers (src_netuid ≠ dest_netuid) are **dropped**
         """
 
         seen = kept = 0
@@ -449,7 +335,7 @@ class AlphaTransfersScanner:
         rem_netuid: Dict[int, int] = {}
         add_netuid: Dict[int, int] = {}
 
-        # pass-1: collect companion data ------------------------------ #
+        # pass‑1: collect companion data ------------------------------ #
         for ev in raw_events:
             x = ev.get("extrinsic_idx")
             if x is None:
@@ -465,7 +351,7 @@ class AlphaTransfersScanner:
                 add_amount[x] = _amount_from_stake_added(fields)
                 add_netuid[x] = _subnet_from_stake_added(fields)
 
-        # pass-2: process StakeTransferred ---------------------------- #
+        # pass‑2: process StakeTransferred ---------------------------- #
         for ev in raw_events:
             if _event_name(ev) != "StakeTransferred":
                 continue
@@ -480,7 +366,7 @@ class AlphaTransfersScanner:
 
             x = ev.get("extrinsic_idx")
 
-            # enrich amount + netuid data from pass-1
+            # enrich amount + netuid data from pass‑1
             if x is not None:
                 if x in add_amount:
                     te = replace(te, amount_rao=add_amount[x])
@@ -493,11 +379,11 @@ class AlphaTransfersScanner:
                         f"event={te.subnet_id}  add_netuid={add_netuid[x]}"
                     )
 
-            # ── SECURITY GATE – drop cross-subnet transfers ───────── #
+            # ── SECURITY GATE – drop cross‑subnet transfers ───────── #
             if te.src_subnet_id is not None and te.src_subnet_id != te.subnet_id:
                 if dump:
                     bt.logging.info(
-                        f"[blk {block_hint_single}] cross-net α-transfer "
+                        f"[blk {block_hint_single}] cross‑net α‑transfer "
                         f"{te.src_subnet_id} ➞ {te.subnet_id}  "
                         f"(amount={te.amount_rao})  **IGNORED**"
                     )
