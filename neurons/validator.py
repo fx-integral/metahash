@@ -1,5 +1,5 @@
 # ╭────────────────────────────────────────────────────────────────────╮
-# neurons/validator.py – SN‑73 treasury‑only (July 2025, patched)      #
+# neurons/validator.py – SN‑73 treasury‑only (July 2025, patched)      #
 # ╰────────────────────────────────────────────────────────────────────╯
 from __future__ import annotations
 
@@ -50,7 +50,7 @@ class _Bid:
 @dataclass(slots=True)
 class _Pending:
     alpha: float
-    discount_bps: int          # ← FIX: store bidder‑specific discount
+    discount_bps: int          # bidder‑specific discount
     deadline: int
     src_coldkey: str           # payer
     epoch: int                 # auction epoch index
@@ -61,9 +61,9 @@ class _Pending:
 class Validator(EpochValidatorNeuron):
     """
     SN‑73 batch‑auction:
-      • miners pay α directly to validator's treasury cold‑key
-      • auction cleared at epoch (e‑1), payments occur during epoch e,
-        rewards accounted at epoch (e+1)
+      • miners pay α directly to the validator’s treasury cold‑key
+      • auction cleared at epoch (e‑1); payments occur during epoch e;
+        rewards accounted for at epoch (e+1)
     """
 
     # ─── init ─────────────────────────────────────────────────────────
@@ -97,16 +97,24 @@ class Validator(EpochValidatorNeuron):
         self._validated_epochs: set[int] = self._load_set("validated_epochs.json")
 
     # ─── persistence helpers ──────────────────────────────────────────
+    # NOTE: these now save in the current working directory so that
+    #       they no longer depend on self.wallet.hotkey_file.
     def _load_set(self, filename: str) -> set[int]:
-        path = Path(self.wallet.hotkey_file).expanduser().parent / filename
+        """
+        Load a JSON array of integers from *filename* in the CWD.
+        Returns an empty set on first run or if the file is unreadable.
+        """
+        path = Path.cwd() / filename
         try:
-            data = json.loads(path.read_text())
-            return set(data)
+            return set(json.loads(path.read_text()))
         except Exception:
             return set()
 
     def _save_set(self, s: set[int], filename: str):
-        path = Path(self.wallet.hotkey_file).expanduser().parent / filename
+        """
+        Atomically write *s* (sorted list) to *filename* in the CWD.
+        """
+        path = Path.cwd() / filename
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(sorted(s)))
         tmp.replace(path)
@@ -139,7 +147,7 @@ class Validator(EpochValidatorNeuron):
         if self._bid_counter[uid] >= MAX_BIDS_PER_MINER:
             return AckSynapse(**syn.dict(), accepted=False, error="rate‑limit exceeded")
 
-        # ← FIX: sanity‑check inputs (issue #9)
+        # sanity‑check inputs (issue #9)
         if not isfinite(syn.alpha) or syn.alpha <= 0:
             return AckSynapse(**syn.dict(), accepted=False, error="invalid α")
         if syn.alpha > AUCTION_BUDGET_ALPHA:
@@ -252,7 +260,7 @@ class Validator(EpochValidatorNeuron):
             src_ck = self.metagraph.coldkeys[w.miner_uid]
             self._pending[w.miner_uid] = _Pending(
                 alpha=w.alpha,
-                discount_bps=w.discount_bps,     # ← FIX
+                discount_bps=w.discount_bps,
                 deadline=deadline,
                 src_coldkey=src_ck,
                 epoch=epoch_to_clear,
@@ -272,7 +280,7 @@ class Validator(EpochValidatorNeuron):
                 synapse=WinSynapse(
                     subnet_id=bid.subnet_id,
                     alpha=bid.alpha,
-                    clearing_discount_bps=bid.discount_bps,   # ← FIX
+                    clearing_discount_bps=bid.discount_bps,
                     pay_deadline_block=deadline,
                 ),
                 deserialize=False,
@@ -312,7 +320,7 @@ class Validator(EpochValidatorNeuron):
             ]
             received_rao = sum(ev.amount_rao for ev in evs)
 
-            # ← FIX: apply individual discount
+            # apply individual discount
             pay_alpha = pend.alpha * (1 - pend.discount_bps / 10_000)
             required_rao = int(pay_alpha * PLANCK)
 
@@ -364,7 +372,7 @@ class Validator(EpochValidatorNeuron):
         if not self.config.no_epoch:
             self.set_weights()
 
-        # ← FIX: mark validated *after* weights are set
+        # mark validated *after* weights are set
         self._validated_epochs.add(target_epoch)
         self._save_set(self._validated_epochs, "validated_epochs.json")
         clog.success(f"weights set for epoch {target_epoch}", color="cyan")
