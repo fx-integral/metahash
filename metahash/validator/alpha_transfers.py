@@ -346,10 +346,25 @@ class AlphaTransfersScanner:
         """
         allowed: set[int] = set()
         for idx, ex in enumerate(extrinsics):
-            pallet, func = self._pallet_func(ex)
+            # ① Nuevo formato (dicts planos)
+            if isinstance(ex, dict):
+                pallet = str(ex.get("call_module") or ex.get("module_name") or "")
+                func = str(ex.get("call_function") or ex.get("function_name") or "")
+            else:
+                # ② Formatos antiguos (objeto con atributos o dict anidado)
+                try:
+                    call = ex["call"]
+                    pallet = str(call.get("call_module", ""))
+                    func = str(call.get("call_function", ""))
+                except Exception:
+                    pallet = str(getattr(ex, "call_module", ""))
+                    func = str(getattr(ex, "call_function", ""))
 
             if self.debug_extr:
                 bt.logging.debug(f"[blk {block_num}] ex#{idx}  {pallet}.{func}")
+            print()
+            print("Transfer detected")
+            print(pallet, func)
 
             if (pallet, func) == ("SubtensorModule", "transfer_stake"):
                 allowed.add(idx)
