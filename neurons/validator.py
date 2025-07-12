@@ -255,10 +255,9 @@ class Validator(EpochValidatorNeuron):
 
             # ── ✅  broadcast weights on-chain  ────────────────────────── #
             if not self.config.no_epoch:          # honour --no-epoch flag
-                pass
-                # self.set_weights()
-                # self._validated_epochs.add(prev_epoch_index)
-                # self._save_validated_epochs()
+                self.set_weights()
+                self._validated_epochs.add(prev_epoch_index)
+                self._save_validated_epochs()
 
     # ╭──────────────────────────── main loop ──────────────────────────╮
     async def forward(self) -> None:
