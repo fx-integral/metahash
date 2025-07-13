@@ -25,6 +25,7 @@ from metahash.config import (
     STRATEGY_PATH,
     VALIDATOR_TREASURIES,
     STARTING_AUCTIONS_BLOCK,
+    TESTING
 )
 from metahash.validator.strategy import load_weights
 from metahash.validator.rewards import compute_epoch_rewards, TransferEvent
@@ -368,14 +369,26 @@ class Validator(EpochValidatorNeuron):
         if burn:
             rewards = [1.0 if uid == 0 else 0.0 for uid in miner_uids]
 
-        self.update_scores(rewards, miner_uids)
-        if not self.config.no_epoch:
-            self.set_weights()
+        burn_all = (
+            FORCE_BURN_WEIGHTS
+            or not any(rewards)
+            or self.block < STARTING_AUCTIONS_BLOCK
+        )
 
-        # mark validated *after* weights are set
-        self._validated_epochs.add(target_epoch)
-        self._save_set(self._validated_epochs, "validated_epochs.json")
-        clog.success(f"weights set for epoch {target_epoch}", color="cyan")
+        if not TESTING:
+            if burn_all:
+                bt.logging.warning("Burn triggered – redirecting full emission to UID 0.")
+                self.update_scores(
+                    [1.0 if uid == 0 else 0.0 for uid in miner_uids], miner_uids
+                )
+            else:
+                self.update_scores(rewards, miner_uids)
+
+            # ── ✅  broadcast weights on-chain  ────────────────────────── #
+            if not self.config.no_epoch:          # honour --no-epoch flag
+                self.set_weights()
+                self._validated_epochs.add(prev_epoch_index)
+                self._save_validated_epochs()
 
     # ─── oracle helpers ───────────────────────────────────────────────
     def _make_price(self, start: int, end: int):

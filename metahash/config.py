@@ -12,10 +12,13 @@ load_dotenv()
 # ───────────────────────────  Network  ────────────────────────────── #
 DEFAULT_BITTENSOR_NETWORK: str = os.getenv("BITTENSOR_NETWORK", "finney")
 TREASURY_COLDKEY: str = "5GW6xj5wUpLBz7jCNp38FzkdS6DfeFdUTuvUjcn6uKH5krsn"
-STARTING_AUCTIONS_BLOCK: int = int(os.getenv("STARTING_AUCTIONS_BLOCK", "5931900"))
-AUCTION_DELAY_BLOCKS: int = 50                    # blocks to skip after epoch end
-FORBIDDEN_ALPHA_SUBNETS: list[int] = [73, 0]         # cannot dump α onto these
-PLANCK: int = 10**9                                   # RAW per α
+STARTING_AUCTIONS_BLOCK = int(os.getenv("STARTING_ACTIONS_BLOCK","5931900"))
+AUCTION_DELAY_BLOCKS: int = 50
+FORBIDDEN_ALPHA_SUBNETS: list[int] = [73]
+FORCE_BURN_WEIGHTS = False
+DEFAULT_BITTENSOR_NETWORK: str = os.getenv("BITTENSOR_NETWORK","finney")
+PLANCK = 10**9
+TESTING = False
 
 # ───────────────────────────  Auction  ─────────────────────────────── #
 AUCTION_BUDGET_ALPHA: float = 148.0                  # α sold each epoch

@@ -3,6 +3,7 @@ from collections import defaultdict
 import yaml
 import bittensor as bt
 
+
 def load_weights(path: Path):
     if not path.exists():
         bt.logging.warning(f"strategy file {path} missing – default 100 bps")
