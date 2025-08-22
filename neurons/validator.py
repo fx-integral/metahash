@@ -20,7 +20,7 @@ from metahash.config import (
     TREASURY_COLDKEY,
     AUCTION_DELAY_BLOCKS,
     FORCE_BURN_WEIGHTS,
-    STARTING_AUCTIONS_BLOCK,
+    STARTING_BURN_AUCTIONS_BLOCK,
     TESTING
 )
 from metahash.validator.rewards import compute_epoch_rewards, TransferEvent
@@ -241,7 +241,7 @@ class Validator(EpochValidatorNeuron):
         burn_all = (
             FORCE_BURN_WEIGHTS
             or not any(rewards)
-            or self.block < STARTING_AUCTIONS_BLOCK
+            or self.block > STARTING_BURN_AUCTIONS_BLOCK
         )
 
         if not TESTING:
