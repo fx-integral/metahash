@@ -1,14 +1,9 @@
 # ╭────────────────────────────────────────────────────────────────────────╮
-# metahash/validator/rewards.py        Epoch reward‑calculation logic      #
-#                                                                           #
-# Patched 2025‑07‑07                                                        #
-#   • Imports the enhanced `TransferEvent` that now carries `src_subnet_id` #
-#     (defined in metahash.validator.alpha_transfers).                      #
-#   • All reward‑calculation semantics are unchanged; cross‑net events      #
-#     have already been stripped out by the scanner.                        #
+# metahash/validator/rewards.py 
 # ╰────────────────────────────────────────────────────────────────────────╯
-from __future__ import annotations
 
+
+from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass
