@@ -3,7 +3,7 @@
 # (only the new and changed parts are shown)                                 #
 # ========================================================================== #
 from __future__ import annotations
-from typing import Optional, Dict, List
+from typing import Optional, Dict
 from bittensor import Synapse
 
 
