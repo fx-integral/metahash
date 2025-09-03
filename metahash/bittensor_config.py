@@ -22,9 +22,8 @@ def is_cuda_available():
 
 def add_args(parser):
     """
-    Adds relevant arguments to the parser for operation.
+    Adds relevant common arguments to the parser.
     """
-
     parser.add_argument("--netuid", type=int, help="Subnet netuid", default=1)
 
     parser.add_argument(
@@ -37,7 +36,7 @@ def add_args(parser):
     parser.add_argument(
         "--neuron.epoch_length",
         type=int,
-        help="The default epoch length (how often we set weights, measured in 12 second blocks).",
+        help="Epoch length (in ~12s blocks).",
         default=360,
     )
 
@@ -86,7 +85,6 @@ def add_args(parser):
 
 def add_miner_args(parser):
     """Add miner specific arguments to the parser."""
-
     parser.add_argument(
         "--neuron.name",
         type=str,
@@ -139,7 +137,6 @@ def add_miner_args(parser):
 
 def add_validator_args(parser):
     """Add validator specific arguments to the parser."""
-
     parser.add_argument(
         "--neuron.name",
         type=str,
@@ -205,16 +202,19 @@ def config():
     Returns the configuration object specific to this miner or validator after adding relevant arguments.
     """
     parser = argparse.ArgumentParser(conflict_handler="resolve")
+
+    # Core bittensor argument groups
     bt.wallet.add_args(parser)
     bt.subtensor.add_args(parser)
     bt.logging.add_args(parser)
     bt.axon.add_args(parser)
+
+    # Project argument groups
     add_validator_args(parser)
     add_miner_args(parser)
     add_args(parser)
 
-    # Explicit config
-    # Setting weights are disabled so we can trigger manually
+    # ─────────────────────────── Validator ─────────────────────────── #
     parser.add_argument(
         "--neuron.disable_set_weights",
         action="store_true",
@@ -230,22 +230,44 @@ def config():
         help="Enable mock mode (no real chain calls).",
     )
 
-    # 1.0 so it reset completely the scores
+    # 1.0 so it resets completely the scores on each update (validators)
     parser.add_argument(
         "--neuron.moving_average_alpha",
         type=float,
-        help="Moving average alpha parameter, how much to add of the new observation.",
-        default=1,
+        help="Moving average alpha parameter for validator rewards blending.",
+        default=1.0,
     )
 
+    # NOTE: Validators can opt-out of serving an axon, miners cannot.
     parser.add_argument(
         "--neuron.axon_off",
         "--axon_off",
         action="store_true",
-        # Note: the validator needs to serve an Axon with their IP or they may
-        #   be blacklisted by the firewall of serving peers on the network.
-        help="Set this flag to not attempt to serve an Axon.",
-        default=True,
+        help="Set this flag to not attempt to serve an Axon (validators only; miners ignore).",
+        default=False,
+    )
+
+    # ─────────────────────────── MINER ─────────────────────────── #
+    parser.add_argument(
+        "--miner.bids.netuids",
+        nargs="+",
+        type=int,
+        default=[],
+        help="Target subnets to bid on (repeat allowed), e.g. 30 30 12",
+    )
+    parser.add_argument(
+        "--miner.bids.amounts",
+        nargs="+",
+        type=float,
+        default=[],
+        help="α amounts for each bid, e.g. 1000 500 200",
+    )
+    parser.add_argument(
+        "--miner.bids.discounts",
+        nargs="+",
+        type=str,
+        default=[],
+        help="Discounts per bid: percent or bps tokens (e.g., 10 5 1000bps)",
     )
 
     return bt.config(parser)
