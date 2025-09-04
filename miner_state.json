@@ -1,0 +1,59 @@
+{
+  "already_bid": {
+    "<unknown>": [
+      [
+        14792,
+        136,
+        100.0,
+        1000
+      ],
+      [
+        14793,
+        136,
+        100.0,
+        1000
+      ],
+      [
+        14794,
+        136,
+        100.0,
+        1000
+      ]
+    ]
+  },
+  "treasuries": {
+    "<unknown>": "5DLULtxCS9vA3pZRgSTd9gkvGrUwgNje2TNQeLibo9wUWjSS"
+  },
+  "wins": [
+    {
+      "alpha": 2.96,
+      "amount_rao": 2664000000,
+      "deadline_block": 5340305,
+      "discount_bps": 1000,
+      "epoch_seen": 0,
+      "invoice_id": "06619176f333",
+      "last_attempt_ts": 1756945782.478668,
+      "last_response": "rejected",
+      "paid": false,
+      "pay_attempts": 1,
+      "subnet_id": 136,
+      "treasury_coldkey": "5DLULtxCS9vA3pZRgSTd9gkvGrUwgNje2TNQeLibo9wUWjSS",
+      "validator_key": "<unknown>"
+    },
+    {
+      "alpha": 2.96,
+      "amount_rao": 2664000000,
+      "deadline_block": 5340667,
+      "discount_bps": 1000,
+      "epoch_seen": 0,
+      "invoice_id": "7147ef4d3f68",
+      "last_attempt_ts": 1756950135.2438126,
+      "last_response": "rejected",
+      "paid": false,
+      "pay_attempts": 1,
+      "subnet_id": 136,
+      "treasury_coldkey": "5DLULtxCS9vA3pZRgSTd9gkvGrUwgNje2TNQeLibo9wUWjSS",
+      "validator_key": "<unknown>"
+    }
+  ]
+}

@@ -13,20 +13,14 @@ from typing import AsyncGenerator, Optional
 from bittensor.core.metagraph import AsyncMetagraph
 from bittensor import AsyncSubtensor
 from bittensor.utils.balance import Balance
-import time
 from typing import List
 import random
 import bittensor as bt
 from substrateinterface.exceptions import SubstrateRequestException
-
-
-# ── project‑specific constants (keep or replace) ────────────────────────────
 from metahash.config import (
-    DEFAULT_BITTENSOR_NETWORK,   # e.g. "finney"
-    DEFAULT_NETUID,       # default netuid for your project
-    DECIMALS,          # 10**9 for TAO
-    SAMPLE_POINTS)
-# ─────────────────────────────────────────────────────────────────────────────
+    DEFAULT_BITTENSOR_NETWORK,   
+    SAMPLE_POINTS,
+    DECIMALS)
 
 
 # ╭────────────────────────────── context helpers ───────────────────────────╮
@@ -57,7 +51,7 @@ async def _with_subtensor(
 
 # ╭───────────────────────────── public helpers ──────────────────────────────╮
 async def subnet_info(
-    netuid: int = DEFAULT_NETUID,
+    netuid: int,
     *,
     st: AsyncSubtensor | None = None,
     block: int | None = None,
@@ -67,7 +61,7 @@ async def subnet_info(
         return await sub.subnet(netuid, block=block)
 
 
-async def current_epoch(netuid: int = DEFAULT_NETUID, *, st=None):
+async def current_epoch(netuid: int, *, st=None):
     """Snapshot of where we are in the current epoch."""
     async with _with_subtensor(st) as sub:
         tempo = await sub.tempo(netuid)
@@ -81,14 +75,14 @@ async def current_epoch(netuid: int = DEFAULT_NETUID, *, st=None):
         }
 
 
-async def subnet_price(netuid: int = DEFAULT_NETUID, *, st=None) -> Balance:
+async def subnet_price(netuid: int, *, st=None) -> Balance:
     """TAO price of 1 α‑share in the subnet’s liquidity pool."""
     async with _with_subtensor(st) as sub:
         info = await sub.subnet(netuid)
         return info.price
 
 
-async def liquidity_and_slippage(netuid: int = DEFAULT_NETUID, tao_in=1, *, st=None):
+async def liquidity_and_slippage(netuid: int, tao_in=1, *, st=None):
     """Return pool sizes and simple slippage estimate for a buy of *tao_in* TAO."""
     async with _with_subtensor(st) as sub:
         info = await sub.subnet(netuid)

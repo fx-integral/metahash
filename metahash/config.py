@@ -5,12 +5,11 @@ metahash/config.py — global constants (v2 + reputation + pretty logs)
 from __future__ import annotations
 import os
 from dotenv import load_dotenv
-from metahash.validator import __version__
+from decimal import Decimal
 
 load_dotenv()
 
 # ╭─────────────────────────── ENVIRONMENT ────────────────────────────╮
-VERSION = __version__
 DEFAULT_BITTENSOR_NETWORK: str = os.getenv("BITTENSOR_NETWORK", "finney")
 
 # Gate v2 logic until chain reaches this height (validators idle before this)
@@ -22,17 +21,6 @@ FORCE_BURN_WEIGHTS: bool = os.getenv("FORCE_BURN_WEIGHTS", "false").lower() == "
 
 # Monetary base unit (α planck)
 PLANCK: int = 10**9
-# ╰────────────────────────────────────────────────────────────────────╯
-
-
-# ╭────────────────────────────── ROLES ───────────────────────────────╮
-# Validators whose hotkeys appear here are *eligible masters*.
-# Final master status also requires stake ≥ S_MIN_MASTER_VALIDATOR.
-# Mapping: hotkey_ss58 → treasury_coldkey_ss58
-VALIDATOR_TREASURIES: dict[str, str] = {
-    # "5Hk...MASTER1_HOT": "5Dw...MASTER1_TREASURY",
-    # "5Hk...MASTER2_HOT": "5Dw...MASTER2_TREASURY",
-}
 # ╰────────────────────────────────────────────────────────────────────╯
 
 
@@ -78,6 +66,13 @@ REPUTATION_BASELINE_CAP_FRAC: float = float(os.getenv("REPUTATION_BASELINE_CAP_F
 REPUTATION_MAX_CAP_FRAC: float = float(os.getenv("REPUTATION_MAX_CAP_FRAC", "0.30"))
 # ╰────────────────────────────────────────────────────────────────────╯
 
+
+# ╭────────────────────── SLIPPAGE ──────────────────────╮
+DECIMALS: int = 10**9
+K_SLIP: Decimal = Decimal("1.0")
+CAP_SLIP: float = 1.0
+SLIP_TOLERANCE: Decimal = Decimal("0.001")     
+SAMPLE_POINTS: int = 8  
 
 # ╭────────────────────── ORACLE / SCANNER KNOBS ──────────────────────╮
 # Event scan chunk / concurrency for alpha transfer scanner

@@ -8,8 +8,6 @@
 # - NO custom project state here (kept in neurons/miner.py).                   #
 # ============================================================================ #
 
-from __future__ import annotations
-
 import typing
 import time
 import asyncio
@@ -63,7 +61,16 @@ class BaseMinerNeuron(BaseNeuron):
             config=self.config() if callable(self.config) else self.config,
         )
 
-        # Attach v2 handlers (typed by synapse)
+        # Catch-all forward for any other synapse
+        bt.logging.info("Attaching generic forward function to miner axon.")
+
+        self.axon.attach(
+            forward_fn=self.forward,
+            blacklist_fn=self.blacklist,
+            priority_fn=self.priority,
+        )
+
+        # # Attach v2 handlers (typed by synapse)
         bt.logging.info("Attaching v2 auction handlers to miner axon.")
         self.axon.attach(
             forward_fn=self.auctionstart_forward,
@@ -74,14 +81,6 @@ class BaseMinerNeuron(BaseNeuron):
             forward_fn=self.win_forward,
             blacklist_fn=self.win_blacklist,
             priority_fn=self.win_priority,
-        )
-
-        # Catch-all forward for any other synapse
-        bt.logging.info("Attaching generic forward function to miner axon.")
-        self.axon.attach(
-            forward_fn=self.forward,
-            blacklist_fn=self.blacklist,
-            priority_fn=self.priority,
         )
 
         bt.logging.info(f"Axon created: {self.axon}")
@@ -167,19 +166,6 @@ class BaseMinerNeuron(BaseNeuron):
     def set_weights(self):
         """Miners do not emit weights; keep no‑op."""
         pass
-
-    # --------------------------- default handlers ---------------------------- #
-    async def auctionstart_forward(self, synapse: AuctionStartSynapse) -> AuctionStartSynapse:
-        """Override in subclass to bid logic."""
-        return synapse
-
-    async def win_forward(self, synapse: WinSynapse) -> WinSynapse:
-        """Override in subclass to pay invoices."""
-        return synapse
-
-    async def forward(self, synapse: bt.Synapse) -> bt.Synapse:
-        """Generic catch-all; safe no-op."""
-        return synapse
 
     # -------------------------- blacklist & priority ------------------------- #
     async def blacklist(self, synapse: bt.Synapse) -> typing.Tuple[bool, str]:

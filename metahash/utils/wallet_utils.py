@@ -139,6 +139,7 @@ async def transfer_alpha(
 
     except Exception as e:
         bt.logging.error(f":cross_mark: [red]Failed[/red]: {str(e)}")
+        raise e
         return False
 
 

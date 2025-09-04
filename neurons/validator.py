@@ -1,10 +1,11 @@
-# ╭────────────────────────────────────────────────────────────────────╮
-# neurons/validator.py – SN‑73 v2 (commitments + reputation caps)      #
-# Pretty logs for testnet using Rich (with safe fallback).             #
-# ╰────────────────────────────────────────────────────────────────────╯
+# neurons/validator.py – SN‑73 v2 (commitments + reputation caps)
+#
+# Pretty logs for testnet using Rich (with safe fallback).
+
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import time
 from collections import defaultdict
@@ -17,12 +18,11 @@ import bittensor as bt
 from bittensor import BLOCKTIME
 
 from metahash.base.utils.logging import ColoredLogger as clog
+from metahash import __version__
+from treasuries import VALIDATOR_TREASURIES
 
-# ── config ------------------------------------------------------------- #
-import metahash.config as mh_cfg
-
+# ── config -------------------------------------------------------------
 from metahash.config import (
-    VERSION,
     PLANCK,
     AUCTION_BUDGET_ALPHA,
     PAYMENT_WINDOW_BLOCKS,
@@ -30,11 +30,9 @@ from metahash.config import (
     S_MIN_ALPHA_MINER,
     S_MIN_MASTER_VALIDATOR,
     STRATEGY_PATH,
-    VALIDATOR_TREASURIES,
     START_V2_BLOCK,
     TESTING,
     FORCE_BURN_WEIGHTS,
-    PARTIAL_PAYMENT_PENALTY_BPS,
     POST_PAYMENT_CHECK_DELAY_BLOCKS,
     JAIL_EPOCHS_NO_PAY,
     JAIL_EPOCHS_PARTIAL,
@@ -43,15 +41,17 @@ from metahash.config import (
     REPUTATION_BETA,
     REPUTATION_BASELINE_CAP_FRAC,
     REPUTATION_MAX_CAP_FRAC,
+    # pretty log controls
+    LOG_TOP_N,
 )
-
 from metahash.validator.strategy import load_weights
 from metahash.validator.rewards import compute_epoch_rewards, TransferEvent
 from metahash.validator.alpha_transfers import AlphaTransfersScanner
 from metahash.validator.epoch_validator import EpochValidatorNeuron
 from metahash.utils.subnet_utils import average_price, average_depth
 from metahash.protocol import (
-    BidSynapse, AckSynapse, WinSynapse, AuctionStartSynapse
+    AuctionStartSynapse,  # miners return bids in this response
+    WinSynapse,           # winners notification
 )
 from metahash.utils.commitments import (
     write_plain_commitment_json,
@@ -60,32 +60,28 @@ from metahash.utils.commitments import (
 )
 from metahash.utils.pretty_logs import pretty  # ← Rich logs (fallback-safe)
 
-
 # ───────────────────────── data models ──────────────────────────────── #
+
 
 @dataclass(slots=True)
 class _Bid:
     epoch: int
     subnet_id: int
-    alpha: float                 # α requested for this bid (payment target)
+    alpha: float       # α requested for this bid (payment target)
     miner_uid: int
     coldkey: str
-    discount_bps: int            # valuation discount (NOT payment)
-    weight_snap: float = 0.0     # snapshot at acceptance (0..1)
-    idx: int = 0                 # stable order per miner+subnet
+    discount_bps: int  # valuation discount (NOT payment)
+    weight_snap: float = 0.0  # snapshot at acceptance (0..1)
+    idx: int = 0       # stable order per miner+subnet
 
-
-# ──────────────────────────  Validator  ─────────────────────────────── #
 
 class Validator(EpochValidatorNeuron):
     """
-    v2 with auto master detection, commitments-based sharing, and
-    reputation-capped per-coldkey allocations at clearing time.
+    v2 with auto master detection, commitments-based sharing, and reputation-capped
+    per-coldkey allocations at clearing time.
 
-    Head E order:
-      1) settle E−2 and set weights,
-      2) masters broadcast AuctionStart for E,
-      3) masters clear & publish invoices (commitment) for E−1.
+    Head E order: 1) settle E−2 and set weights, 2) masters broadcast AuctionStart for E,
+    3) masters clear & publish invoices (commitment) for E−1.
 
     Bids placed during epoch e → published at head e+1 → payments in e+1 → settled at head e+2.
     """
@@ -95,6 +91,10 @@ class Validator(EpochValidatorNeuron):
         super().__init__(config=config)
 
         self.hotkey_ss58: str = self.wallet.hotkey.ss58_address
+
+        # Wipe local persisted state if requested BEFORE loading it.
+        if getattr(self.config, "fresh", False):
+            self._wipe_state_files()
 
         # strategy (weights per subnet), accepts [0,1] or bps
         self.weights_bps = load_weights(Path(STRATEGY_PATH))
@@ -116,14 +116,26 @@ class Validator(EpochValidatorNeuron):
 
         # remember when we broadcast per-epoch
         self._auction_start_sent_for: Optional[int] = None
+        self._not_master_log_epoch: Optional[int] = None  # ← avoid spam
 
         pretty.banner(
-            f"Validator v{VERSION} initialized",
-            f"hotkey={self.hotkey_ss58} | netuid={self.config.netuid}",
+            f"Validator v{__version__} initialized",
+            f"hotkey={self.hotkey_ss58} | netuid={self.config.netuid} | epoch={getattr(self, 'epoch_index', 0)}"
+            + (" | fresh" if getattr(self.config, "fresh", False) else ""),
             style="bold magenta",
         )
 
     # ─── persistence helpers ──────────────────────────────────────────
+    def _wipe_state_files(self):
+        for fn in ("validated_epochs.json", "jailed_coldkeys.json", "reputation.json"):
+            path = Path.cwd() / fn
+            try:
+                if path.exists():
+                    path.unlink()
+            except Exception as e:
+                pretty.log(f"[yellow]Could not remove {fn}: {e}[/yellow]")
+        pretty.log("[magenta]Fresh start requested: cleared validator local state files.[/magenta]")
+
     def _load_set(self, filename: str) -> set[int]:
         path = Path.cwd() / filename
         try:
@@ -173,7 +185,7 @@ class Validator(EpochValidatorNeuron):
 
     # ─── utilities ────────────────────────────────────────────────────
     def _norm_weight(self, subnet_id: int) -> float:
-        raw = float(self.weights_bps[subnet_id])
+        raw = float(self.weights_bps.get(subnet_id, 0.0))
         if raw > 1.0:
             raw = raw / 10_000.0
         return max(0.0, min(1.0, raw))
@@ -207,14 +219,16 @@ class Validator(EpochValidatorNeuron):
         stakes: Dict[str, float] = {}
         total = 0.0
         shares: List[Tuple[str, int, float, float]] = []  # for pretty log
-        for hk in VALIDATOR_TREASURIES.keys():           # ← only listed hotkeys count
+
+        for hk in VALIDATOR_TREASURIES.keys():  # ← only listed hotkeys count
             uid = hk2uid.get(hk)
             if uid is None or uid >= len(self.metagraph.stake):
                 continue
             st = float(self.metagraph.stake[uid])
-            if st >= S_MIN_MASTER_VALIDATOR:             # ← only above threshold
+            if st >= S_MIN_MASTER_VALIDATOR:  # ← only above threshold
                 stakes[hk] = st
                 total += st
+
         my_stake = stakes.get(self.hotkey_ss58, 0.0)
         share = (my_stake / total) if (total > 0 and my_stake > 0) else 0.0
 
@@ -229,75 +243,70 @@ class Validator(EpochValidatorNeuron):
 
         return share
 
-    # ─── RPC entry (BidSynapse) – masters only ────────────────────────
-    async def server_step(self, syn: BidSynapse) -> AckSynapse:  # type: ignore[override]
-        uid = syn.dendrite.origin
+    # ─── internal: accept bids coming from AuctionStart responses ───── #
+    def _accept_bid_from(self, *, uid: int, subnet_id: int, alpha: float, discount_bps: int) -> Tuple[bool, Optional[str]]:
         epoch = self.epoch_index
-
         if self.block < START_V2_BLOCK:
-            return AckSynapse(**syn.dict(), accepted=False, error="auction not started (v2 gating)")
-
+            return False, "auction not started (v2 gating)"
         if not self._is_master_now():
-            return AckSynapse(**syn.dict(), accepted=False, error="bids disabled on non-master validator")
+            return False, "bids disabled on non-master validator"
 
         # epoch‑jail (by coldkey)
         ck = self.metagraph.coldkeys[uid]
         jail_upto = self._ck_jail_until_epoch.get(ck, -1)
         if jail_upto is not None and epoch < jail_upto:
-            return AckSynapse(**syn.dict(), accepted=False, error=f"jailed until epoch {jail_upto}")
+            return False, f"jailed until epoch {jail_upto}"
 
         # stake gate (miner’s UID)
         stake_alpha = self.metagraph.stake[uid]
         if stake_alpha < S_MIN_ALPHA_MINER:
-            return AckSynapse(**syn.dict(), accepted=False,
-                              error=f"stake {stake_alpha:.3f} α < S_MIN_ALPHA_MINER")
+            return False, f"stake {stake_alpha:.3f} α < S_MIN_ALPHA_MINER"
 
         # sanity‑checks
-        if not isfinite(syn.alpha) or syn.alpha <= 0:
-            return AckSynapse(**syn.dict(), accepted=False, error="invalid α")
-        if syn.alpha > AUCTION_BUDGET_ALPHA:
-            return AckSynapse(**syn.dict(), accepted=False, error="α exceeds max per bid")
-        if not (0 <= syn.discount_bps <= 10_000):
-            return AckSynapse(**syn.dict(), accepted=False, error="discount out of range")
+        if not isfinite(alpha) or alpha <= 0:
+            return False, "invalid α"
+        if alpha > AUCTION_BUDGET_ALPHA:
+            return False, "α exceeds max per bid"
+        if not (0 <= discount_bps <= 10_000):
+            return False, "discount out of range"
 
         # enforce one uid per coldkey (per epoch per master)
         ck_map = self._ck_uid_epoch[epoch]
         existing_uid = ck_map.get(ck)
         if existing_uid is not None and existing_uid != uid:
-            return AckSynapse(**syn.dict(), accepted=False,
-                              error=f"coldkey already bidding as uid={existing_uid}")
+            return False, f"coldkey already bidding as uid={existing_uid}"
 
         # per‑coldkey bid limit on distinct subnets
         count = self._ck_subnets_bid[epoch].get(ck, 0)
         first_on_subnet = True
-        key = (uid, syn.subnet_id)
+        key = (uid, subnet_id)
         if key in self._bid_book[epoch]:
             first_on_subnet = False
         if first_on_subnet and count >= MAX_BIDS_PER_MINER:
-            return AckSynapse(**syn.dict(), accepted=False, error="per-coldkey bid limit reached")
+            return False, "per-coldkey bid limit reached"
 
         # accept / upsert
         ck_map.setdefault(ck, uid)
         if first_on_subnet:
             self._ck_subnets_bid[epoch][ck] = count + 1
-
-        idx = len([b for (u, s), b in self._bid_book[epoch].items() if u == uid and s == syn.subnet_id])
+        idx = len([b for (u, s), b in self._bid_book[epoch].items() if u == uid and s == subnet_id])
 
         self._bid_book[epoch][key] = _Bid(
             epoch=epoch,
-            subnet_id=syn.subnet_id,
-            alpha=syn.alpha,
+            subnet_id=subnet_id,
+            alpha=alpha,
             miner_uid=uid,
             coldkey=ck,
-            discount_bps=syn.discount_bps,
-            weight_snap=self._norm_weight(syn.subnet_id),
+            discount_bps=discount_bps,
+            weight_snap=self._norm_weight(subnet_id),
             idx=idx,
         )
-        return AckSynapse(**syn.dict(), accepted=True)
+        return True, None
 
     # ───────────────────────── broadcast helper (masters) ───────────── #
     async def _broadcast_auction_start(self):
         if not self._is_master_now():
+            # Intentionally quiet here; forward() logs a once-per-epoch note.
             return
         if getattr(self, "_auction_start_sent_for", None) == self.epoch_index:
             return
@@ -306,14 +315,15 @@ class Validator(EpochValidatorNeuron):
 
         share = self._master_budget_share()
         my_budget = AUCTION_BUDGET_ALPHA * share
-
         if my_budget <= 0:
-            pretty.log("[yellow]Budget share is zero – not broadcasting AuctionStart.[/yellow]")
+            pretty.log("[yellow]Budget share is zero – not broadcasting AuctionStart (no stake share this epoch).[/yellow]")
             self._auction_start_sent_for = self.epoch_index
             return
 
         axons = self.metagraph.axons
         if not axons:
+            pretty.log("[yellow]Metagraph has no axons; skipping AuctionStart broadcast.[/yellow]")
+            self._auction_start_sent_for = self.epoch_index
             return
 
         syn = AuctionStartSynapse(
@@ -324,9 +334,54 @@ class Validator(EpochValidatorNeuron):
             weights_bps=dict(self.weights_bps),
             treasury_coldkey=VALIDATOR_TREASURIES.get(self.hotkey_ss58, ""),
         )
-        await self.dendrite(axons=axons, synapse=syn, deserialize=False, timeout=8)
+
+        # Expect a list[AuctionStartSynapse]
+        try:
+            resps = await self.dendrite(axons=axons, synapse=syn, deserialize=True, timeout=8)
+        except Exception as e:
+            resps = []
+            pretty.log(f"[yellow]AuctionStart broadcast exceptions: {e}[/yellow]")
+
+        # Map hotkey->uid for attribution of bids
+        hk2uid = self._hotkey_to_uid()
+
+        # Count acks and collected bids
+        ack_count = 0
+        total = len(axons) if axons else 0
+        bids_accepted = 0
+        bids_rejected = 0
+
+        # Responses come in same order as axons; zip to know who sent what
+        for idx, ax in enumerate(axons or []):
+            resp = resps[idx] if isinstance(resps, list) and idx < len(resps) else None
+            if not isinstance(resp, AuctionStartSynapse):
+                continue
+            if bool(getattr(resp, "ack", False)):
+                ack_count += 1
+
+            # Collect bids filled by miner in the response
+            bids = getattr(resp, "bids", None) or []
+            uid = hk2uid.get(ax.hotkey)
+            if uid is None:
+                # unknown / recently pruned miner; skip
+                continue
+
+            for b in bids:
+                try:
+                    subnet_id = int(b.get("subnet_id"))
+                    alpha = float(b.get("alpha"))
+                    discount_bps = int(b.get("discount_bps"))
+                except Exception:
+                    bids_rejected += 1
+                    continue
+                ok, err = self._accept_bid_from(uid=uid, subnet_id=subnet_id, alpha=alpha, discount_bps=discount_bps)
+                if ok:
+                    bids_accepted += 1
+                else:
+                    bids_rejected += 1
 
         self._auction_start_sent_for = self.epoch_index
+
         pretty.kv_panel(
             "AuctionStart Broadcast",
             [
@@ -334,20 +389,21 @@ class Validator(EpochValidatorNeuron):
                 ("block", self.block),
                 ("budget α", f"{my_budget:.3f}"),
                 ("treasury", VALIDATOR_TREASURIES.get(self.hotkey_ss58, "")),
+                ("acks_received", f"{ack_count}/{total}"),
+                ("bids_accepted", bids_accepted),
+                ("bids_rejected", bids_rejected),
             ],
             style="bold cyan",
         )
 
     # ─────────────────────────── forward() ──────────────────────────── #
     async def forward(self):
-        """
-        Per-epoch driver (weights-first):
-          1) Settle epoch (e−2) and set weights (from commitments).
-          2) Masters: broadcast auction start for current epoch e.
-          3) Masters: clear and publish invoices for epoch (e−1) to commitments.
+        """ Per-epoch driver (weights-first):
+        1) Settle epoch (e−2) and set weights (from commitments).
+        2) Masters: broadcast auction start for current epoch e.
+        3) Masters: clear previous epoch’s auction (e−1) and publish to commitments
         """
         await self._stxn()
-
         if self.block < START_V2_BLOCK:
             pretty.banner(
                 "Waiting for START_V2_BLOCK",
@@ -366,6 +422,11 @@ class Validator(EpochValidatorNeuron):
         # 1) WEIGHTS FIRST: settle older epoch (e−2)
         await self._settle_and_set_weights_all_masters(epoch_to_settle=self.epoch_index - 2)
 
+        # If we're not a master, say so once per epoch (clear operator signal)
+        if not self._is_master_now() and self._not_master_log_epoch != self.epoch_index:
+            pretty.log("[yellow]validator is not a master so no biddings.[/yellow]")
+            self._not_master_log_epoch = self.epoch_index
+
         # 2) Masters broadcast auction start for current epoch (e)
         await self._broadcast_auction_start()
 
@@ -378,6 +439,10 @@ class Validator(EpochValidatorNeuron):
         self._ck_subnets_bid.pop(self.epoch_index - 2, None)
 
     # ─── (masters) Auction clearing (epoch e-1) → publish commitment ──
+    def _make_invoice_id(self, validator_key: str, epoch: int, subnet_id: int, alpha: float, discount_bps: int, deadline_block: int, amount_rao: int) -> str:
+        payload = f"{validator_key}|{epoch}|{subnet_id}|{alpha:.12f}|{discount_bps}|{deadline_block}|{amount_rao}"
+        return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
+
     async def _clear_publish_commitment(self, epoch_to_clear: int):
         if epoch_to_clear < 0:
             return
@@ -386,7 +451,7 @@ class Validator(EpochValidatorNeuron):
 
         bid_map = self._bid_book.get(epoch_to_clear, {})
         if not bid_map:
-            pretty.log("[grey]No bids to clear this epoch (master).[/grey]")
+            pretty.log(f"[grey]No bids to clear this epoch (master). epoch={epoch_to_clear}[/grey]")
             return
 
         share = self._master_budget_share()
@@ -415,7 +480,6 @@ class Validator(EpochValidatorNeuron):
         budget = my_budget
         winners: List[_Bid] = []
         allocated_by_ck: Dict[str, float] = defaultdict(float)
-
         for b in bids:
             if budget <= 0:
                 break
@@ -443,10 +507,22 @@ class Validator(EpochValidatorNeuron):
         start_blk = self.epoch_start_block  # include pre-bids within the epoch
         treasury = VALIDATOR_TREASURIES.get(self.hotkey_ss58, "")
 
-        # Notify winners (off-chain RPC)
+        # Notify winners (off-chain RPC) — expect list[WinSynapse] and log acks
+        ack_ok = 0
+        total_sent = 0
         for w in winners:
             try:
-                await self.dendrite(
+                # For traceability in logs, compute the same invoice_id as the miner will derive
+                amount_rao = int(round(w.alpha * (1 - w.discount_bps / 10_000.0) * PLANCK))
+                invoice_id = self._make_invoice_id(
+                    self.hotkey_ss58, self.epoch_index, w.subnet_id, w.alpha, w.discount_bps, deadline, amount_rao
+                )
+                pretty.log(
+                    f"[cyan]Sending Win[/cyan] uid={w.miner_uid} subnet={w.subnet_id} "
+                    f"alpha={w.alpha:.4f} disc={w.discount_bps}bps deadline={deadline} "
+                    f"(epoch_clear={epoch_to_clear}, inv={invoice_id})"
+                )
+                resps = await self.dendrite(
                     axons=[self.metagraph.axons[w.miner_uid]],
                     synapse=WinSynapse(
                         subnet_id=w.subnet_id,
@@ -454,8 +530,12 @@ class Validator(EpochValidatorNeuron):
                         clearing_discount_bps=w.discount_bps,
                         pay_deadline_block=deadline,
                     ),
-                    deserialize=False,
+                    deserialize=True,
                 )
+                total_sent += 1
+                resp = resps[0] if isinstance(resps, list) and resps else resps
+                if isinstance(resp, WinSynapse) and bool(getattr(resp, "ack", False)):
+                    ack_ok += 1
             except Exception as e:
                 clog.warning(f"WinSynapse to uid={w.miner_uid} failed: {e}", color="red")
 
@@ -465,16 +545,18 @@ class Validator(EpochValidatorNeuron):
             key = str(w.miner_uid)
             if key not in inv:
                 inv[key] = {"ck": w.coldkey, "ln": []}
-            inv[key]["ln"].append([
-                int(w.subnet_id),
-                int(w.discount_bps),
-                int(round(w.weight_snap * 10_000)),
-                int(w.alpha * PLANCK),  # required RAO for this line (full α)
-            ])
+            inv[key]["ln"].append(
+                [
+                    int(w.subnet_id),
+                    int(w.discount_bps),
+                    int(round(w.weight_snap * 10_000)),
+                    int(w.alpha * PLANCK),  # required RAO for this line (full α)
+                ]
+            )
 
         new_snap = {"e": int(epoch_to_clear), "t": treasury, "as": int(start_blk), "de": int(deadline), "inv": inv}
-        st = await self._stxn()
 
+        st = await self._stxn()
         # Try to include the previous snapshot (keep at most 1 older)
         try:
             prev = await read_plain_commitment(st, netuid=self.config.netuid, hotkey_ss58=self.hotkey_ss58)
@@ -497,6 +579,7 @@ class Validator(EpochValidatorNeuron):
 
         # Publish commitment
         try:
+            payload_bytes = len(json.dumps(payload).encode("utf-8"))
             ok = await write_plain_commitment_json(st, wallet=self.wallet, data=payload, netuid=self.config.netuid)
             if ok:
                 pretty.kv_panel(
@@ -506,6 +589,8 @@ class Validator(EpochValidatorNeuron):
                         ("deadline_block", deadline),
                         ("budget_left α", f"{budget:.3f}"),
                         ("treasury", treasury),
+                        ("win_acks", f"{ack_ok}/{total_sent}"),
+                        ("payload_bytes", payload_bytes),
                     ],
                     style="bold green",
                 )
@@ -530,7 +615,6 @@ class Validator(EpochValidatorNeuron):
 
         masters_hotkeys: Set[str] = set(VALIDATOR_TREASURIES.keys())
         snapshots: List[Dict] = []
-
         for hk in masters_hotkeys:
             data = commits.get(hk)
             if not isinstance(data, dict):
@@ -551,8 +635,31 @@ class Validator(EpochValidatorNeuron):
                     pretty.log(f"[yellow]Treasury mismatch in commitment for {hk}[/yellow]")
                 snapshots.append({"hk": hk, **chosen})
 
+        miner_uids_all: List[int] = list(self.get_miner_uids())
+
         if not snapshots:
-            pretty.log("[grey]No master commitments found for this settlement epoch.[/grey]")
+            # NEW: Explicit burn-all path when there were no commitments to settle
+            pretty.log("[grey]No master commitments found for this settlement epoch – applying burn‑all weights (no payments to account).[/grey]")
+            final_scores = [1.0 if uid == 0 else 0.0 for uid in miner_uids_all]
+            self._log_final_scores_table(final_scores, miner_uids_all, reason="no commitments → burn-all")
+            if TESTING:
+                pretty.log("[yellow]TESTING=True → not updating weights; burn‑all shown only.[/yellow]")
+            else:
+                self.update_scores(final_scores, miner_uids_all)
+                if not self.config.no_epoch:
+                    self.set_weights()
+
+            pretty.kv_panel(
+                "Weights Set (Burn‑All: No Commitments)",
+                [
+                    ("epoch_settled", epoch_to_settle),
+                    ("miners_scored", sum(1 for x in final_scores if x > 0)),
+                    ("mode", "burn-all (uid 0)"),
+                ],
+                style="bold red",
+            )
+            self._validated_epochs.add(epoch_to_settle)
+            self._save_set(self._validated_epochs, "validated_epochs.json")
             return
 
         # time window: min(start) .. max(deadline) + delay
@@ -565,7 +672,9 @@ class Validator(EpochValidatorNeuron):
             # small ETA banner
             remain = end_block - self.block
             eta_s = remain * BLOCKTIME
-            pretty.kv_panel("Waiting for window to close", [("blocks_left", remain), ("~eta", f"{int(eta_s//60)}m{int(eta_s%60):02d}s}")], style="bold yellow")
+            pretty.kv_panel("Waiting for window to close",
+                            [("blocks_left", remain), ("~eta", f"{int(eta_s//60)}m{int(eta_s%60):02d}s")],
+                            style="bold yellow")
             return
 
         # Prepare scanner; accept all, filter by treasuries after
@@ -577,7 +686,6 @@ class Validator(EpochValidatorNeuron):
         master_treasuries: Set[str] = {VALIDATOR_TREASURIES.get(s["hk"], s.get("t", "")) for s in snapshots}
         subnets_needed: Set[int] = set()
         ck_uid_map: Dict[str, int] = {}
-
         for s in snapshots:
             inv = s.get("inv", {})
             for uid_s, inv_d in inv.items():
@@ -608,9 +716,8 @@ class Validator(EpochValidatorNeuron):
             rao_by_uid_dest_subnet[(uid, ev.dest_coldkey, ev.subnet_id)] += int(ev.amount_rao)
 
         # TAO per (uid, dest_treasury, subnet) via canonical pipeline
-        miner_uids_all: List[int] = list(self.get_miner_uids())
+        miner_uids_all = list(self.get_miner_uids())  # refresh
         tao_by_uid_dest_subnet: Dict[Tuple[int, str, int], float] = {}
-
         for sid in sorted(subnets_needed):
             sub_events = [ev for ev in filtered_events if ev.subnet_id == sid]
             if not sub_events:
@@ -649,11 +756,9 @@ class Validator(EpochValidatorNeuron):
         for s in snapshots:
             tre = VALIDATOR_TREASURIES.get(s["hk"], s.get("t", ""))
             inv = s.get("inv", {})
-
             for uid_s, inv_d in inv.items():
                 uid = int(uid_s)
                 ck = inv_d.get("ck")
-
                 by_subnet: Dict[int, List[Tuple[int, int, int, int, int]]] = defaultdict(list)
                 for idx_line, ln in enumerate(inv_d.get("ln", [])):
                     if not (isinstance(ln, list) and len(ln) >= 4):
@@ -669,10 +774,10 @@ class Validator(EpochValidatorNeuron):
                     tao_total = tao_by_uid_dest_subnet.get((uid, tre, sid), 0.0)
 
                     lines.sort(key=line_key, reverse=True)
-
                     remain = paid_rao_total
                     covered: List[Tuple[int, int, int, int, int]] = []
                     uncovered: List[Tuple[int, int, int, int, int]] = []
+
                     for ln_t in lines:
                         _, _, _, req_rao, _ = ln_t
                         if remain >= req_rao:
@@ -723,7 +828,7 @@ class Validator(EpochValidatorNeuron):
                 if self._ck_jail_until_epoch.get(ck, 0) < next_ep:
                     self._ck_jail_until_epoch[ck] = next_ep
             self._save_dict_int(self._ck_jail_until_epoch, "jailed_coldkeys.json")
-            pretty.show_offenders(sorted(list(offenders_partial)), sorted(list(offenders_nopay)))
+        pretty.show_offenders(sorted(list(offenders_partial)), sorted(list(offenders_nopay)))
 
         # Reputation update (EMA on paid *effective* share)
         if REPUTATION_ENABLED:
@@ -736,21 +841,34 @@ class Validator(EpochValidatorNeuron):
                     new_r = (1.0 - beta) * prev + beta * share
                     self._reputation[ck] = max(0.0, min(1.0, new_r))
                 self._save_dict_float(self._reputation, "reputation.json")
-                pretty.show_reputation(self._reputation)
+        pretty.show_reputation(self._reputation)
 
         # finalize weights; add burn to UID 0
-        miner_uids_all: List[int] = list(self.get_miner_uids())
+        miner_uids_all = list(self.get_miner_uids())
         if 0 in miner_uids_all and burn_total_value > 0:
             scores_by_uid[0] = scores_by_uid.get(0, 0.0) + burn_total_value
-            pretty.show_burn(burn_total_value)
+        pretty.show_burn(burn_total_value)
 
         final_scores: List[float] = [scores_by_uid.get(uid, 0.0) for uid in miner_uids_all]
 
+        # Ordered, explicit logs: 1) show scores, 2) show TESTING/burn, 3) act
+        burn_reason = None
         burn_all = FORCE_BURN_WEIGHTS or (not any(final_scores))
-        if not TESTING:
+        if FORCE_BURN_WEIGHTS:
+            burn_reason = "FORCE_BURN_WEIGHTS"
+        elif not any(final_scores):
+            burn_reason = "no positive scores"
+
+        self._log_final_scores_table(final_scores, miner_uids_all, reason=burn_reason)
+
+        if TESTING:
+            pretty.log("[yellow]TESTING=True → not updating weights; displaying computed scores only.[/yellow]")
+        else:
             if burn_all:
-                pretty.log("[red]Burn-all triggered – redirecting emission to UID 0.[/red]")
+                pretty.log(f"[red]Burn‑all triggered – reason: {burn_reason}.[/red]")
                 final_scores = [1.0 if uid == 0 else 0.0 for uid in miner_uids_all]
+            else:
+                pretty.log("[green]Setting weights from final scores.[/green]")
 
             self.update_scores(final_scores, miner_uids_all)
             if not self.config.no_epoch:
@@ -765,9 +883,34 @@ class Validator(EpochValidatorNeuron):
                 ("epoch_settled", epoch_to_settle),
                 ("miners_scored", sum(1 for x in final_scores if x > 0)),
                 ("snapshots_used", len(snapshots)),
+                ("mode", "burn-all" if burn_all and not TESTING else "normal" if not TESTING else "TESTING (no set)"),
             ],
             style="bold green",
         )
+
+    # ─── internal: score table printer ────────────────────────────────
+    def _log_final_scores_table(self, scores: List[float], uids: List[int], reason: str | None = None):
+        """ Prints a compact table of top-N final scores (before any burn-all overwrite). """
+        pairs = list(zip(uids, scores))
+        pairs.sort(key=lambda x: x[1], reverse=True)
+        top_n = max(1, int(LOG_TOP_N))
+        head = pairs[:top_n]
+        total = sum(scores)
+        nonzero = sum(1 for _, s in pairs if s > 0)
+        lines = []
+        lines.append("┌──────────── Final Scores (top {}) ────────────┐".format(min(top_n, len(pairs))))
+        lines.append("│ {:>6} │ {:>14} │".format("UID", "score (TAO)"))
+        lines.append("├─────────┼────────────────┤")
+        for uid, sc in head:
+            lines.append("│ {:>6} │ {:>14.6f} │".format(uid, sc))
+        if len(pairs) > top_n:
+            lines.append("│ ... │ ({} more) │".format(len(pairs) - top_n))
+        lines.append("├─────────┴────────────────┤")
+        lines.append("│ total: {:>10.6f} | nonzero: {:>4} │".format(total, nonzero))
+        if reason:
+            lines.append("│ reason: {:<28} │".format(reason))
+        lines.append("└───────────────────────────┘")
+        pretty.log("\n".join(lines))
 
     # ─── oracle helpers ───────────────────────────────────────────────
     def _make_price(self, start: int, end: int):
@@ -789,7 +932,8 @@ class Validator(EpochValidatorNeuron):
 # ╭────────────────── keep‑alive (optional) ───────────────────────────╮
 if __name__ == "__main__":
     from metahash.bittensor_config import config
-    with Validator(config=config()) as v:
+
+    with Validator(config=config(role="validator")) as v:
         while True:
             clog.info("Validator running…", color="gray")
             time.sleep(120)

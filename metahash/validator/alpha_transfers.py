@@ -23,7 +23,6 @@ from substrateinterface.utils.ss58 import (
 
 from metahash.config import MAX_CONCURRENCY
 from metahash.utils.async_substrate import maybe_async
-from metahash.validator.sink_lookup import uid_from_sink
 
 
 # ── extrinsic filter ─────────────────────────────────────────────────── #
