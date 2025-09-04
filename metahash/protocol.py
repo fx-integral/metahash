@@ -2,7 +2,8 @@
 #
 # metahash/protocol.py
 #
-# (v2 — unified request/response synapses, miners include bids in AuctionStart)
+# (v2.2 — miners include bids in AuctionStart; validators send EARLY wins with
+#          payment window = epoch e+1; no legacy deadline fields)
 #
 # ==========================================================================
 from __future__ import annotations
@@ -48,14 +49,20 @@ class AuctionStartSynapse(Synapse):
 # ───────────────────── Win synapse (Validator → Miner) ───────────────────── #
 class WinSynapse(Synapse):
     """
-    Validator → Miner (per won bid line).
-    Miner pays and returns this same synapse with ack + payment status.
+    Validator → Miner (per won bid line). Sent EARLY in epoch e,
+    with explicit *next-epoch* payment window.
+
+    Settlement by validators will scan exactly the payment-epoch window recorded in commitments.
     """
     # request fields
     subnet_id: int
     alpha: float
     clearing_discount_bps: int
-    pay_deadline_block: int
+
+    # explicit payment window (epoch e+1)
+    pay_window_start_block: Optional[int] = None
+    pay_window_end_block: Optional[int] = None
+    pay_epoch_index: Optional[int] = None
 
     # response fields (filled by Miner)
     ack: Optional[bool] = None

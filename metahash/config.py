@@ -1,5 +1,5 @@
 """
-metahash/config.py — global constants (v2 + reputation + pretty logs)
+metahash/config.py — global constants (v2.2: early wins, reputation, pretty logs)
 """
 
 from __future__ import annotations
@@ -38,9 +38,6 @@ S_MIN_MASTER_VALIDATOR: float = float(os.getenv("S_MIN_MASTER_VALIDATOR", "10000
 # Max distinct subnets a single coldkey may bid per epoch (per master)
 MAX_BIDS_PER_MINER: int = int(os.getenv("MAX_BIDS_PER_MINER", "5"))
 
-# Payment window length (blocks) from confirmation to deadline
-PAYMENT_WINDOW_BLOCKS: int = int(os.getenv("PAYMENT_WINDOW_BLOCKS", "30"))
-
 # Subnets on which incoming α transfers must be ignored for rewards calc
 FORBIDDEN_ALPHA_SUBNETS: list[int] = [73]
 
@@ -71,32 +68,28 @@ REPUTATION_MAX_CAP_FRAC: float = float(os.getenv("REPUTATION_MAX_CAP_FRAC", "0.3
 DECIMALS: int = 10**9
 K_SLIP: Decimal = Decimal("1.0")
 CAP_SLIP: float = 1.0
-SLIP_TOLERANCE: Decimal = Decimal("0.001")     
-SAMPLE_POINTS: int = 8  
+SLIP_TOLERANCE: Decimal = Decimal("0.001")
+SAMPLE_POINTS: int = 8
+# ╰──────────────────────────────────────────────────────╯
+
 
 # ╭────────────────────── ORACLE / SCANNER KNOBS ──────────────────────╮
 # Event scan chunk / concurrency for alpha transfer scanner
 MAX_CHUNK: int = int(os.getenv("ALPHA_SCAN_CHUNK", "512"))
 MAX_CONCURRENCY: int = int(os.getenv("ALPHA_SCAN_CONCURRENCY", "8"))
 
-# We use post‑deadline delay for settlement; keep FINALITY_LAG for compatibility
-FINALITY_LAG: int = int(os.getenv("FINALITY_LAG", "0"))
+# Extra delay after payment window before settlement (blocks).
+POST_PAYMENT_CHECK_DELAY_BLOCKS: int = int(os.getenv("POST_PAYMENT_CHECK_DELAY_BLOCKS", "0"))
 # ╰────────────────────────────────────────────────────────────────────╯
 
 
-# ╭──────────────────── PENALTIES & SETTLEMENT DELAYS ─────────────────╮
-# Extra delay after payment window before settlement (blocks).
-# With a full-epoch payment window (e+1), you can keep this at 0.
-POST_PAYMENT_CHECK_DELAY_BLOCKS: int = int(os.getenv("POST_PAYMENT_CHECK_DELAY_BLOCKS", "0"))
-
-# Haircut on partially‑paid contributions (bps), e.g. 4000 = −40%
-PARTIAL_PAYMENT_PENALTY_BPS: int = int(os.getenv("PARTIAL_PAYMENT_PENALTY_BPS", "0"))
-
+# ╭──────────────────── PENALTIES & JAIL ──────────────────────────────╮
 # Epoch‑based jail durations applied to the *coldkey* (not uid)
 #   – If some lines covered but not all → PARTIAL jail
 #   – If nothing paid (0 RAO)           → NO_PAY jail
 JAIL_EPOCHS_PARTIAL: int = int(os.getenv("JAIL_EPOCHS_PARTIAL", "2"))
 JAIL_EPOCHS_NO_PAY: int = int(os.getenv("JAIL_EPOCHS_NO_PAY", "8"))
+# (Removed PARTIAL_PAYMENT_PENALTY_BPS — both partial and zero are penalized equivalently.)
 # ╰────────────────────────────────────────────────────────────────────╯
 
 

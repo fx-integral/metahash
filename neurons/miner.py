@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# neurons/miner.py — Event-driven multi-line bidder (v2, no local dendrite bidding)
+# neurons/miner.py — Event-driven bidder v2.2 (early-win aware, pays only in epoch e+1 window)
 
 import asyncio
 import hashlib
@@ -30,15 +30,18 @@ class BidLine:
 @dataclass
 class WinInvoice:
     # identity
-    invoice_id: str = ""                      # <- derived, filled automatically for new items
+    invoice_id: str = ""                      # <- derived
     validator_key: str = ""                   # hotkey if known else "uid:<n>"
     treasury_coldkey: str = ""
     # bid / allocation
     subnet_id: int = 0
     alpha: float = 0.0
     discount_bps: int = 0
-    # chain settlement
-    deadline_block: int = 0
+    # payment window (epoch e+1)
+    pay_window_start_block: int = 0
+    pay_window_end_block: int = 0
+    pay_epoch_index: int = 0
+    # amount to pay (post-discount)
     amount_rao: int = 0
     # context
     epoch_seen: int = 0
@@ -50,8 +53,6 @@ class WinInvoice:
 
 
 class Miner(BaseMinerNeuron):
-    LATE_GRACE_BLOCKS = 0  # do not pay past deadline (validators won’t count it)
-
     def __init__(self, config=None):
         super().__init__(config=config)
 
@@ -97,10 +98,10 @@ class Miner(BaseMinerNeuron):
         subnet_id: int,
         alpha: float,
         discount_bps: int,
-        deadline_block: int,
+        pay_epoch: int,
         amount_rao: int,
     ) -> str:
-        payload = f"{validator_key}|{epoch}|{subnet_id}|{alpha:.12f}|{discount_bps}|{deadline_block}|{amount_rao}"
+        payload = f"{validator_key}|{epoch}|{subnet_id}|{alpha:.12f}|{discount_bps}|{pay_epoch}|{amount_rao}"
         return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
 
     def _make_bid_id(self, validator_key: str, epoch: int, subnet_id: int, alpha: float, discount_bps: int) -> str:
@@ -110,8 +111,7 @@ class Miner(BaseMinerNeuron):
     def _load_state_file(self):
         """
         Robust loader:
-        - tolerates extra legacy keys (e.g., 'validator_hotkey')
-        - maps 'validator_hotkey' -> 'validator_key' when present
+        - tolerates extra legacy keys (safely ignored)
         - backfills missing 'invoice_id'
         """
         if not self._state_file.exists():
@@ -123,23 +123,14 @@ class Miner(BaseMinerNeuron):
             return
 
         self._treasuries = dict(data.get("treasuries", {}))
-
-        self._already_bid = {
-            k: [tuple(x) for x in v] for k, v in data.get("already_bid", {}).items()
-        }
+        self._already_bid = {k: [tuple(x) for x in v] for k, v in data.get("already_bid", {}).items()}
 
         self._wins = []
         for w in data.get("wins", []):
             try:
-                # Map legacy field names
-                if "validator_key" not in w and "validator_hotkey" in w:
-                    w["validator_key"] = w.pop("validator_hotkey", "")
-
-                # Keep only fields known to WinInvoice
                 allowed = set(WinInvoice.__dataclass_fields__.keys())
                 clean = {k: v for k, v in w.items() if k in allowed}
 
-                # Backfill invoice_id if missing
                 if not clean.get("invoice_id"):
                     inv_id = self._make_invoice_id(
                         clean.get("validator_key", ""),
@@ -147,7 +138,7 @@ class Miner(BaseMinerNeuron):
                         int(clean.get("subnet_id", 0) or 0),
                         float(clean.get("alpha", 0.0) or 0.0),
                         int(clean.get("discount_bps", 0) or 0),
-                        int(clean.get("deadline_block", 0) or 0),
+                        int(clean.get("pay_epoch_index", 0) or 0),
                         int(clean.get("amount_rao", 0) or 0),
                     )
                     clean["invoice_id"] = inv_id
@@ -214,12 +205,8 @@ class Miner(BaseMinerNeuron):
             pretty.table("Configured Bid Lines", ["#", "Subnet", "Alpha", "Discount"], rows)
 
     def _status_tables(self):
-        now_blk = int(getattr(self, "block", 0))
         pend = [w for w in self._wins if not w.paid]
         done = [w for w in self._wins if w.paid]
-
-        def left_blocks(deadline: int) -> int:
-            return max(0, int(deadline) - now_blk)
 
         rows_pend = [[
             (w.validator_key[:8] + "…"),
@@ -227,13 +214,14 @@ class Miner(BaseMinerNeuron):
             w.subnet_id,
             f"{w.alpha:.4f} α",
             f"{w.discount_bps} bps",
-            w.deadline_block,
-            left_blocks(w.deadline_block),
+            w.pay_epoch_index,
+            w.pay_window_start_block,
+            (w.pay_window_end_block if w.pay_window_end_block else 0),
             f"{w.amount_rao/PLANCK:.4f} α",
             w.pay_attempts,
             (w.invoice_id[:8] + "…"),
             (w.last_response or "")[:24] + ("…" if len(w.last_response or "") > 24 else "")
-        ] for w in sorted(pend, key=lambda x: (x.deadline_block, x.validator_key))[:LOG_TOP_N]]
+        ] for w in sorted(pend, key=lambda x: (x.pay_epoch_index, x.pay_window_start_block, x.validator_key))[:LOG_TOP_N]]
 
         rows_done = [[
             (w.validator_key[:8] + "…"),
@@ -241,8 +229,9 @@ class Miner(BaseMinerNeuron):
             w.subnet_id,
             f"{w.alpha:.4f} α",
             f"{w.discount_bps} bps",
-            w.deadline_block,
-            left_blocks(w.deadline_block),
+            w.pay_epoch_index,
+            w.pay_window_start_block,
+            (w.pay_window_end_block if w.pay_window_end_block else 0),
             f"{w.amount_rao/PLANCK:.4f} α",
             w.pay_attempts,
             (w.invoice_id[:8] + "…"),
@@ -252,13 +241,13 @@ class Miner(BaseMinerNeuron):
         if rows_pend:
             pretty.table(
                 "Pending Wins (to pay)",
-                ["Validator", "E", "Subnet", "Alpha", "Disc", "Deadline", "Left", "Amount", "Attempts", "InvID", "LastResp"],
+                ["Validator", "E_seen", "Subnet", "Alpha", "Disc", "PayE", "WinStart", "WinEnd", "Amount", "Attempts", "InvID", "LastResp"],
                 rows_pend,
             )
         if rows_done:
             pretty.table(
                 "Paid Wins (recent)",
-                ["Validator", "E", "Subnet", "Alpha", "Disc", "Deadline", "Left", "Amount", "Attempts", "InvID", "LastResp"],
+                ["Validator", "E_seen", "Subnet", "Alpha", "Disc", "PayE", "WinStart", "WinEnd", "Amount", "Attempts", "InvID", "LastResp"],
                 rows_done,
             )
 
@@ -317,7 +306,7 @@ class Miner(BaseMinerNeuron):
             style="bold cyan",
         )
 
-        # (1) Retry unpaid invoices (all validators)
+        # (1) Retry unpaid invoices (all validators) — will attempt only if in the right epoch/window
         pre_unpaid = len([w for w in self._wins if not w.paid])
         await self._retry_unpaid_invoices()
 
@@ -352,7 +341,7 @@ class Miner(BaseMinerNeuron):
                 "subnet_id": int(ln.subnet_id),
                 "alpha": float(ln.alpha),
                 "discount_bps": int(ln.discount_bps),
-                # Optional, for traceability; allowed by protocol type (str)
+                # Optional, for traceability
                 "bid_id": bid_id,
             })
             self._remember_bid(vkey, epoch, ln.subnet_id, ln.alpha, ln.discount_bps)
@@ -392,20 +381,26 @@ class Miner(BaseMinerNeuron):
         amount_rao = int(round(pay_alpha * PLANCK))
         epoch_now = int(getattr(self, "epoch_index", 0))
 
+        pay_start = int(getattr(synapse, "pay_window_start_block", 0) or 0)
+        pay_end = int(getattr(synapse, "pay_window_end_block", 0) or 0)
+        pay_ep = int(getattr(synapse, "pay_epoch_index", 0) or 0)
+
         inv = WinInvoice(
             validator_key=vkey,
             treasury_coldkey=treasury_ck,
             subnet_id=int(synapse.subnet_id),
             alpha=float(synapse.alpha),
             discount_bps=int(synapse.clearing_discount_bps),
-            deadline_block=int(synapse.pay_deadline_block),
+            pay_window_start_block=pay_start,
+            pay_window_end_block=pay_end,
+            pay_epoch_index=pay_ep,
             amount_rao=amount_rao,
             epoch_seen=epoch_now,
         )
 
         # derive invoice_id
         inv.invoice_id = self._make_invoice_id(
-            vkey, epoch_now, inv.subnet_id, inv.alpha, inv.discount_bps, inv.deadline_block, inv.amount_rao
+            vkey, epoch_now, inv.subnet_id, inv.alpha, inv.discount_bps, inv.pay_epoch_index, inv.amount_rao
         )
 
         # idempotent merge
@@ -415,9 +410,12 @@ class Miner(BaseMinerNeuron):
                 and w.subnet_id == inv.subnet_id
                 and w.alpha == inv.alpha
                 and w.discount_bps == inv.discount_bps
-                and w.deadline_block == inv.deadline_block
+                and w.pay_epoch_index == inv.pay_epoch_index
                 and w.amount_rao == inv.amount_rao
             ):
+                # update window end if we had a placeholder earlier
+                if inv.pay_window_end_block and not w.pay_window_end_block:
+                    w.pay_window_end_block = inv.pay_window_end_block
                 inv = w
                 break
         else:
@@ -433,18 +431,20 @@ class Miner(BaseMinerNeuron):
                 ("subnet", inv.subnet_id),
                 ("alpha_won", f"{inv.alpha:.4f} α"),
                 ("discount", f"{inv.discount_bps} bps"),
-                ("deadline", inv.deadline_block),
+                ("pay_epoch", inv.pay_epoch_index or (epoch_now + 1)),
+                ("window", f"[{inv.pay_window_start_block}, {inv.pay_window_end_block or '?'}]"),
                 ("amount_to_pay", f"{inv.amount_rao/PLANCK:.4f} α"),
                 ("invoice_id", inv.invoice_id),
             ],
             style="bold green",
         )
 
+        # Attempt payment ONLY if in the correct epoch and after window start
         await self._attempt_payment(inv)
         self._status_tables()
 
         synapse.ack = True
-        synapse.payment_attempted = True
+        synapse.payment_attempted = inv.pay_attempts > 0
         synapse.payment_ok = inv.paid
         synapse.attempts = inv.pay_attempts
         synapse.last_response = inv.last_response[:300] if inv.last_response else ""
@@ -460,8 +460,19 @@ class Miner(BaseMinerNeuron):
             return
 
         blk = int(getattr(self, "block", 0))
-        if blk > inv.deadline_block + self.LATE_GRACE_BLOCKS:
-            pretty.log(f"[yellow]Skipping late payment (block {blk} > deadline {inv.deadline_block}+{self.LATE_GRACE_BLOCKS}).[/yellow]")
+        cur_epoch = int(getattr(self, "epoch_index", 0))
+
+        # Respect the explicit payment epoch and window (epoch e+1)
+        if inv.pay_epoch_index and cur_epoch != inv.pay_epoch_index:
+            inv.last_response = f"wrong epoch (now {cur_epoch}, need {inv.pay_epoch_index})"
+            return
+
+        if inv.pay_window_start_block and blk < inv.pay_window_start_block:
+            inv.last_response = f"not yet in window (blk {blk} < start {inv.pay_window_start_block})"
+            return
+
+        if inv.pay_window_end_block and blk > inv.pay_window_end_block:
+            inv.last_response = f"window over (blk {blk} > end {inv.pay_window_end_block})"
             return
 
         async with self._pay_lock:
@@ -490,12 +501,12 @@ class Miner(BaseMinerNeuron):
             pretty.log(
                 f"[green]Payment OK[/green] "
                 f"{inv.amount_rao/PLANCK:.4f} α → {inv.treasury_coldkey[:8]}… "
-                f"(epoch={inv.epoch_seen}, inv={inv.invoice_id})"
+                f"(seen_e={inv.epoch_seen}, pay_e={inv.pay_epoch_index}, inv={inv.invoice_id})"
             )
         else:
             pretty.log(
                 f"[red]Payment FAILED[/red] resp={resp} "
-                f"(epoch={inv.epoch_seen}, inv={inv.invoice_id})"
+                f"(seen_e={inv.epoch_seen}, pay_e={inv.pay_epoch_index}, inv={inv.invoice_id})"
             )
 
         self._save_state_file()

@@ -1,21 +1,25 @@
 # ╭────────────────────────────────────────────────────────────────────────╮
-# metahash/validator/rewards.py 
+# metahash/validator/rewards.py
 # ╰────────────────────────────────────────────────────────────────────────╯
 
-
 from __future__ import annotations
+
 import asyncio
 import time
+from collections import defaultdict
 from dataclasses import dataclass
 from decimal import Decimal, getcontext
 from typing import (
+    Any,
     Callable,
     Dict,
     Iterable,
     List,
+    Mapping,
     Optional,
     Protocol,
     Sequence,
+    Set,
     Tuple,
     runtime_checkable,
 )
@@ -25,17 +29,17 @@ from metahash.config import (
     K_SLIP,
     SLIP_TOLERANCE,
     FORBIDDEN_ALPHA_SUBNETS,
+    AUCTION_BUDGET_ALPHA,
+    PLANCK,
 )
 
-# ↓ NEW – use the single authoritative definition
+# ↓ single authoritative event model
 from metahash.validator.alpha_transfers import TransferEvent
 
 # ───────────────────────────── GLOBAL CONSTANTS ───────────────────────── #
 
 getcontext().prec = 60                          # 60‑digit arithmetic precision
-
-PLANCK: int = 10**9
-DECIMALS: Decimal = Decimal(10) ** 9
+DECIMALS: Decimal = Decimal(10) ** 9            # planck scaling (1 α = 10^9 planck)
 
 # Keep monetary constants in Decimal space
 K_SLIP_D: Decimal = Decimal(str(K_SLIP))
@@ -356,3 +360,283 @@ async def compute_epoch_rewards(
     bt.logging.debug(f"[rewards] rewards_list_float: {rewards_list_float}")
 
     return rewards_list_float
+
+
+# ╭──────────────────────────── Allocation Utils ──────────────────────────╯
+
+@dataclass(slots=True, frozen=True)
+class BidInput:
+    """
+    Minimal, serializable bid shape used by allocation helpers.
+    """
+    miner_uid: int
+    coldkey: str
+    subnet_id: int
+    alpha: float                # α requested for this line
+    discount_bps: int           # valuation discount in bps
+    weight_bps: int             # subnet weight in bps (0..10_000)
+    idx: int = 0                # stable, per-miner ordering
+
+
+@dataclass(slots=True)
+class WinAllocation:
+    """
+    A winning allocation after capping and budget constraints are applied.
+    """
+    miner_uid: int
+    coldkey: str
+    subnet_id: int
+    alpha_accepted: float       # α actually accepted (may be truncated)
+    discount_bps: int
+    weight_bps: int
+
+
+def budget_from_share(*, share: float, auction_budget_alpha: float = AUCTION_BUDGET_ALPHA) -> float:
+    """
+    Compute this validator's α budget from its share among master validators.
+    """
+    if share <= 0:
+        return 0.0
+    return auction_budget_alpha * float(share)
+
+
+def compute_budget_share(
+    *,
+    my_stake: float,
+    total_master_stake: float,
+    auction_budget_alpha: float = AUCTION_BUDGET_ALPHA,
+) -> tuple[float, float]:
+    """
+    Return (share, budget_α) given my stake and the total active masters' stake.
+    """
+    if my_stake <= 0 or total_master_stake <= 0:
+        return 0.0, 0.0
+    share = float(my_stake) / float(total_master_stake)
+    return share, budget_from_share(share=share, auction_budget_alpha=auction_budget_alpha)
+
+
+def calc_required_rao(alpha: float, discount_bps: int, *, planck: int = PLANCK) -> int:
+    """
+    Given α and discount, compute the RAO required to cover the line.
+    """
+    disc = max(0, min(10_000, int(discount_bps)))
+    eff_alpha = float(alpha) * (1.0 - disc / 10_000.0)
+    return int(round(eff_alpha * planck))
+
+
+def caps_by_reputation_for_bids(
+    bids: Iterable[BidInput],
+    *,
+    my_budget_alpha: float,
+    reputation: Mapping[str, float],
+    baseline_cap_frac: float,
+    max_cap_frac: float,
+) -> dict[str, float]:
+    """
+    Per-coldkey α caps derived from reputation for exactly the coldkeys present in `bids`.
+    """
+    caps: dict[str, float] = {}
+    bcf = float(baseline_cap_frac)
+    mcf = float(max_cap_frac)
+    for b in bids:
+        R = float(reputation.get(b.coldkey, 0.0))
+        R = max(0.0, min(1.0, R))
+        cap_frac = bcf + R * (mcf - bcf)
+        cap_frac = max(bcf, min(mcf, cap_frac))
+        caps[b.coldkey] = my_budget_alpha * cap_frac
+    return caps
+
+
+def _bid_order_key(b: BidInput) -> tuple:
+    """
+    Deterministic order:
+      1) higher subnet weight,
+      2) higher discount (cheaper),
+      3) larger α,
+      4) earlier index.
+    """
+    return (-b.weight_bps, -b.discount_bps, -float(b.alpha), int(b.idx))
+
+
+def allocate_bids(
+    bids: Iterable[BidInput],
+    *,
+    my_budget_alpha: float,
+    cap_alpha_by_ck: Mapping[str, float] | None = None,
+) -> tuple[List[WinAllocation], float]:
+    """
+    Greedy, deterministic allocation under (global budget + per‑CK caps).
+    """
+    ordered = sorted(bids, key=_bid_order_key)
+    caps = dict(cap_alpha_by_ck or {})
+    allocated: dict[str, float] = defaultdict(float)
+    budget = float(my_budget_alpha)
+
+    wins: List[WinAllocation] = []
+    for b in ordered:
+        if budget <= 0:
+            break
+        cap_rem = float(caps.get(b.coldkey, my_budget_alpha)) - allocated[b.coldkey]
+        take = min(float(b.alpha), budget, max(0.0, cap_rem))
+        if take <= 0:
+            continue
+        wins.append(
+            WinAllocation(
+                miner_uid=b.miner_uid,
+                coldkey=b.coldkey,
+                subnet_id=b.subnet_id,
+                alpha_accepted=take,
+                discount_bps=b.discount_bps,
+                weight_bps=b.weight_bps,
+            )
+        )
+        budget -= take
+        allocated[b.coldkey] += take
+
+    return wins, budget
+
+
+def build_pending_commitment(
+    wins: Iterable[WinAllocation],
+    *,
+    epoch_cleared: int,
+    treasury_coldkey: str,
+    stake_snapshot_block: int,
+    planck: int = PLANCK,
+) -> dict[str, Any]:
+    """
+    Produce the exact pending commitment payload used later when publishing.
+    """
+    inv: dict[str, dict[str, Any]] = {}
+    for w in wins:
+        uid_key = str(int(w.miner_uid))
+        if uid_key not in inv:
+            inv[uid_key] = {"ck": w.coldkey, "ln": []}
+        req_rao = calc_required_rao(w.alpha_accepted, w.discount_bps, planck=planck)
+        inv[uid_key]["ln"].append(
+            [
+                int(w.subnet_id),
+                int(w.discount_bps),
+                int(w.weight_bps),
+                int(req_rao),
+            ]
+        )
+    return {
+        "e": int(epoch_cleared),
+        "t": str(treasury_coldkey),
+        "inv": inv,
+        "st_blk": int(stake_snapshot_block),
+        # ("pe", "as", "de") are attached at publish time by validator.
+    }
+
+
+# ───────── settlement: commitments + payments → per‑UID value/burn/offenders ────── #
+
+def _line_fill_order_key(ln_tuple: tuple[int, int, int, int, int]) -> tuple[float, int, int]:
+    """
+    Sorting key for commitment invoice lines within a subnet:
+      - higher weight first,
+      - higher discount next,
+      - larger required RAO next,
+      - earlier index last.
+    """
+    sid, disc_bps, w_bps, req_rao_paid, idx = ln_tuple
+    score = (w_bps / 10_000.0) * (1.0 + disc_bps / 10_000.0)
+    return (score, req_rao_paid, -idx)
+
+
+def evaluate_commitment_snapshots(
+    *,
+    snapshots: Sequence[dict],
+    rao_by_uid_dest_subnet: Mapping[tuple[int, str, int], int],
+    tao_by_uid_dest_subnet: Mapping[tuple[int, str, int], float],
+    price_cache: Mapping[int, float],
+    planck: int = PLANCK,
+) -> tuple[
+    dict[int, float],       # scores_by_uid
+    float,                  # burn_total_value
+    Set[str],               # offenders_nopay
+    Set[str],               # offenders_partial
+    dict[str, float],       # paid_effective_by_ck
+]:
+    """
+    Core **reward calculation** used at settlement:
+    takes the published commitment snapshots and the actually‑paid transfers
+    → returns per‑UID TAO value, burn amount, and offender sets.
+    """
+    scores_by_uid: Dict[int, float] = defaultdict(float)
+    burn_total_value: float = 0.0
+    offenders_nopay: Set[str] = set()
+    offenders_partial: Set[str] = set()
+    paid_effective_by_ck: Dict[str, float] = defaultdict(float)
+
+    for s in snapshots:
+        tre = s.get("t", "")
+        inv = s.get("inv", {})
+        for uid_s, inv_d in inv.items():
+            try:
+                uid = int(uid_s)
+            except Exception:
+                continue
+
+            ck = inv_d.get("ck")
+            by_subnet: Dict[int, List[tuple[int, int, int, int, int]]] = defaultdict(list)
+            for idx_line, ln in enumerate(inv_d.get("ln", [])):
+                if not (isinstance(ln, list) and len(ln) >= 4):
+                    continue
+                sid, disc_bps, w_bps, req_rao_paid = int(ln[0]), int(ln[1]), int(ln[2]), int(ln[3])
+                by_subnet[sid].append((sid, disc_bps, w_bps, req_rao_paid, idx_line))
+
+            coldkey_any_paid = False
+            coldkey_uncovered_exists = False
+
+            for sid, lines in by_subnet.items():
+                paid_rao_total = int(rao_by_uid_dest_subnet.get((uid, tre, sid), 0))
+                tao_total = float(tao_by_uid_dest_subnet.get((uid, tre, sid), 0.0))
+
+                lines.sort(key=_line_fill_order_key, reverse=True)
+                remain = paid_rao_total
+                covered: List[tuple[int, int, int, int, int]] = []
+                uncovered: List[tuple[int, int, int, int, int]] = []
+
+                for ln_t in lines:
+                    _, _, _, req_rao_paid, _ = ln_t
+                    if remain >= req_rao_paid:
+                        covered.append(ln_t)
+                        remain -= req_rao_paid
+                        coldkey_any_paid = True
+                    else:
+                        uncovered.append(ln_t)
+                        if req_rao_paid > 0:
+                            coldkey_uncovered_exists = True
+
+                if paid_rao_total > 0 and tao_total > 0 and covered:
+                    tao_per_rao = tao_total / float(paid_rao_total)
+                else:
+                    tao_per_rao = 0.0
+
+                # Covered lines → value credited = TAO_paid(line) × subnet_weight
+                for sid2, disc_bps, w_bps, req_rao_paid, _ in covered:
+                    line_tao = tao_per_rao * float(req_rao_paid) if tao_per_rao > 0 else 0.0
+                    eff = line_tao * (w_bps / 10_000.0)
+                    scores_by_uid[uid] += eff
+                    if ck:
+                        paid_effective_by_ck[ck] += eff
+
+                # Uncovered lines → full line value is burned (fallback to price cache if needed)
+                for sid2, disc_bps, w_bps, req_rao_paid, _ in uncovered:
+                    if tao_per_rao > 0:
+                        line_tao = tao_per_rao * float(req_rao_paid)
+                    else:
+                        price = float(price_cache.get(sid2, 0.0))
+                        line_tao = price * (float(req_rao_paid) / float(planck))
+                    eff_burn = line_tao * (w_bps / 10_000.0)
+                    burn_total_value += eff_burn
+
+            if ck:
+                if not coldkey_any_paid:
+                    offenders_nopay.add(ck)
+                elif coldkey_uncovered_exists:
+                    offenders_partial.add(ck)
+
+    return dict(scores_by_uid), float(burn_total_value), offenders_nopay, offenders_partial, dict(paid_effective_by_ck)
