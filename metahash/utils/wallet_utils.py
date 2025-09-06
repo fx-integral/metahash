@@ -2,17 +2,18 @@
 # metahash/utils/wallet_utils.py                                         #
 # ====================================================================== #
 
-
 from __future__ import annotations
 
+import asyncio
+import os
 import sys
 from typing import Sequence, Union
 
+import bittensor as bt
 from bittensor import AsyncSubtensor
 from substrateinterface import Keypair, KeypairType
+
 from metahash.base.utils.logging import ColoredLogger as clog
-import bittensor as bt
-import os
 
 
 def verify_coldkey(
@@ -25,7 +26,7 @@ def verify_coldkey(
 
     sig = bytes.fromhex(signature_hex)
 
-    # SR25519 primero, ED25519 como respaldo
+    # Try SR25519 first, ED25519 as fallback
     for crypto in (KeypairType.SR25519, KeypairType.ED25519):
         try:
             kp = Keypair(ss58_address=cold_ss58, crypto_type=crypto)
@@ -42,25 +43,23 @@ def check_coldkeys_and_signatures(
     message: Union[str, bytes] | None = None,
 ) -> list[dict]:
     """
-    Comprueba que cada firma sea válida.
+    Verifies each signature.
 
     Parameters
     ----------
     entries
-        Secuencia de dicts con ``address`` (cold‑key SS58) y ``signature`` (hex).
+        Sequence of dicts with ``address`` (cold-key SS58) and ``signature`` (hex).
     message
-        **Nuevo (opcional)**.  Si se pasa, *todas* las firmas se verifican contra
-        ese mensaje (p. ej. el hot‑key del miner).  
-        Si se deja en ``None`` se usa, como antes, la propia dirección del
-        cold‑key.
+        If provided, **all** signatures are verified against this message (e.g. miner hotkey).
+        If ``None``, the cold-key address itself is used as the signed message.
     """
     verified: list[dict] = []
 
-    # Normalizar el mensaje una sola vez
+    # Normalize message (if any) once
     if message is not None and isinstance(message, str):
         message_bytes = message.encode()
     else:
-        message_bytes = None  # se calculará por entrada
+        message_bytes = None  # computed per entry
 
     for idx, item in enumerate(entries, 1):
         addr = item.get("address") or item.get("coldkey")
@@ -80,7 +79,7 @@ def check_coldkeys_and_signatures(
 
         verified.append({"address": addr, "signature": sig_hex})
 
-    clog.success(f"✓ All {len(verified)} cold‑keys verified", color="green")
+    clog.success(f"✓ All {len(verified)} cold-keys verified", color="green")
     return verified
 
 
@@ -94,71 +93,94 @@ async def transfer_alpha(
     amount,
     wait_for_inclusion: bool = True,
     wait_for_finalization: bool = False,
-    period: int = 256,           # safer default on slow nodes
+    period: int = 512,           # safer default on slow nodes
+    max_retries: int = 3,        # retry on subscription loss
 ) -> bool:
-    # The bittensor SDK seems to have a wrong check only allowing transfrers of alpha staked to a hotkey owned by the coldkey. So random. 
-    # Lets use directly the extrinsics
+    """
+    Submit a SubtensorModule.transfer_stake extrinsic and (optionally) wait.
 
-    try:
-        bt.logging.info(
-            f"Transferring stake from coldkey [blue]{wallet.coldkeypub.ss58_address}[/blue] to coldkey "
-            f"[blue]{dest_coldkey_ss58}[/blue]\n"
-            f"Amount: [green]{amount}[/green] from netuid [yellow]{origin_and_dest_netuid}[/yellow] to netuid "
-            f"[yellow]{origin_and_dest_netuid}[/yellow]"
-        )
-        call = await subtensor.substrate.compose_call(
-            call_module="SubtensorModule",
-            call_function="transfer_stake",
-            call_params={
-                "destination_coldkey": dest_coldkey_ss58,
-                "hotkey": hotkey_ss58,
-                "origin_netuid": origin_and_dest_netuid,
-                "destination_netuid": origin_and_dest_netuid,
-                "alpha_amount": amount.rao,
-            },
-        )
+    We work around async-substrate subscription flakiness by catching the
+    KeyError raised when a subscription id vanishes (WS hiccup), reconnecting,
+    and retrying the submission up to `max_retries` times.
+    """
+    bt.logging.info(
+        f"Transferring stake from coldkey [blue]{wallet.coldkeypub.ss58_address}[/blue] to coldkey "
+        f"[blue]{dest_coldkey_ss58}[/blue]\n"
+        f"Amount: [green]{amount}[/green] from netuid [yellow]{origin_and_dest_netuid}[/yellow] to netuid "
+        f"[yellow]{origin_and_dest_netuid}[/yellow]"
+    )
 
-        success, err_msg = await subtensor.sign_and_send_extrinsic(
-            call=call,
-            wallet=wallet,
-            wait_for_inclusion=wait_for_inclusion,
-            wait_for_finalization=wait_for_finalization,
-            period=period,
-        )
+    # Compose call once; it’s fine to reuse across retries
+    call = await subtensor.substrate.compose_call(
+        call_module="SubtensorModule",
+        call_function="transfer_stake",
+        call_params={
+            "destination_coldkey": dest_coldkey_ss58,  # AccountId
+            "hotkey": hotkey_ss58,                     # AccountId
+            "origin_netuid": origin_and_dest_netuid,   # u16
+            "destination_netuid": origin_and_dest_netuid,
+            "alpha_amount": amount.rao,                # u64
+        },
+    )
 
-        if success:
-            if not wait_for_finalization and not wait_for_inclusion:
+    for attempt in range(1, max_retries + 1):
+        try:
+            success, err_msg = await subtensor.sign_and_send_extrinsic(
+                call=call,
+                wallet=wallet,
+                wait_for_inclusion=wait_for_inclusion,
+                wait_for_finalization=wait_for_finalization,
+                period=period,
+            )
+            if success:
+                if wait_for_inclusion or wait_for_finalization:
+                    bt.logging.success(":white_heavy_check_mark: [green]Included[/green]")
                 return True
+            else:
+                bt.logging.error(f":cross_mark: [red]Failed[/red]: {err_msg}")
+                return False
 
-            bt.logging.success(":white_heavy_check_mark: [green]Finalized[/green]")
+        except KeyError as e:
+            # Lost subscription id (WS hiccup). Reconnect + retry.
+            bt.logging.warning(
+                f"Subscription lost (attempt {attempt}/{max_retries}): {e}. Reconnecting…"
+            )
+            try:
+                await subtensor.substrate.close()
+            except Exception:
+                pass
+            await asyncio.sleep(0.8)
+            await subtensor.initialize()
+            continue
 
-            return True
-        else:
-            bt.logging.error(f":cross_mark: [red]Failed[/red]: {err_msg}")
-            return False
+        except Exception as e:
+            bt.logging.error(f":cross_mark: [red]Failed[/red]: {str(e)}")
+            raise
 
-    except Exception as e:
-        bt.logging.error(f":cross_mark: [red]Failed[/red]: {str(e)}")
-        raise e
-        return False
+    bt.logging.error(":cross_mark: [red]Failed[/red]: subscription retries exhausted")
+    return False
 
 
-def load_wallet(coldkey_name: str, hotkey_name: str, unlock:bool = True) -> bt.wallet:
+def load_wallet(coldkey_name: str, hotkey_name: str, unlock: bool = True):
+    """
+    Convenience loader used by other scripts.
+    """
     bt.logging.debug(f"Loading wallet coldkey: {coldkey_name} hotkey: {hotkey_name}")
     w = bt.wallet(name=coldkey_name, hotkey=hotkey_name)
 
     if unlock:
         pwd = os.getenv("WALLET_PASSWORD")
-
         if not pwd:
-            bt.logging.error("WALLET_PASSWORD not set in .env")
+            bt.logging.error("WALLET_PASSWORD not set in .env or env")
             return None
         try:
             w.coldkey_file.save_password_to_env(pwd)
             w.unlock_coldkey()
         except Exception as e:  # noqa: BLE001
             bt.logging.error(f"cannot unlock cold-key: {e}")
-            raise Exception("Unable to unlock wallet with: coldkey name: cold, hotkey name: {hot}")
+            raise Exception(
+                "Unable to unlock wallet with: coldkey name: {cold}, hotkey name: {hot}"
+            )
 
         bt.logging.debug(f"Wallet unlocked {w.coldkey.ss58_address} {w.hotkey.ss58_address}")
 

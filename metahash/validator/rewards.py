@@ -373,7 +373,7 @@ class BidInput:
     coldkey: str
     subnet_id: int
     alpha: float                # α requested for this line
-    discount_bps: int           # valuation discount in bps
+    discount_bps: int           # valuation discount in bps (affects ordering/valuation only)
     weight_bps: int             # subnet weight in bps (0..10_000)
     idx: int = 0                # stable, per-miner ordering
 
@@ -386,6 +386,7 @@ class WinAllocation:
     miner_uid: int
     coldkey: str
     subnet_id: int
+    alpha_requested: float      # requested α
     alpha_accepted: float       # α actually accepted (may be truncated)
     discount_bps: int
     weight_bps: int
@@ -417,11 +418,11 @@ def compute_budget_share(
 
 def calc_required_rao(alpha: float, discount_bps: int, *, planck: int = PLANCK) -> int:
     """
-    Given α and discount, compute the RAO required to cover the line.
+    Amount a miner must pay for an accepted line **(discount does NOT reduce payment)**.
+    Discount only reduces **valuation** for selection/ordering.
     """
-    disc = max(0, min(10_000, int(discount_bps)))
-    eff_alpha = float(alpha) * (1.0 - disc / 10_000.0)
-    return int(round(eff_alpha * planck))
+    _ = discount_bps  # ignored by design
+    return int(round(float(alpha) * float(planck)))
 
 
 def caps_by_reputation_for_bids(
@@ -449,13 +450,15 @@ def caps_by_reputation_for_bids(
 
 def _bid_order_key(b: BidInput) -> tuple:
     """
-    Deterministic order:
-      1) higher subnet weight,
-      2) higher discount (cheaper),
-      3) larger α,
-      4) earlier index.
+    Deterministic order by **per‑unit value**:
+      per_unit_value = weight × (1 − discount)
+
+      1) higher per‑unit value first,
+      2) larger α (to reduce fragmentation),
+      3) earlier index.
     """
-    return (-b.weight_bps, -b.discount_bps, -float(b.alpha), int(b.idx))
+    per_unit_value = (b.weight_bps / 10_000.0) * (1.0 - b.discount_bps / 10_000.0)
+    return (-per_unit_value, -float(b.alpha), int(b.idx))
 
 
 def allocate_bids(
@@ -463,37 +466,108 @@ def allocate_bids(
     *,
     my_budget_alpha: float,
     cap_alpha_by_ck: Mapping[str, float] | None = None,
-) -> tuple[List[WinAllocation], float]:
+) -> tuple[List[WinAllocation], float, dict]:
     """
-    Greedy, deterministic allocation under (global budget + per‑CK caps).
+    Greedy, deterministic allocation that:
+      • First pass respects per‑CK caps (reputation).
+      • If caps leave budget unused, a **second pass** ignores caps so the
+        budget is fully utilized (prevents low‑rep miners from being starved
+        when there’s no competition or equal reputations).
+
+    Returns
+    -------
+    wins, budget_left, debug
     """
     ordered = sorted(bids, key=_bid_order_key)
-    caps = dict(cap_alpha_by_ck or {})
-    allocated: dict[str, float] = defaultdict(float)
+
+    # Build debug structure
+    def _pua(b: BidInput) -> float:
+        return (b.weight_bps / 10_000.0) * (1.0 - b.discount_bps / 10_000.0)
+
+    debug: dict = {
+        "ordered": [
+            {
+                "miner_uid": b.miner_uid, "coldkey": b.coldkey, "subnet_id": b.subnet_id,
+                "alpha": float(b.alpha), "discount_bps": int(b.discount_bps),
+                "weight_bps": int(b.weight_bps), "idx": int(b.idx),
+                "per_unit_value": _pua(b),
+            } for b in ordered
+        ],
+        "caps": dict(cap_alpha_by_ck or {}),
+        "budget_initial": float(my_budget_alpha),
+        "pass1_takes": [],
+        "pass2_takes": [],
+    }
+
+    # Internal aggregation so a single bid can be partially filled across passes
+    def _bid_key(b: BidInput) -> tuple:
+        return (b.miner_uid, b.coldkey, b.subnet_id, b.discount_bps, b.weight_bps, b.idx)
+
+    allocated_by_ck: dict[str, float] = defaultdict(float)
+    taken_by_bid: dict[tuple, float] = defaultdict(float)
+    alloc_by_key: dict[tuple, WinAllocation] = {}
+
+    def _take_from_bids(pass_caps: Mapping[str, float] | None, budget: float, pass_name: str) -> float:
+        for b in ordered:
+            if budget <= 0:
+                break
+            key = _bid_key(b)
+            remaining = float(b.alpha) - taken_by_bid.get(key, 0.0)
+            if remaining <= 0:
+                continue
+
+            cap_rem = float("inf")
+            cap_before = None
+            cap_after = None
+            if pass_caps is not None:
+                cap = float(pass_caps.get(b.coldkey, my_budget_alpha))
+                cap_before = max(0.0, cap - allocated_by_ck[b.coldkey])
+                cap_rem = max(0.0, cap_before)
+
+            take = min(remaining, budget, cap_rem)
+            if take <= 0:
+                continue
+
+            if key in alloc_by_key:
+                wa = alloc_by_key[key]
+                wa.alpha_accepted += take
+            else:
+                alloc_by_key[key] = WinAllocation(
+                    miner_uid=b.miner_uid,
+                    coldkey=b.coldkey,
+                    subnet_id=b.subnet_id,
+                    alpha_requested=b.alpha,
+                    alpha_accepted=take,
+                    discount_bps=b.discount_bps,
+                    weight_bps=b.weight_bps,
+                )
+
+            budget -= take
+            taken_by_bid[key] = taken_by_bid.get(key, 0.0) + take
+            allocated_by_ck[b.coldkey] += take
+            if pass_caps is not None:
+                cap_after = max(0.0, float(pass_caps.get(b.coldkey, my_budget_alpha)) - allocated_by_ck[b.coldkey])
+
+            debug[f"{pass_name}_takes"].append({
+                "miner_uid": b.miner_uid, "coldkey": b.coldkey, "subnet_id": b.subnet_id,
+                "alpha_req": float(b.alpha), "take": float(take),
+                "discount_bps": int(b.discount_bps), "weight_bps": int(b.weight_bps), "idx": int(b.idx),
+                "cap_before": cap_before, "cap_after": cap_after,
+            })
+        return budget
+
+    # Pass 1 — respect caps
     budget = float(my_budget_alpha)
+    budget = _take_from_bids(cap_alpha_by_ck or {}, budget, "pass1")
+    debug["budget_after_pass1"] = float(budget)
 
-    wins: List[WinAllocation] = []
-    for b in ordered:
-        if budget <= 0:
-            break
-        cap_rem = float(caps.get(b.coldkey, my_budget_alpha)) - allocated[b.coldkey]
-        take = min(float(b.alpha), budget, max(0.0, cap_rem))
-        if take <= 0:
-            continue
-        wins.append(
-            WinAllocation(
-                miner_uid=b.miner_uid,
-                coldkey=b.coldkey,
-                subnet_id=b.subnet_id,
-                alpha_accepted=take,
-                discount_bps=b.discount_bps,
-                weight_bps=b.weight_bps,
-            )
-        )
-        budget -= take
-        allocated[b.coldkey] += take
+    # Pass 2 — if any budget remains, ignore caps entirely
+    if budget > 0.0:
+        budget = _take_from_bids(None, budget, "pass2")
+    debug["budget_after_pass2"] = float(budget)
 
-    return wins, budget
+    wins: List[WinAllocation] = list(alloc_by_key.values())
+    return wins, budget, debug
 
 
 def build_pending_commitment(
@@ -506,6 +580,7 @@ def build_pending_commitment(
 ) -> dict[str, Any]:
     """
     Produce the exact pending commitment payload used later when publishing.
+    NOTE: required_rao is **full accepted α** (no discount).
     """
     inv: dict[str, dict[str, Any]] = {}
     for w in wins:
@@ -535,13 +610,14 @@ def build_pending_commitment(
 def _line_fill_order_key(ln_tuple: tuple[int, int, int, int, int]) -> tuple[float, int, int]:
     """
     Sorting key for commitment invoice lines within a subnet:
-      - higher weight first,
-      - higher discount next,
-      - larger required RAO next,
+      - **higher effective value first**: weight × (1 − discount),
+      - larger required RAO next (cover bigger full‑α lines),
       - earlier index last.
+
+    (Discount reduces valuation; it does not reduce payment.)
     """
     sid, disc_bps, w_bps, req_rao_paid, idx = ln_tuple
-    score = (w_bps / 10_000.0) * (1.0 + disc_bps / 10_000.0)
+    score = (w_bps / 10_000.0) * (1.0 - disc_bps / 10_000.0)
     return (score, req_rao_paid, -idx)
 
 

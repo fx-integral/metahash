@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-# neurons/miner.py — Event-driven bidder v2.2 (early-win aware, pays only in epoch e+1 window)
+# neurons/miner.py — Event-driven bidder v2.2+ (early-win aware, pays only in epoch e+1 window)
+# Adds explicit accepted size handling, validator identity in logs, and clearer colors.
 
 import asyncio
 import hashlib
@@ -35,13 +36,15 @@ class WinInvoice:
     treasury_coldkey: str = ""
     # bid / allocation
     subnet_id: int = 0
-    alpha: float = 0.0
+    alpha: float = 0.0                        # accepted α (what we'll pay against)
     discount_bps: int = 0
+    alpha_requested: float = 0.0              # what we originally asked
+    was_partial: bool = False                 # partial fill?
     # payment window (epoch e+1)
     pay_window_start_block: int = 0
     pay_window_end_block: int = 0
     pay_epoch_index: int = 0
-    # amount to pay (post-discount)
+    # amount to pay (post-discount NOTE: discount DOES NOT reduce payment)
     amount_rao: int = 0
     # context
     epoch_seen: int = 0
@@ -74,7 +77,7 @@ class Miner(BaseMinerNeuron):
 
         pretty.banner(
             "Miner started",
-            f"uid={self.uid} | hotkey={self.wallet.hotkey.ss58_address} | lines={len(self.lines)} | epoch={getattr(self, 'epoch_index', 0)}",
+            f"uid={self.uid} | hotkey={self.wallet.hotkey.ss58_address} | lines={len(self.lines)} | epoch(e)={getattr(self, 'epoch_index', 0)}",
             style="bold magenta",
         )
         self._log_cfg_summary()
@@ -142,6 +145,10 @@ class Miner(BaseMinerNeuron):
                         int(clean.get("amount_rao", 0) or 0),
                     )
                     clean["invoice_id"] = inv_id
+
+                # Defaults for new fields
+                clean.setdefault("alpha_requested", float(clean.get("alpha", 0.0) or 0.0))
+                clean.setdefault("was_partial", False)
 
                 self._wins.append(WinInvoice(**clean))
             except Exception as e:
@@ -213,6 +220,8 @@ class Miner(BaseMinerNeuron):
             w.epoch_seen,
             w.subnet_id,
             f"{w.alpha:.4f} α",
+            f"{w.alpha_requested:.4f} α",
+            "P" if w.was_partial else "F",
             f"{w.discount_bps} bps",
             w.pay_epoch_index,
             w.pay_window_start_block,
@@ -228,6 +237,8 @@ class Miner(BaseMinerNeuron):
             w.epoch_seen,
             w.subnet_id,
             f"{w.alpha:.4f} α",
+            f"{w.alpha_requested:.4f} α",
+            "P" if w.was_partial else "F",
             f"{w.discount_bps} bps",
             w.pay_epoch_index,
             w.pay_window_start_block,
@@ -241,25 +252,29 @@ class Miner(BaseMinerNeuron):
         if rows_pend:
             pretty.table(
                 "Pending Wins (to pay)",
-                ["Validator", "E_seen", "Subnet", "Alpha", "Disc", "PayE", "WinStart", "WinEnd", "Amount", "Attempts", "InvID", "LastResp"],
+                ["Validator", "E_seen", "Subnet", "Accepted", "Requested", "Fill", "Disc", "PayE", "WinStart", "WinEnd", "Amount", "Attempts", "InvID", "LastResp"],
                 rows_pend,
             )
         if rows_done:
             pretty.table(
                 "Paid Wins (recent)",
-                ["Validator", "E_seen", "Subnet", "Alpha", "Disc", "PayE", "WinStart", "WinEnd", "Amount", "Attempts", "InvID", "LastResp"],
+                ["Validator", "E_seen", "Subnet", "Accepted", "Requested", "Fill", "Disc", "PayE", "WinStart", "WinEnd", "Amount", "Attempts", "InvID", "LastResp"],
                 rows_done,
             )
 
     def _resolve_caller(self, synapse: Synapse) -> Tuple[Optional[int], str]:
-        """Return (uid, hotkey) for caller, best-effort."""
-        uid = None
-        try:
-            uid = int(getattr(getattr(synapse, "dendrite", None), "origin", None))
-        except Exception:
-            uid = None
-        hk = None
-        if uid is not None and 0 <= uid < len(self.metagraph.axons):
+        """Return (uid, hotkey) for caller, best-effort. Uses synapse identity if present."""
+        # Prefer identity fields carried in the synapse (when validator sets them)
+        uid = getattr(synapse, "validator_uid", None)
+        hk = getattr(synapse, "validator_hotkey", None)
+
+        # Fallback to origin→hotkey resolution
+        if uid is None:
+            try:
+                uid = int(getattr(getattr(synapse, "dendrite", None), "origin", None))
+            except Exception:
+                uid = None
+        if not hk and uid is not None and 0 <= uid < len(self.metagraph.axons):
             hk = getattr(self.metagraph.axons[uid], "hotkey", None)
         if not hk and hasattr(self.metagraph, "hotkeys") and uid is not None and uid < len(self.metagraph.hotkeys):
             hk = self.metagraph.hotkeys[uid]
@@ -296,12 +311,13 @@ class Miner(BaseMinerNeuron):
             pass
 
         pretty.kv_panel(
-            "AuctionStart received",
+            "[cyan]AuctionStart received[/cyan]",
             [
-                ("validator", caller_hot or vkey),
-                ("epoch", epoch),
+                ("validator", f"{caller_hot or vkey} (uid={uid if uid is not None else '?'})"),
+                ("epoch (e)", epoch),
                 ("budget α", f"{getattr(synapse, 'auction_budget_alpha', 0):.3f}"),
                 ("min_stake", f"{synapse.min_stake_alpha:.3f} α"),
+                ("timeline", f"bid now (e) → pay in (e+1={epoch+1}) → weights from e in (e+2={epoch+2})"),
             ],
             style="bold cyan",
         )
@@ -351,7 +367,7 @@ class Miner(BaseMinerNeuron):
         if sent == 0:
             pretty.log("[grey]No bids were added (all lines either invalid or already added).[/grey]")
         else:
-            pretty.table("Bids Sent", ["Subnet", "Alpha", "Discount", "BidID", "Epoch"], rows_sent)
+            pretty.table("[yellow]Bids Sent[/yellow]", ["Subnet", "Alpha", "Discount", "BidID", "Epoch"], rows_sent)
 
         self._save_state_file()
         self._status_tables()
@@ -377,8 +393,13 @@ class Miner(BaseMinerNeuron):
             synapse.last_response = "treasury unknown"
             return synapse
 
-        pay_alpha = float(synapse.alpha) * (1 - synapse.clearing_discount_bps / 10_000)
-        amount_rao = int(round(pay_alpha * PLANCK))
+        # Prefer explicit accepted_alpha if provided (new), fallback to alpha (compat)
+        accepted_alpha = float(getattr(synapse, "accepted_alpha", None) or synapse.alpha)
+        requested_alpha = float(getattr(synapse, "requested_alpha", None) or accepted_alpha)
+        was_partial = bool(getattr(synapse, "was_partially_accepted", accepted_alpha < requested_alpha - 1e-12))
+
+        # IMPORTANT: discount does NOT reduce payment.
+        amount_rao = int(round(accepted_alpha * PLANCK))
         epoch_now = int(getattr(self, "epoch_index", 0))
 
         pay_start = int(getattr(synapse, "pay_window_start_block", 0) or 0)
@@ -389,7 +410,9 @@ class Miner(BaseMinerNeuron):
             validator_key=vkey,
             treasury_coldkey=treasury_ck,
             subnet_id=int(synapse.subnet_id),
-            alpha=float(synapse.alpha),
+            alpha=float(accepted_alpha),
+            alpha_requested=float(requested_alpha),
+            was_partial=was_partial,
             discount_bps=int(synapse.clearing_discount_bps),
             pay_window_start_block=pay_start,
             pay_window_end_block=pay_end,
@@ -416,6 +439,9 @@ class Miner(BaseMinerNeuron):
                 # update window end if we had a placeholder earlier
                 if inv.pay_window_end_block and not w.pay_window_end_block:
                     w.pay_window_end_block = inv.pay_window_end_block
+                # ensure requested/partial fields persist
+                w.alpha_requested = inv.alpha_requested
+                w.was_partial = inv.was_partial
                 inv = w
                 break
         else:
@@ -424,14 +450,16 @@ class Miner(BaseMinerNeuron):
         self._save_state_file()
 
         pretty.kv_panel(
-            "Win received",
+            "[green]Win received[/green]",
             [
-                ("validator", caller_hot or vkey),
-                ("epoch_now", epoch_now),
+                ("validator", f"{caller_hot or vkey} (uid={uid if uid is not None else '?'})"),
+                ("epoch_now (e)", epoch_now),
                 ("subnet", inv.subnet_id),
-                ("alpha_won", f"{inv.alpha:.4f} α"),
+                ("accepted α", f"{inv.alpha:.4f}"),
+                ("requested α", f"{inv.alpha_requested:.4f}"),
+                ("partial", inv.was_partial),
                 ("discount", f"{inv.discount_bps} bps"),
-                ("pay_epoch", inv.pay_epoch_index or (epoch_now + 1)),
+                ("pay_epoch (e+1)", inv.pay_epoch_index or (epoch_now + 1)),
                 ("window", f"[{inv.pay_window_start_block}, {inv.pay_window_end_block or '?'}]"),
                 ("amount_to_pay", f"{inv.amount_rao/PLANCK:.4f} α"),
                 ("invoice_id", inv.invoice_id),
@@ -484,8 +512,10 @@ class Miner(BaseMinerNeuron):
                     origin_and_dest_netuid=inv.subnet_id,
                     dest_coldkey_ss58=inv.treasury_coldkey,
                     amount=bt.Balance.from_rao(inv.amount_rao),
-                    wait_for_inclusion=True,
+                    wait_for_inclusion=False,         # <- avoid subscription on miner path
                     wait_for_finalization=False,
+                    period=512,                       # <- longer window for slower nodes
+                    max_retries=3,                    # <- leverage wallet_utils retry
                 )
                 resp = "ok" if ok else "rejected"
             except Exception as exc:
@@ -501,12 +531,12 @@ class Miner(BaseMinerNeuron):
             pretty.log(
                 f"[green]Payment OK[/green] "
                 f"{inv.amount_rao/PLANCK:.4f} α → {inv.treasury_coldkey[:8]}… "
-                f"(seen_e={inv.epoch_seen}, pay_e={inv.pay_epoch_index}, inv={inv.invoice_id})"
+                f"(seen_e={inv.epoch_seen}, pay_e={inv.pay_epoch_index}, inv={inv.invoice_id}, partial={inv.was_partial})"
             )
         else:
             pretty.log(
                 f"[red]Payment FAILED[/red] resp={resp} "
-                f"(seen_e={inv.epoch_seen}, pay_e={inv.pay_epoch_index}, inv={inv.invoice_id})"
+                f"(seen_e={inv.epoch_seen}, pay_e={inv.pay_epoch_index}, inv={inv.invoice_id}, partial={inv.was_partial})"
             )
 
         self._save_state_file()
