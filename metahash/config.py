@@ -13,12 +13,10 @@ load_dotenv()
 # ╭─────────────────────────── ENVIRONMENT ────────────────────────────╮
 METAHASH_SUBNET_ID = 73
 DEFAULT_BITTENSOR_NETWORK: str = os.getenv("BITTENSOR_NETWORK", "finney")
-
-# Gate v2 logic until chain reaches this height (validators idle before this)
+TESTING: bool = os.getenv("TESTING", "false").lower() == "true"
 START_V3_BLOCK: int = int(os.getenv("START_V3_BLOCK", "0"))
 
 # Operational flags
-TESTING: bool = os.getenv("TESTING", "false").lower() == "true"
 FORCE_BURN_WEIGHTS: bool = os.getenv("FORCE_BURN_WEIGHTS", "false").lower() == "true"
 
 # Monetary base unit (α planck)
@@ -32,7 +30,7 @@ ALLOW_INLINE_FALLBACK: bool = True
 RAW_BYTES_CEILING = 120
 
 # ╭───────────────────────────── EPOCH ────────────────────────────────╮
-EPOCH_LENGTH_OVERRIDE: int = int(os.getenv("EPOCH_LENGTH_OVERRIDE", "5"))
+EPOCH_LENGTH_OVERRIDE: int = int(os.getenv("EPOCH_LENGTH_OVERRIDE", "10"))
 # ╰────────────────────────────────────────────────────────────────────╯
 
 
