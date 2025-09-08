@@ -169,6 +169,76 @@ class AuctionEngine:
             pretty.log("[yellow]No active masters meet the threshold this epoch.[/yellow]")
         return share
 
+    # --- NEW: axon filtering helpers to avoid 0.0.0.0:0 / localhost / bad ports ---
+    @staticmethod
+    def _extract_ip_port(ax) -> Tuple[Optional[str], Optional[int]]:
+        """Best-effort extraction of (ip, port) from various axon layouts."""
+        ip = None
+        port = None
+        try:
+            # Common attrs
+            ip = getattr(ax, "ip", None) or getattr(ax, "external_ip", None)
+            port = getattr(ax, "port", None) or getattr(ax, "external_port", None)
+            # Endpoint object fallback
+            ep = getattr(ax, "endpoint", None)
+            if ep is not None:
+                ip = ip or getattr(ep, "ip", None)
+                port = port or getattr(ep, "port", None)
+        except Exception:
+            pass
+        try:
+            port = int(port) if port is not None else None
+        except Exception:
+            port = None
+        return ip, port
+
+    @staticmethod
+    def _is_bad_ip(ip: Optional[str]) -> bool:
+        if not ip:
+            return True
+        ip_l = str(ip).strip().lower()
+        return ip_l in {"0.0.0.0", "::", "localhost", "127.0.0.1", "::1"}
+
+    @classmethod
+    def _is_ax_reachable(cls, ax) -> Tuple[bool, str]:
+        hk = getattr(ax, "hotkey", None)
+        if not hk:
+            return False, "missing hotkey"
+        ip, port = cls._extract_ip_port(ax)
+        if cls._is_bad_ip(ip):
+            return False, f"bad ip {ip!r}"
+        if port is None or not (1 <= int(port) <= 65535):
+            return False, f"bad port {port!r}"
+        # optional flag many axons expose
+        is_serving = getattr(ax, "is_serving", True)
+        if is_serving is False:
+            return False, "not serving"
+        return True, "ok"
+
+    def _filter_reachable_axons(self, axons: List[object]) -> List[object]:
+        if not axons:
+            return []
+        good: List[object] = []
+        bad_rows: List[List[object]] = []
+        for ax in axons:
+            ok, why = self._is_ax_reachable(ax)
+            if ok:
+                good.append(ax)
+            else:
+                hk = getattr(ax, "hotkey", "?")
+                ip, port = self._extract_ip_port(ax)
+                if len(bad_rows) < max(10, LOG_TOP_N):
+                    bad_rows.append([hk, str(ip), str(port), why])
+        if bad_rows:
+            pretty.table("Filtered unreachable axons", ["Hotkey", "IP", "Port", "Reason"], bad_rows)
+        pretty.kv_panel(
+            "Axon filter",
+            [("received", len(axons)), ("usable", len(good)), ("filtered_out", len(axons) - len(good))],
+            style="bold cyan",
+        )
+        return good
+    # -----------------------------------------------------------------------
+
     def _accept_bid_from(self, *, uid: int, subnet_id: int, alpha: float, discount_bps: int) -> Tuple[bool, Optional[str]]:
         epoch = self.parent.epoch_index
         if self.parent.block < START_V3_BLOCK:
@@ -178,7 +248,7 @@ class AuctionEngine:
         if uid == 0:
             return False, "uid 0 not allowed"
 
-        # epoch‑jail (by coldkey)
+        # epoch-jail (by coldkey)
         ck = self.parent.metagraph.coldkeys[uid]
         jail_upto = self.state.ck_jail_until_epoch.get(ck, -1)
         if jail_upto is not None and epoch < jail_upto:
@@ -189,7 +259,7 @@ class AuctionEngine:
         if stake_alpha < S_MIN_ALPHA_MINER:
             return False, f"stake {stake_alpha:.3f} α < S_MIN_ALPHA_MINER"
 
-        # sanity‑checks
+        # sanity-checks
         if not (alpha > 0):
             return False, "invalid α"
         if alpha > AUCTION_BUDGET_ALPHA:
@@ -197,7 +267,7 @@ class AuctionEngine:
         if not (0 <= discount_bps <= 10_000):
             return False, "discount out of range"
 
-        # weight gate: reject zero‑weight subnets outright
+        # weight gate: reject zero-weight subnets outright
         w = self._norm_weight(subnet_id)
         if w <= 0.0:
             return False, f"subnet weight {w:.4f} ≤ 0 (sid={subnet_id})"
@@ -208,7 +278,7 @@ class AuctionEngine:
         if existing_uid is not None and existing_uid != uid:
             return False, f"coldkey already bidding as uid={existing_uid}"
 
-        # per‑coldkey bid limit on distinct subnets
+        # per-coldkey bid limit on distinct subnets
         count = self._ck_subnets_bid[epoch].get(ck, 0)
         first_on_subnet = (uid, subnet_id) not in self._bid_book[epoch]
         if first_on_subnet and count >= MAX_BIDS_PER_MINER:
@@ -254,9 +324,10 @@ class AuctionEngine:
             self._auction_start_sent_for = self.parent.epoch_index
             return
 
-        axons = self.parent.metagraph.axons
+        raw_axons = list(self.parent.metagraph.axons or [])
+        axons = self._filter_reachable_axons(raw_axons)
         if not axons:
-            pretty.log("[yellow]Metagraph has no reachable axons; skipping AuctionStart broadcast.[/yellow]")
+            pretty.log("[yellow]No usable axons after filtering; skipping AuctionStart broadcast.[/yellow]")
             self._auction_start_sent_for = self.parent.epoch_index
             return
 
@@ -282,20 +353,20 @@ class AuctionEngine:
 
         hk2uid = self._hotkey_to_uid()
         ack_count = 0
-        total = len(axons) if axons else 0
+        total = len(axons)
         bids_accepted = 0
         bids_rejected = 0
         reject_rows: List[List[object]] = []
         reasons_counter: Dict[str, int] = defaultdict(int)
 
-        for idx, ax in enumerate(axons or []):
+        for idx, ax in enumerate(axons):
             resp = resps[idx] if isinstance(resps, list) and idx < len(resps) else None
             if not isinstance(resp, AuctionStartSynapse):
                 continue
             if bool(getattr(resp, "ack", False)):
                 ack_count += 1
             bids = getattr(resp, "bids", None) or []
-            uid = hk2uid.get(ax.hotkey)
+            uid = hk2uid.get(getattr(ax, "hotkey", None))
             if uid is None:
                 continue
             for b in bids:
