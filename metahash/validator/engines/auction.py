@@ -236,7 +236,7 @@ class AuctionEngine:
 
         try:
             pretty.log("[cyan]Broadcasting AuctionStart to miners…[/cyan]")
-            resps = await self.parent.dendrite(axons=axons, synapse=syn, deserialize=True, timeout=20)
+            resps = await self.parent.dendrite(axons=axons, synapse=syn, deserialize=True, timeout=30)
         except Exception as e_exc:
             resps = []
             pretty.log(f"[yellow]AuctionStart broadcast exceptions: {e_exc}[/yellow]")
