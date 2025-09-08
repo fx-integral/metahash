@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-# neurons/miner.py — Event-driven bidder v2.6 (files split)
+# neurons/miner.py — Event-driven bidder v2.6 (files split, no α cap vs validator budget)
 # Files:
 #   - miner_models.py              (BidLine, WinInvoice)
 #   - miner_mixins.py              (state I/O, helpers, chain info)
 #   - background_payment_miner.py  (payments + background retries)
 #
-# Keeps v2.5 behavior and fixes.
+# Change in this build:
+#   • Do NOT reject bids with alpha > auction budget (or AUCTION_BUDGET_ALPHA).
+#     We warn but still submit; validator’s TAO-based clearing will partially fill.
 
 import asyncio
 from math import isfinite
@@ -20,7 +22,11 @@ from metahash.miner.payments import BackgroundPaymentMiner
 
 from metahash.base.utils.logging import ColoredLogger as clog
 from metahash.protocol import AuctionStartSynapse, WinSynapse
-from metahash.config import PLANCK, AUCTION_BUDGET_ALPHA, S_MIN_ALPHA_MINER, PAYMENT_TICK_SLEEP_SECONDS
+from metahash.config import (
+    PLANCK,
+    S_MIN_ALPHA_MINER,
+    PAYMENT_TICK_SLEEP_SECONDS,
+)
 from metahash.utils.pretty_logs import pretty
 from metahash.utils.wallet_utils import unlock_wallet
 
@@ -81,13 +87,16 @@ class Miner(BackgroundPaymentMiner):
         except Exception:
             pass
 
+        budget_alpha = float(getattr(synapse, "auction_budget_alpha", 0.0) or 0.0)
+        min_stake_alpha = float(getattr(synapse, "min_stake_alpha", S_MIN_ALPHA_MINER) or S_MIN_ALPHA_MINER)
+
         pretty.kv_panel(
             "[cyan]AuctionStart received[/cyan]",
             [
                 ("validator", f"{caller_hot or vkey} (uid={uid if uid is not None else '?'})"),
                 ("epoch (e)", epoch),
-                ("budget α", f"{getattr(synapse, 'auction_budget_alpha', 0):.3f}"),
-                ("min_stake", f"{synapse.min_stake_alpha:.3f} α"),
+                ("budget α", f"{budget_alpha:.3f}"),
+                ("min_stake", f"{min_stake_alpha:.3f} α"),
                 ("timeline", f"bid now (e) → pay in (e+1={epoch+1}) → weights from e in (e+2={epoch+2})"),
             ],
             style="bold cyan",
@@ -99,7 +108,7 @@ class Miner(BackgroundPaymentMiner):
 
         # Stake gate
         my_stake = float(self.metagraph.stake[self.uid])
-        if my_stake < float(synapse.min_stake_alpha or S_MIN_ALPHA_MINER):
+        if my_stake < min_stake_alpha:
             pretty.log(f"[yellow]Stake below S_MIN_ALPHA_MINER – not bidding to this validator (epoch {epoch}).[/yellow]")
             self._status_tables()
             synapse.ack = True
@@ -114,7 +123,8 @@ class Miner(BackgroundPaymentMiner):
         sent = 0
         rows_sent = []
         for ln in self.lines:
-            if not isfinite(ln.alpha) or ln.alpha <= 0 or ln.alpha > AUCTION_BUDGET_ALPHA:
+            # Basic sanity checks only; DO NOT cap by validator budget anymore.
+            if not isfinite(ln.alpha) or ln.alpha <= 0:
                 pretty.log(f"[yellow]Invalid alpha {ln.alpha} for subnet {ln.subnet_id} – skipping line.[/yellow]")
                 continue
             if not (0 <= ln.discount_bps <= 10_000):
@@ -122,6 +132,13 @@ class Miner(BackgroundPaymentMiner):
                 continue
             if self._has_bid(vkey, epoch, ln.subnet_id, ln.alpha, ln.discount_bps):
                 continue
+
+            # Soft warning if the line α exceeds the announced budget — still send the bid.
+            if budget_alpha > 0 and ln.alpha > budget_alpha:
+                pretty.log(
+                    f"[grey58]Note:[/grey58] line α {ln.alpha:.4f} exceeds validator’s announced budget α {budget_alpha:.4f}; "
+                    f"it will be considered and may be partially filled by TAO-budgeted clearing."
+                )
 
             bid_id = self._make_bid_id(vkey, epoch, ln.subnet_id, ln.alpha, ln.discount_bps)
             out_bids.append({
