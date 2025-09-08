@@ -18,9 +18,6 @@ from metahash.config import (
 
 from metahash.utils.helpers import load_weights
 
-# Services / feature toggles
-from metahash.config import DRYRUN_WEIGHTS
-
 # State & Engines
 from metahash.validator.state import StateStore
 from metahash.validator.engines.commitments import CommitmentsEngine
@@ -79,7 +76,6 @@ class Validator(EpochValidatorNeuron):
                         f"netuid={self.config.netuid}",
                         f"epoch(e)={getattr(self, 'epoch_index', 0)}",
                         "fresh" if getattr(self.config, "fresh", False) else "",
-                        "DRY-RUN weights" if DRYRUN_WEIGHTS else "",
                     ],
                 )
             ),

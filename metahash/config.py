@@ -21,8 +21,6 @@ FORCE_BURN_WEIGHTS: bool = os.getenv("FORCE_BURN_WEIGHTS", "false").lower() == "
 
 # Monetary base unit (α planck)
 PLANCK: int = 10**9
-
-DRYRUN_WEIGHTS = TESTING
 # ╰────────────────────────────────────────────────────────────────────╯
 
 # ╭───────────────────────────── IPFS and Commitments ────────────────────────────────╮
@@ -30,7 +28,7 @@ ALLOW_INLINE_FALLBACK: bool = True
 RAW_BYTES_CEILING = 120
 
 # ╭───────────────────────────── EPOCH ────────────────────────────────╮
-EPOCH_LENGTH_OVERRIDE: int = int(os.getenv("EPOCH_LENGTH_OVERRIDE", "10"))
+EPOCH_LENGTH_OVERRIDE: int = int(os.getenv("EPOCH_LENGTH_OVERRIDE", "20"))
 # ╰────────────────────────────────────────────────────────────────────╯
 
 
@@ -41,7 +39,7 @@ S_MIN_MASTER_VALIDATOR: float = float(os.getenv("S_MIN_MASTER_VALIDATOR", "10000
 MAX_BIDS_PER_MINER: int = int(os.getenv("MAX_BIDS_PER_MINER", "5"))
 FORBIDDEN_ALPHA_SUBNETS: list[int] = [73]
 STRATEGY_PATH: str = os.getenv("STRATEGY_PATH", "weights.yml")
-AUCTION_START_TIMEOUT = 10
+AUCTION_START_TIMEOUT = 30
 # ╰────────────────────────────────────────────────────────────────────╯
 
 
