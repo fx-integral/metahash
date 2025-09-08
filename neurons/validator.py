@@ -14,6 +14,7 @@ from metahash.config import (
     STRATEGY_PATH,
     START_V3_BLOCK,
     EPOCH_LENGTH_OVERRIDE,
+    TESTING
 )
 
 from metahash.utils.helpers import load_weights
@@ -76,6 +77,7 @@ class Validator(EpochValidatorNeuron):
                         f"netuid={self.config.netuid}",
                         f"epoch(e)={getattr(self, 'epoch_index', 0)}",
                         "fresh" if getattr(self.config, "fresh", False) else "",
+                        "Testing" if TESTING else "",
                     ],
                 )
             ),
