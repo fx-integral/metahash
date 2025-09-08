@@ -1,4 +1,4 @@
-# neurons/validator.py – SN-73 v2.3.4 (modularized, cleaned)
+# neurons/validator.py – SN-73 v2.3.4 (modularized, cleaned, recv-safe)
 from __future__ import annotations
 
 import asyncio
@@ -14,9 +14,8 @@ from metahash.config import (
     STRATEGY_PATH,
     START_V3_BLOCK,
     EPOCH_LENGTH_OVERRIDE,
-    TESTING
+    TESTING,
 )
-
 from metahash.utils.helpers import load_weights
 
 # State & Engines
@@ -49,7 +48,7 @@ class Validator(EpochValidatorNeuron):
         super().__init__(config=config)
         self.hotkey_ss58: str = self.wallet.hotkey.ss58_address
 
-        # Async Subtensor (shared across engines)
+        # Single AsyncSubtensor client + a per-connection RPC lock.
         self._async_subtensor: bt.AsyncSubtensor | None = None
         self._rpc_lock: asyncio.Lock = asyncio.Lock()
 
@@ -61,7 +60,7 @@ class Validator(EpochValidatorNeuron):
         # Strategy (weights per subnet)
         self.weights_bps = load_weights(STRATEGY_PATH)
 
-        # Engines
+        # Engines (they will call back into _stxn() to reuse the single client)
         self.commitments = CommitmentsEngine(self, self.state)
         self.settlement = SettlementEngine(self, self.state)
         self.clearing = ClearingEngine(self, self.state)
@@ -84,22 +83,18 @@ class Validator(EpochValidatorNeuron):
             style="bold magenta",
         )
 
-    # ─── async-Subtensor getter ───────────────────────────────────────
     async def _stxn(self) -> bt.AsyncSubtensor:
+        """Return the shared AsyncSubtensor client (create once)."""
         if self._async_subtensor is None:
-            async_subtensor = await self._new_async_subtensor()
-            self._async_subtensor = async_subtensor
+            self._async_subtensor = await self._new_async_subtensor()
         return self._async_subtensor
 
-    # ─── async-Subtensor getter ───────────────────────────────────────
     async def _new_async_subtensor(self) -> bt.AsyncSubtensor:
         stxn = bt.AsyncSubtensor(network=self.config.subtensor.network)
         await stxn.initialize()
         return stxn
 
-    # ─── epoch override (testing) ─────────────────────────────────────
     def _apply_epoch_override(self):
-        """Optionally override epoch boundaries for testing."""
         try:
             if EPOCH_LENGTH_OVERRIDE and EPOCH_LENGTH_OVERRIDE > 0:
                 L = int(EPOCH_LENGTH_OVERRIDE)
@@ -110,10 +105,8 @@ class Validator(EpochValidatorNeuron):
                 self.epoch_end_block = self.epoch_start_block + L - 1
                 self.epoch_length = L
         except Exception:
-            # non-fatal
-            pass
+            pass  # non-fatal
 
-    # ─────────────────────────── forward() ────────────────────────────
     async def forward(self):
         """
         Per-epoch driver (weights-first):
@@ -121,7 +114,7 @@ class Validator(EpochValidatorNeuron):
           2) Masters: auction & clear NOW (epoch e).
           3) Masters: publish previous epoch’s cleared winners (e−1) using stored window.
         """
-        await self._stxn()
+        await self._stxn()          # ensure single client exists
         self._apply_epoch_override()
 
         if self.block < START_V3_BLOCK:
@@ -171,12 +164,8 @@ class Validator(EpochValidatorNeuron):
         self.auction.cleanup_old_epoch_books(before_epoch=e - 2)
 
 
-# ─────────────────────── keep-alive (optional) ───────────────────────
 if __name__ == "__main__":
     from metahash.bittensor_config import config
-
-    # NOTE: The base neuron runner typically owns the loop and calls forward().
-    # This keep-alive shows the process is up; it doesn't drive epochs.
     with Validator(config=config(role="validator")) as v:
         while True:
             clog.info("Validator running…", color="gray")
