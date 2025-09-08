@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 from metahash.utils.pretty_logs import pretty
-from treasuries import VALIDATOR_TREASURIES
+from metahash.treasuries import VALIDATOR_TREASURIES
 
 from metahash.validator.state import StateStore
 

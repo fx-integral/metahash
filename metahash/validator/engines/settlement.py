@@ -30,7 +30,7 @@ from metahash.utils.pretty_logs import pretty
 from metahash.utils.ipfs import aget_json
 from metahash.utils.commitments import read_all_plain_commitments
 from metahash.validator.alpha_transfers import AlphaTransfersScanner
-from treasuries import VALIDATOR_TREASURIES
+from metahash.treasuries import VALIDATOR_TREASURIES
 
 from metahash.validator.state import StateStore
 from metahash.utils.helpers import safe_json_loads, safe_int

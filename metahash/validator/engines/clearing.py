@@ -11,11 +11,11 @@ from metahash.validator.state import StateStore
 
 # Config & rewards utilities
 from metahash.config import (AUCTION_BUDGET_ALPHA, LOG_TOP_N, METAHASH_SUBNET_ID, PLANCK,
-    REPUTATION_BASELINE_CAP_FRAC, REPUTATION_ENABLED, REPUTATION_MAX_CAP_FRAC,
-    REPUTATION_MIX_GAMMA)
+                             REPUTATION_BASELINE_CAP_FRAC, REPUTATION_ENABLED, REPUTATION_MAX_CAP_FRAC,
+                             REPUTATION_MIX_GAMMA)
 from metahash.validator.rewards import WinAllocation, BidInput, budget_tao_from_share
 from metahash.protocol import WinSynapse
-from treasuries import VALIDATOR_TREASURIES
+from metahash.treasuries import VALIDATOR_TREASURIES
 
 # Price oracle (for ordering and budget conversion; prices are NOT written into commitments)
 from metahash.utils.subnet_utils import average_price
