@@ -7,7 +7,7 @@ from typing import Dict
 from metahash.utils.ipfs import aadd_json, minidumps as ipfs_minidumps, IPFSError
 from metahash.utils.pretty_logs import pretty
 from metahash.utils.commitments import write_plain_commitment_json
-from treasuries import VALIDATOR_TREASURIES
+from metahash.treasuries import VALIDATOR_TREASURIES
 
 from metahash.config import ALLOW_INLINE_FALLBACK, RAW_BYTES_CEILING
 from metahash.validator.state import StateStore
