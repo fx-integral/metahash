@@ -34,7 +34,7 @@ EPOCH_LENGTH_OVERRIDE: int = int(os.getenv("EPOCH_LENGTH_OVERRIDE", "20"))
 
 # ╭───────────────────────────── AUCTION ──────────────────────────────╮
 AUCTION_BUDGET_ALPHA: float = float(os.getenv("AUCTION_BUDGET_ALPHA", "148.0"))
-S_MIN_ALPHA_MINER: float = float(os.getenv("S_MIN_ALPHA_MINER", "5.0"))
+S_MIN_ALPHA_MINER: float = float(os.getenv("S_MIN_ALPHA_MINER", "0"))
 S_MIN_MASTER_VALIDATOR: float = float(os.getenv("S_MIN_MASTER_VALIDATOR", "10000"))
 MAX_BIDS_PER_MINER: int = int(os.getenv("MAX_BIDS_PER_MINER", "5"))
 FORBIDDEN_ALPHA_SUBNETS: list[int] = [73]
