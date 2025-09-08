@@ -87,10 +87,15 @@ class Validator(EpochValidatorNeuron):
     # ─── async-Subtensor getter ───────────────────────────────────────
     async def _stxn(self) -> bt.AsyncSubtensor:
         if self._async_subtensor is None:
-            stxn = bt.AsyncSubtensor(network=self.config.subtensor.network)
-            await stxn.initialize()
-            self._async_subtensor = stxn
+            async_subtensor = await self._new_async_subtensor()
+            self._async_subtensor = async_subtensor
         return self._async_subtensor
+
+    # ─── async-Subtensor getter ───────────────────────────────────────
+    async def _new_async_subtensor(self) -> bt.AsyncSubtensor:
+        stxn = bt.AsyncSubtensor(network=self.config.subtensor.network)
+        await stxn.initialize()
+        return stxn
 
     # ─── epoch override (testing) ─────────────────────────────────────
     def _apply_epoch_override(self):
