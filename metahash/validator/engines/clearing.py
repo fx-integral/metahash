@@ -128,7 +128,7 @@ class ClearingEngine:
         out: Dict[int, float] = {}
         # use a single client for the loop
         try:
-            st = await self.parent._stxn()
+            st = await self.parent._new_async_subtensor()
         except Exception:
             st = None
         for sid in sids:
@@ -146,7 +146,7 @@ class ClearingEngine:
         sids = sorted({b.subnet_id for b in bids})
         out: Dict[int, int] = {}
         try:
-            st = await self.parent._stxn()
+            st = await self.parent._new_async_subtensor()
         except Exception:
             st = None
         for sid in sids:
