@@ -1,4 +1,4 @@
-# neurons/auction.py
+# metahash/validator/engines/auction.py
 from __future__ import annotations
 
 import inspect
@@ -12,18 +12,11 @@ from metahash.treasuries import VALIDATOR_TREASURIES
 from metahash.validator.state import StateStore
 
 # Config constants
-from metahash.config import (
-    AUCTION_BUDGET_ALPHA,
-    MAX_BIDS_PER_MINER,
-    S_MIN_ALPHA_MINER,
-    S_MIN_MASTER_VALIDATOR,
-    START_V3_BLOCK,
-    LOG_TOP_N,
-)
-from metahash.validator.rewards import WinAllocation, budget_from_share
+from metahash.config import (AUCTION_BUDGET_ALPHA, AUCTION_START_TIMEOUT, LOG_TOP_N,
+    MAX_BIDS_PER_MINER, S_MIN_ALPHA_MINER, S_MIN_MASTER_VALIDATOR, START_V3_BLOCK)
 from metahash.protocol import AuctionStartSynapse
 
-EPS_ALPHA = 1e-12  # (kept for potential future use)
+EPS_ALPHA = 1e-12  # keep small epsilon for partial fill checks
 
 
 @dataclass(slots=True)
@@ -38,8 +31,52 @@ class _Bid:
     idx: int = 0              # stable order per miner+subnet
 
 
+@dataclass(slots=True, frozen=True)
+class BidInput:
+    miner_uid: int
+    coldkey: str
+    subnet_id: int
+    alpha: float                # requested α (in α units, not rao)
+    discount_bps: int           # 0..10_000
+    weight_bps: int             # 0..10_000
+    idx: int = 0                # stable per-miner ordering
+
+
+@dataclass(slots=True)
+class WinAllocation:
+    miner_uid: int
+    coldkey: str
+    subnet_id: int
+    alpha_requested: float
+    alpha_accepted: float
+    discount_bps: int
+    weight_bps: int
+
+
+def budget_from_share(*, share: float, auction_budget_alpha: float = AUCTION_BUDGET_ALPHA) -> float:
+    """(Legacy) Returns an α-denominated budget = share * AUCTION_BUDGET_ALPHA."""
+    if share <= 0:
+        return 0.0
+    return auction_budget_alpha * float(share)
+
+
+def budget_tao_from_share(
+    *,
+    share: float,
+    auction_budget_alpha: float = AUCTION_BUDGET_ALPHA,
+    price_tao_per_alpha_base: float,
+) -> float:
+    """
+    Convert the base α budget (for validator's netuid) to a TAO budget for allocation:
+        budget_tao = share * auction_budget_alpha (α) * price_tao_per_alpha_base
+    """
+    if share <= 0 or auction_budget_alpha <= 0 or price_tao_per_alpha_base <= 0:
+        return 0.0
+    return float(share) * float(auction_budget_alpha) * float(price_tao_per_alpha_base)
+
+
 class AuctionEngine:
-    """AuctionStart broadcast & bid management."""
+    """AuctionStart broadcast & bid management (masters only)."""
 
     def __init__(self, parent, state: StateStore, weights_bps: Dict[int, float], clearer=None):
         self.parent = parent
@@ -101,8 +138,9 @@ class AuctionEngine:
         return max(0.0, min(1.0, raw))
 
     def _snapshot_master_stakes_for_epoch(self, epoch: int) -> float:
+        """Snapshots current masters' stakes and returns our share in [0,1]."""
         pretty.kv_panel(
-            "Master Stakes => Budget)",
+            "Master Stakes => Budget",
             [("epoch (e)", epoch), ("action", "Calculating master validators’ stakes to compute personal budget share…")],
             style="bold cyan",
         )
@@ -134,7 +172,7 @@ class AuctionEngine:
     def _accept_bid_from(self, *, uid: int, subnet_id: int, alpha: float, discount_bps: int) -> Tuple[bool, Optional[str]]:
         epoch = self.parent.epoch_index
         if self.parent.block < START_V3_BLOCK:
-            return False, "auction not started (v2 gating)"
+            return False, "auction not started (v3 gating)"
         if not self._is_master_now():
             return False, "bids disabled on non-master validator"
         if uid == 0:
@@ -195,6 +233,7 @@ class AuctionEngine:
         return True, None
 
     async def broadcast_auction_start(self):
+        """Broadcast AuctionStart and accept bids; then clear and notify winners immediately."""
         if not self._is_master_now():
             return
         if getattr(self, "_auction_start_sent_for", None) == self.parent.epoch_index:
@@ -236,7 +275,7 @@ class AuctionEngine:
 
         try:
             pretty.log("[cyan]Broadcasting AuctionStart to miners…[/cyan]")
-            resps = await self.parent.dendrite(axons=axons, synapse=syn, deserialize=True, timeout=30)
+            resps = await self.parent.dendrite(axons=axons, synapse=syn, deserialize=True, timeout=AUCTION_START_TIMEOUT)
         except Exception as e_exc:
             resps = []
             pretty.log(f"[yellow]AuctionStart broadcast exceptions: {e_exc}[/yellow]")
@@ -315,6 +354,7 @@ class AuctionEngine:
             self._wins_notified_for = self.parent.epoch_index
 
     def cleanup_old_epoch_books(self, before_epoch: int):
+        """Cleanup old bid state older than (e−2)."""
         self._bid_book.pop(before_epoch, None)
         self._ck_uid_epoch.pop(before_epoch, None)
         self._ck_subnets_bid.pop(before_epoch, None)

@@ -41,6 +41,7 @@ S_MIN_MASTER_VALIDATOR: float = float(os.getenv("S_MIN_MASTER_VALIDATOR", "10000
 MAX_BIDS_PER_MINER: int = int(os.getenv("MAX_BIDS_PER_MINER", "5"))
 FORBIDDEN_ALPHA_SUBNETS: list[int] = [73]
 STRATEGY_PATH: str = os.getenv("STRATEGY_PATH", "weights.yml")
+AUCTION_START_TIMEOUT = 10
 # ╰────────────────────────────────────────────────────────────────────╯
 
 

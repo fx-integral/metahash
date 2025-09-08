@@ -1,4 +1,4 @@
-# neurons/validator.py – SN‑73 v2.3.4 (modularized)
+# neurons/validator.py – SN-73 v2.3.4 (modularized)
 from __future__ import annotations
 
 import asyncio
@@ -17,38 +17,40 @@ from metahash.config import (
 )
 from metahash.utils.helpers import load_weights
 
-# Services
+# Services / feature toggles
 from metahash.config import DRYRUN_WEIGHTS
+
+# State & Engines
 from metahash.validator.state import StateStore
 from metahash.validator.engines.commitments import CommitmentsEngine
 from metahash.validator.engines.settlement import SettlementEngine
 from metahash.validator.engines.auction import AuctionEngine
 from metahash.validator.engines.clearing import ClearingEngine
 
-# Base
+# Base neuron
 from metahash.validator.epoch_validator import EpochValidatorNeuron
 
 
 class Validator(EpochValidatorNeuron):
     """
     v2.3.4 (modular):
-      • DRY‑RUN set_weights (suppresses on-chain, logs WOULD‑SET),
-      • single‑pass quotas by normalized reputation,
+      • DRY-RUN set_weights (suppresses on-chain, logs WOULD-SET),
+      • single-pass quotas by normalized reputation,
       • early winner notification, window recorded (pe, as, de),
-      • v4 commitments: CID‑only on‑chain, full in IPFS,
+      • v4 commitments: CID-only on-chain, full in IPFS,
       • robust fallback: never publish inline payload > limit,
       • settlement guarded; local pending payload as dev fallback when IPFS decode fails.
 
     NOTE in this build:
       • Clearing uses TAO budget (base subnet = this validator's netuid) and TAO-valued bids
-        = α * (1 - disc) * price_tao_per_alpha[subnet] * weight_fraction.
+        = α * (1 - disc) * price_tao_per_alpha[subnet] * weight_fraction (with slippage on α).
     """
 
     def __init__(self, config=None):
         super().__init__(config=config)
         self.hotkey_ss58: str = self.wallet.hotkey.ss58_address
 
-        # Async subtensor
+        # Async Subtensor (shared across engines)
         self._async_subtensor: bt.AsyncSubtensor | None = None
         self._rpc_lock: asyncio.Lock = asyncio.Lock()
 
@@ -60,10 +62,10 @@ class Validator(EpochValidatorNeuron):
         # Strategy (weights per subnet)
         self.weights_bps = load_weights(STRATEGY_PATH)
 
-        # Services / engines
+        # Engines
         self.commitments = CommitmentsEngine(self, self.state)
         self.settlement = SettlementEngine(self, self.state)
-        self.clearing = ClearingEngine(self, self.state)  # TAO-budget allocator
+        self.clearing = ClearingEngine(self, self.state)
         self.auction = AuctionEngine(self, self.state, self.weights_bps, clearer=self.clearing)
 
         pretty.banner(
@@ -74,8 +76,8 @@ class Validator(EpochValidatorNeuron):
             style="bold magenta",
         )
 
-    # ─── async‑Subtensor getter ───────────────────────────────────────
-    async def _stxn(self):
+    # ─── async-Subtensor getter ───────────────────────────────────────
+    async def _stxn(self) -> bt.AsyncSubtensor:
         if self._async_subtensor is None:
             stxn = bt.AsyncSubtensor(network=self.config.subtensor.network)
             await stxn.initialize()
@@ -84,6 +86,7 @@ class Validator(EpochValidatorNeuron):
 
     # ─── epoch override (testing) ─────────────────────────────────────
     def _apply_epoch_override(self):
+        """Optionally override epoch boundaries for testing."""
         try:
             if EPOCH_LENGTH_OVERRIDE and EPOCH_LENGTH_OVERRIDE > 0:
                 L = int(EPOCH_LENGTH_OVERRIDE)
@@ -94,6 +97,7 @@ class Validator(EpochValidatorNeuron):
                 self.epoch_end_block = self.epoch_start_block + L - 1
                 self.epoch_length = L
         except Exception:
+            # non-fatal
             pass
 
     # ─────────────────────────── forward() ────────────────────────────
@@ -110,7 +114,7 @@ class Validator(EpochValidatorNeuron):
         if self.block < START_V3_BLOCK:
             pretty.banner(
                 "Waiting for START_V3_BLOCK",
-                f"current_block={self.block} < start_v2={START_V3_BLOCK}",
+                f"current_block={self.block} < start_v3={START_V3_BLOCK}",
                 style="bold yellow",
             )
             return
@@ -127,35 +131,45 @@ class Validator(EpochValidatorNeuron):
         )
 
         # 1) WEIGHTS FIRST: settle older epoch (e−2)
-        pretty.kv_panel(
-            "Settle & Weights",
-            [("settle epoch (e−2)", e - 2), ("payment epoch scanned (pe)", e - 1)],
-            style="bold cyan",
-        )
-        await self.settlement.settle_and_set_weights_all_masters(epoch_to_settle=e - 2)
+        # await self.settlement.settle_and_set_weights_all_masters(epoch_to_settle=e - 2)
 
-        # 2) Masters: broadcast & clear immediately
+        # 2) Masters: broadcast & clear immediately (if master)
         if not self.auction._is_master_now() and getattr(self.auction, "_not_master_log_epoch", None) != e:
             pretty.log("[yellow]validator is not a master so no biddings.[/yellow]")
             self.auction._not_master_log_epoch = e
 
-        await self.auction.broadcast_auction_start()
+        # Cancellation-safe broadcast; do not crash epoch loop on RPC cancellations
+        try:
+            await self.auction.broadcast_auction_start()
+        except asyncio.CancelledError as ce:
+            pretty.log(f"[yellow]AuctionStart cancelled by RPC: {ce}. Will retry next epoch.[/yellow]")
+            return
+        except Exception as exc:
+            pretty.log(f"[yellow]AuctionStart failed: {exc}[/yellow]")
 
-        # 3) Masters: publish previous epoch’s cleared winners (e−1)
-        pretty.kv_panel(
-            "PHASE 3/3 — Publish commitments",
-            [("epoch_cleared (e−1)", e - 1), ("pay_epoch (pe)", "stored")],
-            style="bold cyan",
-        )
-        await self.commitments.publish_commitment_for(epoch_cleared=e - 1)
+        # # 3) Masters: publish previous epoch’s cleared winners (e−1)
+        # pretty.kv_panel(
+        #     "3. Publish commitments",
+        #     [("epoch_cleared (e−1)", e - 1), ("pay_epoch (pe)", "stored")],
+        #     style="bold cyan",
+        # )
+        # try:
+        #     await self.commitments.publish_commitment_for(epoch_cleared=e - 1)
+        # except asyncio.CancelledError as ce:
+        #     pretty.log(f"[yellow]Publish commitments cancelled by RPC: {ce}[/yellow]")
+        # except Exception as exc:
+        #     pretty.log(f"[yellow]Publish commitments failed: {exc}[/yellow]")
 
         # cleanup bid books older than (e−1)
         self.auction.cleanup_old_epoch_books(before_epoch=e - 2)
 
 
-# ╭────────────────── keep‑alive (optional) ───────────────────────────╮
+# ╭────────────────── keep-alive (optional) ───────────────────────────╮
 if __name__ == "__main__":
     from metahash.bittensor_config import config
+
+    # NOTE: The base neuron runner typically owns the loop and calls forward().
+    # This keep-alive shows the process is up; it doesn't drive epochs.
     with Validator(config=config(role="validator")) as v:
         while True:
             clog.info("Validator running…", color="gray")

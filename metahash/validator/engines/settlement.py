@@ -1,26 +1,10 @@
-# ╭────────────────────────────────────────────────────────────────────────╮
-# metahash/validator/settlement.py — Simple settlement (TESTING-aware)
-#
-# Policy:
-#   For each master snapshot (fetched from CID in v4 commitments):
-#     • For each miner and subnet in the payload:
-#         - Let required_rao = Σ (line.α_required_rao) on that subnet.
-#         - Let paid_rao     = α actually paid by the miner to THIS master's treasury on THAT subnet
-#                              within [as, de] (+ POST_PAYMENT_CHECK_DELAY_BLOCKS).
-#         - If paid_rao >= required_rao:
-#               reward_subnet = TAO(required_rao with slippage) and split across lines by α share:
-#               reward_line   = (reward_subnet × line_share) × weight × (1 − discount)
-#           else:
-#               no credit for that subnet (strict full-pay rule).
-#
-# No jailing, no reputation updates, no burn accounting beyond the usual
-# burn-all fallback if all scores end up 0 (or FORCE_BURN_WEIGHTS is set).
-# TESTING mode: compute & log everything but DO NOT call set_weights().
-# ╰────────────────────────────────────────────────────────────────────────╯
+# metahash/validator/engines/settlement.py — Simple settlement (TESTING-aware, verbose)
 
 from __future__ import annotations
 
 import asyncio
+import json
+import sys
 from collections import defaultdict
 from decimal import Decimal, getcontext
 from typing import Dict, List, Optional, Set, Tuple
@@ -30,13 +14,15 @@ from metahash.utils.pretty_logs import pretty
 from metahash.utils.ipfs import aget_json
 from metahash.utils.commitments import read_all_plain_commitments
 from metahash.validator.alpha_transfers import AlphaTransfersScanner
+from metahash.validator.alpha_transfers import TransferEvent
 from metahash.treasuries import VALIDATOR_TREASURIES
+from metahash.validator.valuation import decode_value_mu, effective_value_tao  # NEW
 
 from metahash.validator.state import StateStore
 from metahash.utils.helpers import safe_json_loads, safe_int
 
 from metahash.config import (
-    TESTING,                         # ← single switch for "no real set_weights"
+    TESTING,  # ← single switch for "no real set_weights"
     POST_PAYMENT_CHECK_DELAY_BLOCKS,
     FORBIDDEN_ALPHA_SUBNETS,
     LOG_TOP_N,
@@ -45,17 +31,67 @@ from metahash.config import (
     SLIP_TOLERANCE,
 )
 
-# high-precision, same as rewards.py
+# ---------- Precision & constants ----------
 getcontext().prec = 60
 _1e9 = Decimal(10) ** 9
 K_SLIP_D = Decimal(str(K_SLIP))
 SLIP_TOLERANCE_D = Decimal(str(SLIP_TOLERANCE))
+
+# ---------- Local toggles (safe defaults) ----------
+VERBOSE_DUMPS = True
+PAUSE_ON_CHECKPOINTS = True  # we auto-disable if not a TTY
+
+
+def _isatty() -> bool:
+    try:
+        return sys.stdin.isatty()
+    except Exception:
+        return False
+
+
+def _pause(msg: str):
+    """Optional interactive pause."""
+    if not PAUSE_ON_CHECKPOINTS or not _isatty():
+        return
+    try:
+        input(f"\n[PAUSE] {msg} — press <enter> to continue...")
+    except Exception:
+        pass
+
+
+def _j(obj) -> str:
+    """Compact JSON dump for logs."""
+    try:
+        return json.dumps(obj, ensure_ascii=False, separators=(",", ":"), default=str)
+    except Exception:
+        try:
+            return str(obj)
+        except Exception:
+            return "<unprintable>"
+
+
+def _head(items: list, n=3):
+    return items[: min(n, len(items))]
+
+
+def _kv_preview(d: dict, n=8) -> dict:
+    out = {}
+    for i, (k, v) in enumerate(d.items()):
+        if i >= n:
+            out["…"] = f"+{len(d)-n} more"
+            break
+        out[k] = v
+    return out
 
 
 class SettlementEngine:
     """
     Simplified settlement across ALL masters for epoch e−2.
     TESTING=True → compute everything, show weights, skip on-chain set_weights().
+
+    Flow:
+      [Commitments] → [Windows] → [Scanner] → [Prices/Depths]* → [Scores] → [Weights]
+      * Only fetched if stored μTAO values are missing in snapshots (fallback).
     """
 
     def __init__(self, parent, state: StateStore):
@@ -69,11 +105,25 @@ class SettlementEngine:
         if epoch_to_settle < 0 or epoch_to_settle in self.state.validated_epochs:
             return
 
+        pretty.rule("[bold cyan]DBG: BEGIN SETTLEMENT[/bold cyan]")
+        pretty.kv_panel(
+            "DBG: Settlement kickoff",
+            [("epoch_to_settle (e-2)", epoch_to_settle),
+             ("testing", str(TESTING).lower()),
+             ("force_burn", str(bool(FORCE_BURN_WEIGHTS)).lower())],
+            style="bold cyan",
+        )
+
         st = await self.parent._stxn()
         try:
             commits = await read_all_plain_commitments(
                 st, netuid=self.parent.config.netuid, block=None
             )
+            cnt = len(commits or {})
+            pretty.kv_panel("DBG: Commitments fetched", [("#hotkeys_in_commit_map", cnt)], style="bold cyan")
+            if VERBOSE_DUMPS and cnt:
+                pretty.log("[dim]commit hotkeys sample: "
+                           + ", ".join(_head(list(commits.keys()), 5)) + (" …" if cnt > 5 else "") + "[/dim]")
         except Exception as e:
             pretty.log(f"[red]Commitment read_all failed: {e}[/red]")
             return
@@ -83,6 +133,8 @@ class SettlementEngine:
         snapshots: List[Dict] = []
 
         # ── 1) Extract v4 snapshots (CID) or inline legacy for this epoch ──
+        pretty.rule("[bold cyan]DBG: PARSE COMMITMENTS → SNAPSHOTS[/bold cyan]")
+
         for hk_key, data_raw in (commits or {}).items():
             data_decoded = self._decode_commit_entry(data_raw)
             cand_list: List[Dict] = []
@@ -115,6 +167,16 @@ class SettlementEngine:
                             full_parsed.setdefault("hk", hk_key)
                             full_parsed.setdefault("t", VALIDATOR_TREASURIES.get(hk_key, ""))
                             chosen = dict(full_parsed)
+                            if VERBOSE_DUMPS:
+                                pretty.kv_panel(
+                                    "DBG: Loaded v4 snapshot via IPFS",
+                                    [("hk", hk_key[:10] + "…"),
+                                     ("cid", cid[:12] + "…"),
+                                     ("as", str(full_parsed.get("as"))),
+                                     ("de", str(full_parsed.get("de"))),
+                                     ("has_inv", str("inv" in full_parsed).lower())],
+                                    style="bold cyan",
+                                )
                             break
                         except Exception as ipfs_exc:
                             # Dev fallback: if this is our own hk and we still have local pending payload, use it.
@@ -136,6 +198,15 @@ class SettlementEngine:
                     chosen = dict(s)
                     chosen.setdefault("hk", hk_key)
                     chosen.setdefault("t", VALIDATOR_TREASURIES.get(hk_key, ""))
+                    if VERBOSE_DUMPS:
+                        pretty.kv_panel(
+                            "DBG: Using legacy inline snapshot",
+                            [("hk", hk_key[:10] + "…"),
+                             ("as", str(s.get("as"))),
+                             ("de", str(s.get("de"))),
+                             ("has_inv", str("inv" in s).lower())],
+                            style="bold cyan",
+                        )
                     break
 
             if not chosen:
@@ -163,20 +234,25 @@ class SettlementEngine:
 
             self.state.validated_epochs.add(epoch_to_settle)
             self.state.save_validated_epochs()
+            pretty.rule("[bold cyan]DBG: END SETTLEMENT[/bold cyan]")
             return
 
         # ── 2) Normalize snapshots & union payment window ──
+        pretty.rule("[bold cyan]DBG: NORMALIZE INVENTORY & MERGE WINDOWS[/bold cyan]")
+
         as_vals: List[int] = []
         de_vals: List[int] = []
         clean_snapshots: List[Dict] = []
         for s in snapshots:
             inv = self._normalize_inv(s)
             if inv is None:
+                pretty.log(f"[yellow]Snapshot hk={s.get('hk','')[:8]}… has no usable inventory — skipping.[/yellow]")
                 continue
             s["inv"] = inv
             a = safe_int(s.get("as"))
             d = safe_int(s.get("de"))
             if a is None or d is None:
+                pretty.log(f"[yellow]Snapshot hk={s.get('hk','')[:8]}… missing as/de — skipping.[/yellow]")
                 continue
             as_vals.append(a)
             de_vals.append(d)
@@ -192,6 +268,7 @@ class SettlementEngine:
             epoch_to_settle, start_block, end_block, POST_PAYMENT_CHECK_DELAY_BLOCKS, len(clean_snapshots)
         )
         end_block += max(0, int(POST_PAYMENT_CHECK_DELAY_BLOCKS or 0))
+        _pause("After windows merged (as/de)")
 
         # Ensure pay window is closed
         if self.parent.block < end_block:
@@ -210,22 +287,73 @@ class SettlementEngine:
             return
 
         # ── 3) Scan events and build paid α by (uid, treasury, subnet) ──
+        pretty.rule("[bold cyan]DBG: SCAN α TRANSFERS[/bold cyan]")
+
         if self._scanner is None:
             self._scanner = AlphaTransfersScanner(await self.parent._stxn(), dest_coldkey=None, rpc_lock=self._rpc_lock)
 
         try:
-            events = await self._scanner.scan(start_block, end_block)
-            if not isinstance(events, list):
-                events = []
+            events_raw = await self._scanner.scan(start_block, end_block)
+            n_raw = len(events_raw or [])
+            pretty.kv_panel("DBG: Scanner returned", [("#events_raw", n_raw), ("range", f"[{start_block},{end_block}]")], style="bold cyan")
+            if VERBOSE_DUMPS and n_raw:
+                pretty.log("[dim]events_raw sample: " + _j(_head(events_raw, 3)) + (" …" if n_raw > 3 else "") + "[/dim]")
         except Exception as scan_exc:
             pretty.kv_panel("Settlement postponed", [("epoch", epoch_to_settle), ("reason", f"scanner failed: {scan_exc}")], style="bold yellow")
             return
 
+        # Coerce scanner output into a clean List[TransferEvent]
+        def _coerce(ev) -> TransferEvent | None:
+            if isinstance(ev, TransferEvent):
+                return ev
+            if isinstance(ev, dict):
+                try:
+                    return TransferEvent(
+                        block=int(ev.get("block", -1)),
+                        from_uid=int(ev.get("from_uid", -1)),
+                        to_uid=int(ev.get("to_uid", -1)),
+                        subnet_id=int(ev.get("subnet_id")),
+                        amount_rao=int(ev.get("amount_rao", 0)),
+                        src_coldkey=ev.get("src_coldkey"),
+                        dest_coldkey=ev.get("dest_coldkey"),
+                        src_coldkey_raw=ev.get("src_coldkey_raw"),
+                        dest_coldkey_raw=ev.get("dest_coldkey_raw"),
+                        src_subnet_id=(None if ev.get("src_subnet_id") is None else int(ev.get("src_subnet_id"))),
+                    )
+                except Exception:
+                    return None
+            return None
+
+        events: List[TransferEvent] = []
+        if isinstance(events_raw, list):
+            for ev in events_raw:
+                coerced = _coerce(ev)
+                if coerced:
+                    events.append(coerced)
+
+        pretty.kv_panel("DBG: Events coerced → TransferEvent", [("#events", len(events))], style="bold cyan")
+        if VERBOSE_DUMPS and events:
+            show = []
+            for e in _head(events, 5):
+                show.append(
+                    {
+                        "blk": e.block,
+                        "src_ck": (e.src_coldkey[:8] + "…") if e.src_coldkey else None,
+                        "dst_ck": (e.dest_coldkey[:8] + "…") if e.dest_coldkey else None,
+                        "sid": e.subnet_id,
+                        "src_sid": e.src_subnet_id,
+                        "amt": e.amount_rao,
+                    }
+                )
+            pretty.log("[dim]" + _j(show) + (" …" if len(events) > 5 else "") + "[/dim]")
+        _pause("After scanning & coercing events")
+
         master_treasuries: Set[str] = {VALIDATOR_TREASURIES.get(s.get("hk", ""), s.get("t", "")) for s in clean_snapshots}
         uids_present: Set[int] = set()
         subnets_needed: Set[int] = set()
+        need_oracle = False  # NEW: only fetch prices/depths if some lines lack μTAO
 
-        # Collect UIDs present in payloads & all subnets referenced
+        # Collect UIDs present in payloads & all subnets referenced; detect μTAO presence
         for s in clean_snapshots:
             inv: Dict[str, Dict] = s.get("inv", {}) or {}
             for uid_s, inv_d in inv.items():
@@ -237,6 +365,18 @@ class SettlementEngine:
                 for ln in inv_d.get("ln", []) or []:
                     if isinstance(ln, list) and len(ln) >= 4:
                         subnets_needed.add(int(ln[0]))
+                        if len(ln) < 5:
+                            need_oracle = True  # fallback path required
+
+        pretty.kv_panel(
+            "DBG: Payload coverage",
+            [("#masters", len(clean_snapshots)),
+             ("#uids_present", len(uids_present)),
+             ("#subnets_needed", len(subnets_needed)),
+             ("need_oracle_fallback", str(need_oracle).lower())],
+            style="bold cyan",
+        )
+        _pause("After inventory normalization overview")
 
         # Build coldkey→uid map limited to present UIDs
         ck_to_uid: Dict[str, int] = {}
@@ -249,30 +389,76 @@ class SettlementEngine:
 
         # Sum α actually paid per (miner uid, treasury, subnet)
         paid_rao_by_uid_tre_sid: Dict[Tuple[int, str, int], int] = defaultdict(int)
+        dropped_cross_subnet = 0
+        dropped_forbidden = 0
+        dropped_not_master = 0
+        dropped_uid_missing = 0
+
         for ev in (events or []):
             try:
                 if ev.dest_coldkey not in master_treasuries:
+                    dropped_not_master += 1
                     continue
                 if ev.subnet_id in FORBIDDEN_ALPHA_SUBNETS:
+                    dropped_forbidden += 1
                     continue
                 uid = ck_to_uid.get(ev.src_coldkey)
                 if uid is None or uid not in uids_present:
+                    dropped_uid_missing += 1
                     continue
-                src_sid = getattr(ev, "src_subnet_id", ev.subnet_id)
+                src_sid = ev.src_subnet_id if getattr(ev, "src_subnet_id", None) is not None else ev.subnet_id
                 if src_sid != ev.subnet_id:
-                    # Guard against cross-subnet crediting
+                    dropped_cross_subnet += 1
                     continue
                 paid_rao_by_uid_tre_sid[(uid, ev.dest_coldkey, ev.subnet_id)] += int(ev.amount_rao)
             except Exception:
+                # ignore malformed event
                 continue
 
-        # ── 4) Price & depth caches ──
+        pretty.kv_panel(
+            "DBG: Paid α aggregation",
+            [
+                ("#paid_keys", len(paid_rao_by_uid_tre_sid)),
+                ("dropped_not_master", dropped_not_master),
+                ("dropped_forbidden", dropped_forbidden),
+                ("dropped_uid_missing", dropped_uid_missing),
+                ("dropped_cross_subnet", dropped_cross_subnet),
+            ],
+            style="bold cyan",
+        )
+        if VERBOSE_DUMPS and paid_rao_by_uid_tre_sid:
+            sample = []
+            for i, (k, v) in enumerate(paid_rao_by_uid_tre_sid.items()):
+                if i >= 6:
+                    break
+                uid, tre, sid = k
+                sample.append({"uid": uid, "tre": tre[:10] + "…", "sid": sid, "paid_rao": v})
+            pretty.log("[dim]paid sample: " + _j(sample) + (" …" if len(paid_rao_by_uid_tre_sid) > 6 else "") + "[/dim]")
+        _pause("After paid α aggregation")
+
+        # ── 4) Price & depth caches (only if needed) ──
         price_cache: Dict[int, float] = {}
         depth_cache: Dict[int, int] = {}
-        await self._populate_price_and_depth_caches(subnets_needed, start_block, end_block, price_cache, depth_cache)
+        if need_oracle:
+            pretty.rule("[bold cyan]DBG: ORACLE — PRICES & DEPTHS (fallback only)[/bold cyan]")
+            await self._populate_price_and_depth_caches(subnets_needed, start_block, end_block, price_cache, depth_cache)
+            pretty.kv_panel(
+                "DBG: Oracle snapshots",
+                [("#prices", len(price_cache)), ("#depths", len(depth_cache)),
+                 ("prices(sample)", _j(_kv_preview(price_cache, 5))),
+                 ("depths(sample)", _j(_kv_preview(depth_cache, 5)))],
+                style="bold cyan",
+            )
+            _pause("After oracle fill (fallback)")
 
-        # ── 5) Score miners (strict full-pay per subnet; split TAO across lines) ──
+        # ── 5) Score miners using stored line values ──
+        pretty.rule("[bold cyan]DBG: SCORING (use stored line values)[/bold cyan]")
+
         scores_by_uid: Dict[int, float] = defaultdict(float)
+        burn_total_value = 0.0  # track burned value if subnets unpaid
+
+        # Per-subnet outcome table (who got credit or not)
+        per_subnet_credit_rows: List[List[str | int | float]] = []
 
         for s in clean_snapshots:
             tre: str = s.get("t", "") or ""
@@ -284,38 +470,55 @@ class SettlementEngine:
                 except Exception:
                     continue
 
-                # Group lines by subnet: [sid, disc_bps, weight_bps, req_rao]
-                lines_by_sid: Dict[int, List[Tuple[int, int, int, int]]] = defaultdict(list)
+                # Group lines by subnet:
+                # normalized line shape now allows optional 5th element μTAO
+                # [sid, disc_bps, weight_bps, required_rao, value_mu?]
+                lines_by_sid: Dict[int, List[List[int]]] = defaultdict(list)
                 for ln in inv_d.get("ln", []) or []:
                     if not (isinstance(ln, list) and len(ln) >= 4):
                         continue
-                    sid = int(ln[0]); disc_bps = int(ln[1]); w_bps = int(ln[2]); req_rao = int(ln[3])
+                    sid2 = int(ln[0]); disc_bps = int(ln[1]); w_bps = int(ln[2]); req_rao = int(ln[3])
                     if req_rao > 0:
-                        lines_by_sid[sid].append((sid, disc_bps, w_bps, req_rao))
+                        # keep entire list to preserve optional μTAO (index 4)
+                        lines_by_sid[sid2].append([sid2, disc_bps, w_bps, req_rao] + ([int(ln[4])] if len(ln) >= 5 else []))
 
                 for sid, lines in lines_by_sid.items():
-                    required_rao_total = sum(req_rao for (_, _, _, req_rao) in lines)
+                    required_rao_total = sum(int(ln[3]) for ln in lines)
                     if required_rao_total <= 0:
                         continue
 
                     paid = int(paid_rao_by_uid_tre_sid.get((uid, tre, sid), 0))
-                    if paid < required_rao_total:
-                        # Not fully paid on this subnet → no credit
-                        continue
+                    got_credit = paid >= required_rao_total
+                    per_subnet_credit_rows.append([uid, tre[:8] + "…", sid, required_rao_total, paid, "OK" if got_credit else "NO"])
 
-                    # Convert the *required* α to TAO with slippage (aggregate then split)
-                    price = float(price_cache.get(sid, 0.0))
-                    depth = int(depth_cache.get(sid, 0))
-                    tao_for_required = self._rao_to_tao(required_rao_total, price, depth)
-                    if tao_for_required <= 0.0:
-                        continue
+                    # Walk each line; use stored μTAO if present; fallback compute if needed.
+                    for ln in lines:
+                        sid2, disc_bps, w_bps, req_rao = int(ln[0]), int(ln[1]), int(ln[2]), int(ln[3])
+                        val_mu = int(ln[4]) if len(ln) >= 5 else 0
 
-                    for (_sid, disc_bps, w_bps, req_rao) in lines:
-                        share = float(req_rao) / float(required_rao_total)
-                        line_tao = tao_for_required * share
-                        weight = max(0, min(10_000, w_bps)) / 10_000.0
-                        disc = 1.0 - (max(0, min(10_000, disc_bps)) / 10_000.0)
-                        scores_by_uid[uid] += line_tao * weight * disc
+                        if val_mu <= 0 and need_oracle:
+                            # Fallback: compute TAO value for this line using oracle and μTAO scaling.
+                            price = float(price_cache.get(sid2, 0.0))
+                            depth = int(depth_cache.get(sid2, 0))
+                            # effective_value_tao applies weight & discount already
+                            fallback_val = effective_value_tao(req_rao, w_bps, disc_bps, price, depth)
+                            val_mu = int(round(fallback_val * 1_000_000.0))
+
+                        val_tao = decode_value_mu(val_mu) if val_mu > 0 else 0.0
+                        if got_credit:
+                            scores_by_uid[uid] += val_tao
+                        else:
+                            burn_total_value += val_tao
+
+        # Show subnet credit summary table
+        if per_subnet_credit_rows:
+            pretty.table(
+                "[cyan]DBG: Subnet credit (per miner/subnet)[/cyan]",
+                ["UID", "Treasury", "Subnet", "α_required(rao)", "α_paid(rao)", "Credit?"],
+                per_subnet_credit_rows[: max(10, int(LOG_TOP_N))],
+            )
+            if len(per_subnet_credit_rows) > max(10, int(LOG_TOP_N)):
+                pretty.log(f"[dim]… +{len(per_subnet_credit_rows) - max(10, int(LOG_TOP_N))} more rows[/dim]")
 
         # ── 6) Produce final scores & set weights (or TESTING preview) ──
         miner_uids_all = list(self.parent.get_miner_uids())
@@ -330,6 +533,7 @@ class SettlementEngine:
 
         self._log_final_scores_table(final_scores, miner_uids_all, reason=burn_reason)
         self._log_weights_preview(final_scores, miner_uids_all, mode="burn-all" if burn_all else "normal")
+        _pause("Before applying weights (or preview in TESTING)")
 
         if burn_all and not TESTING:
             pretty.log(f"[red]Burn-all triggered – reason: {burn_reason}.[/red]")
@@ -354,6 +558,7 @@ class SettlementEngine:
                          ("snapshots_used", len(clean_snapshots)),
                          ("testing", str(TESTING).lower())],
                         style="bold green")
+        pretty.rule("[bold cyan]DBG: END SETTLEMENT[/bold cyan]")
 
     # ---------- helpers ----------
 
@@ -377,13 +582,18 @@ class SettlementEngine:
         """
         Normalize inventory shape to:
           inv = {
-            "<uid>": { "ck": "<coldkey>", "ln": [[sid, disc_bps, weight_bps, required_rao], ...] },
+            "<uid>": { "ck": "<coldkey>", "ln": [[sid, disc_bps, weight_bps, required_rao, value_mu?], ...] },
             ...
           }
-        Accepts legacy `i: [[uid, [[sid, weight_bps, required_rao, disc_bps?], ...]], ...]`.
+        Accepts legacy `i: [[uid, [[sid, weight_bps, required_rao, disc_bps?, value_mu?], ...]], ...]`.
         """
         inv: Dict[str, Dict] | None = s.get("inv")  # type: ignore[assignment]
         if isinstance(inv, dict) and inv:
+            if VERBOSE_DUMPS:
+                sample_uid = next(iter(inv.keys()), None)
+                pretty.kv_panel("DBG: inv pre-normalized (dict)",
+                                [("uids", len(inv)), ("sample_uid", str(sample_uid))],
+                                style="bold cyan")
             return inv
 
         inv_tmp: Dict[str, Dict] = {}
@@ -411,11 +621,22 @@ class SettlementEngine:
                         w_bps = int(ln[1])
                         rao = int(ln[2])
                         disc = int(ln[3]) if len(ln) >= 4 else 0
+                        val_mu = int(ln[4]) if len(ln) >= 5 else 0
                     except Exception:
                         continue
-                    # normalized line: [sid, disc_bps, weight_bps, required_rao]
-                    ln_list.append([sid, disc, w_bps, rao])
+                    # normalized line: [sid, disc_bps, weight_bps, required_rao, value_mu?]
+                    if val_mu:
+                        ln_list.append([sid, disc, w_bps, rao, val_mu])
+                    else:
+                        ln_list.append([sid, disc, w_bps, rao])
                 inv_tmp[str(uid_int)] = {"ck": ck, "ln": ln_list}
+
+        if VERBOSE_DUMPS and inv_tmp:
+            any_uid = next(iter(inv_tmp.keys()), None)
+            ln_samp = inv_tmp.get(any_uid, {}).get("ln", [])[:3]
+            pretty.kv_panel("DBG: inv normalized (legacy→dict)",
+                            [("#uids", len(inv_tmp)), ("sample_uid", str(any_uid)), ("sample_lines", _j(ln_samp))],
+                            style="bold cyan")
         return inv_tmp if inv_tmp else None
 
     async def _populate_price_and_depth_caches(
@@ -439,30 +660,15 @@ class SettlementEngine:
             except Exception:
                 return sid, 0
 
+        if not subnets_needed:
+            return
+
         price_pairs, depth_pairs = await asyncio.gather(
             asyncio.gather(*(_fetch_price(s) for s in sorted(subnets_needed))),
             asyncio.gather(*(_fetch_depth(s) for s in sorted(subnets_needed))),
         )
         price_cache_out.update(dict(price_pairs))
         depth_cache_out.update(dict(depth_pairs))
-
-    def _rao_to_tao(self, alpha_rao: int, price_tao_per_alpha: float, depth_rao: int) -> float:
-        """
-        Same slippage model as rewards. Kept local to avoid cross-module imports.
-        """
-        if alpha_rao <= 0 or depth_rao <= 0 or price_tao_per_alpha <= 0:
-            return 0.0
-        a = Decimal(alpha_rao)
-        d = Decimal(depth_rao)
-        price = Decimal(str(price_tao_per_alpha))
-        ratio = a / (d + a)
-        slip = K_SLIP_D * ratio
-        if slip <= SLIP_TOLERANCE_D:
-            slip = Decimal(0)
-        if slip > 1:
-            slip = Decimal(1)
-        tao = a * price * (Decimal(1) - slip) / _1e9
-        return float(tao)
 
     def _log_final_scores_table(self, scores: List[float], uids: List[int], reason: str | None = None):
         pairs = list(zip(uids, scores))
@@ -493,6 +699,7 @@ class SettlementEngine:
         pairs.sort(key=lambda x: x[1], reverse=True)
         top_n = max(1, int(LOG_TOP_N))
         rows = [[uid, f"{w:.6f}", f"{(w*100):.2f}%"] for uid, w in pairs[:top_n]]
+        # FIX: use f-string, not f(…)
         pretty.table(
             f"[magenta]WEIGHTS PREVIEW — mode={mode}[/magenta]",
             ["UID", "Weight", "% of total"],

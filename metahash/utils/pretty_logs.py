@@ -38,15 +38,30 @@ class Pretty:
         self.enable = bool(enable and _HAS_RICH)
         self.console = Console(log_path=False, highlight=False) if self.enable else None
 
+    # horizontal rule (NEW)
+    def rule(self, title: str = ""):
+        if self.enable and self.console is not None:
+            # allow rich markup in title
+            try:
+                self.console.rule(Text.from_markup(title) if Text else title)
+            except Exception:
+                self.console.rule(title)
+        else:
+            line = "─" * 60
+            if title:
+                print(f"{line} {title} {line}")
+            else:
+                print(f"{line*2}")
+
     # simple log passthrough
     def log(self, msg: str):
-        if self.enable:
+        if self.enable and self.console is not None:
             self.console.log(msg)
         else:
             print(msg)
 
     def banner(self, title: str, subtitle: str = "", style: str = "bold cyan"):
-        if self.enable:
+        if self.enable and self.console is not None:
             self.console.print(Panel.fit(Text(f"{title}\n{subtitle}", justify="center"), title="status", style=style))
         else:
             print(f"\n=== {title} ===")
@@ -54,7 +69,7 @@ class Pretty:
                 print(subtitle)
 
     def kv_panel(self, title: str, items: Iterable[Tuple[str, Any]], style: str = "bold"):
-        if self.enable:
+        if self.enable and self.console is not None:
             body = "\n".join([f"[white]{k}[/white]: {v}" for k, v in items])
             self.console.print(Panel(body, title=title, border_style=style))
         else:
@@ -64,8 +79,8 @@ class Pretty:
 
     def table(self, title: str, columns: List[str], rows: List[List[Any]], caption: str | None = None):
         rows = rows[:LOG_TOP_N]
-        if self.enable:
-            t = Table(title=title, box=box.MINIMAL_DOUBLE_HEAD, show_lines=False)
+        if self.enable and self.console is not None:
+            t = Table(title=title, box=box.MINIMAL_DOUBLE_HEAD if box else None, show_lines=False)
             for c in columns:
                 t.add_column(c)
             for r in rows:
