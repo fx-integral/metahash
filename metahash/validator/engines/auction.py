@@ -13,7 +13,7 @@ from metahash.validator.state import StateStore
 
 # Config constants
 from metahash.config import (AUCTION_BUDGET_ALPHA, AUCTION_START_TIMEOUT, LOG_TOP_N,
-    MAX_BIDS_PER_MINER, S_MIN_ALPHA_MINER, S_MIN_MASTER_VALIDATOR, START_V3_BLOCK)
+                             MAX_BIDS_PER_MINER, S_MIN_ALPHA_MINER, S_MIN_MASTER_VALIDATOR, START_V3_BLOCK)
 from metahash.protocol import AuctionStartSynapse
 
 EPS_ALPHA = 1e-12  # keep small epsilon for partial fill checks

@@ -126,8 +126,18 @@ class ClearingEngine:
     ) -> Dict[int, float]:
         sids = sorted({b.subnet_id for b in bids})
         out: Dict[int, float] = {}
+        # use a single client for the loop
+        try:
+            st = await self.parent._stxn()
+        except Exception:
+            st = None
         for sid in sids:
-            out[sid] = await self._safe_price(sid, start_block, end_block)
+            try:
+                p = await average_price(sid, start_block=start_block, end_block=end_block, st=st)
+                out[sid] = float(getattr(p, "tao", 0.0) or 0.0)
+            except Exception as e:
+                pretty.log(f"[yellow]Price lookup failed for sid={sid}: {e}[/yellow]")
+                out[sid] = 0.0
         return out
 
     async def _estimate_depths_for_bids(
@@ -135,13 +145,16 @@ class ClearingEngine:
     ) -> Dict[int, int]:
         sids = sorted({b.subnet_id for b in bids})
         out: Dict[int, int] = {}
+        try:
+            st = await self.parent._stxn()
+        except Exception:
+            st = None
         for sid in sids:
             try:
-                st = await self.parent._stxn()
                 d = await average_depth(sid, start_block=start_block, end_block=end_block, st=st)
                 out[sid] = int(d or 0)
-            except (asyncio.CancelledError, Exception) as e:
-                pretty.log(f"[yellow]Depth lookup failed/cancelled for sid={sid}: {e}[/yellow]")
+            except Exception as e:
+                pretty.log(f"[yellow]Depth lookup failed for sid={sid}: {e}[/yellow]")
                 out[sid] = 0
         return out
 
@@ -315,7 +328,7 @@ class ClearingEngine:
                 for ck in sorted(cap_tao_by_ck.keys())
             ]
             pretty.table("Reputation caps (TAO, per coldkey)",
-                        ["Coldkey", "Quota frac", "Cap TAO"], cap_rows)
+                         ["Coldkey", "Quota frac", "Cap TAO"], cap_rows)
 
         # 4) TAO-budget greedy allocator honoring per-CK TAO caps — WITH PARTIALS
         ordered = sorted(
