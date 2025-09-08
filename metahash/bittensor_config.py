@@ -1,5 +1,3 @@
-# metahash/bittensor_config.py
-
 from __future__ import annotations
 
 import sys
@@ -125,6 +123,13 @@ def add_miner_args(parser: argparse.ArgumentParser) -> None:
                         help="α amounts for each bid, e.g. 1000 500 200.")
     parser.add_argument("--miner.bids.discounts", nargs="+", type=str, default=[],
                         help="Discounts per bid: percent or bps tokens (e.g., 10 5 1000bps).")
+
+    # NEW: Origin hotkey selection for payments
+    parser.add_argument("--payment.validators", nargs="+", type=str, default=[],
+                        help="Round-robin pool of origin hotkeys (ss58) to use for α payments.")
+    parser.add_argument("--payment.map", nargs="+", type=str, default=[],
+                        help="Explicit subnet→hotkey mapping entries like '348:5G...abc'. "
+                             "Mapping takes precedence over --payment.validators.")
 
 
 # ──────────────────────── main entrypoint ───────────────────────── #
