@@ -1,4 +1,4 @@
-# neurons/validator.py – SN-73 v2.3.4 (modularized)
+# neurons/validator.py – SN-73 v2.3.4 (modularized, cleaned)
 from __future__ import annotations
 
 import asyncio
@@ -15,6 +15,7 @@ from metahash.config import (
     START_V3_BLOCK,
     EPOCH_LENGTH_OVERRIDE,
 )
+
 from metahash.utils.helpers import load_weights
 
 # Services / feature toggles
@@ -38,12 +39,12 @@ class Validator(EpochValidatorNeuron):
       • single-pass quotas by normalized reputation,
       • early winner notification, window recorded (pe, as, de),
       • v4 commitments: CID-only on-chain, full in IPFS,
-      • robust fallback: never publish inline payload > limit,
-      • settlement guarded; local pending payload as dev fallback when IPFS decode fails.
+      • commitment publisher: strict (no inline fallback or size checks),
+      • settlement guarded; optional local pending payload as dev fallback if IPFS fails.
 
-    NOTE in this build:
+    NOTE:
       • Clearing uses TAO budget (base subnet = this validator's netuid) and TAO-valued bids
-        = α * (1 - disc) * price_tao_per_alpha[subnet] * weight_fraction (with slippage on α).
+        = α × (1 − disc) × price_tao_per_alpha[subnet] × weight_fraction (with α-slippage).
     """
 
     def __init__(self, config=None):
@@ -70,9 +71,18 @@ class Validator(EpochValidatorNeuron):
 
         pretty.banner(
             f"Validator v{__version__} initialized",
-            f"hotkey={self.hotkey_ss58} | netuid={self.config.netuid} | epoch(e)={getattr(self, 'epoch_index', 0)}"
-            + (" | fresh" if getattr(self.config, "fresh", False) else "")
-            + (" | DRY-RUN weights" if DRYRUN_WEIGHTS else ""),
+            " | ".join(
+                filter(
+                    None,
+                    [
+                        f"hotkey={self.hotkey_ss58}",
+                        f"netuid={self.config.netuid}",
+                        f"epoch(e)={getattr(self, 'epoch_index', 0)}",
+                        "fresh" if getattr(self.config, "fresh", False) else "",
+                        "DRY-RUN weights" if DRYRUN_WEIGHTS else "",
+                    ],
+                )
+            ),
             style="bold magenta",
         )
 
@@ -131,14 +141,13 @@ class Validator(EpochValidatorNeuron):
         )
 
         # 1) WEIGHTS FIRST: settle older epoch (e−2)
-        # await self.settlement.settle_and_set_weights_all_masters(epoch_to_settle=e - 2)
+        await self.settlement.settle_and_set_weights_all_masters(epoch_to_settle=e - 2)
 
         # 2) Masters: broadcast & clear immediately (if master)
         if not self.auction._is_master_now() and getattr(self.auction, "_not_master_log_epoch", None) != e:
-            pretty.log("[yellow]validator is not a master so no biddings.[/yellow]")
+            pretty.log("[yellow]Validator is not a master — skipping broadcast/clear for this epoch.[/yellow]")
             self.auction._not_master_log_epoch = e
 
-        # Cancellation-safe broadcast; do not crash epoch loop on RPC cancellations
         try:
             await self.auction.broadcast_auction_start()
         except asyncio.CancelledError as ce:
@@ -147,24 +156,19 @@ class Validator(EpochValidatorNeuron):
         except Exception as exc:
             pretty.log(f"[yellow]AuctionStart failed: {exc}[/yellow]")
 
-        # # 3) Masters: publish previous epoch’s cleared winners (e−1)
-        # pretty.kv_panel(
-        #     "3. Publish commitments",
-        #     [("epoch_cleared (e−1)", e - 1), ("pay_epoch (pe)", "stored")],
-        #     style="bold cyan",
-        # )
-        # try:
-        #     await self.commitments.publish_commitment_for(epoch_cleared=e - 1)
-        # except asyncio.CancelledError as ce:
-        #     pretty.log(f"[yellow]Publish commitments cancelled by RPC: {ce}[/yellow]")
-        # except Exception as exc:
-        #     pretty.log(f"[yellow]Publish commitments failed: {exc}[/yellow]")
+        # 3) Publish previous epoch’s cleared winners (e−1)
+        try:
+            await self.commitments.publish_commitment_for(epoch_cleared=e - 1)
+        except asyncio.CancelledError as ce:
+            pretty.log(f"[yellow]Publish commitments cancelled by RPC: {ce}[/yellow]")
+        except Exception as exc:
+            pretty.log(f"[yellow]Publish commitments failed: {exc}[/yellow]")
 
         # cleanup bid books older than (e−1)
         self.auction.cleanup_old_epoch_books(before_epoch=e - 2)
 
 
-# ╭────────────────── keep-alive (optional) ───────────────────────────╮
+# ─────────────────────── keep-alive (optional) ───────────────────────
 if __name__ == "__main__":
     from metahash.bittensor_config import config
 

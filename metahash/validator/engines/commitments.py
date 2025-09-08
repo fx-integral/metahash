@@ -1,4 +1,4 @@
-# neurons/commitments.py
+# neurons/commitments.py — Strict v4 publisher (CID-only on-chain; full payload in IPFS)
 from __future__ import annotations
 
 import json
@@ -32,7 +32,7 @@ class CommitmentsEngine:
 
     async def publish_commitment_for(self, epoch_cleared: int):
         """
-        Publish winners payload for epoch (e - 1) that was cleared.
+        Publish winners payload for epoch (e − 1) that was cleared.
         Reads payload from state.pending_commits[str(epoch_cleared)] and does:
 
           1) IPFS: add the full payload as-is.
@@ -58,6 +58,19 @@ class CommitmentsEngine:
                 filename=f"commit_e{epoch_cleared}.json",
                 pin=True,
                 sort_keys=True,  # deterministic canonicalization for hash stability
+            )
+            # Helpful visibility on what we actually stored:
+            preview_inv = payload.get("inv") or payload.get("i")
+            pretty.kv_panel(
+                "Commit Payload (preview)",
+                [
+                    ("epoch", payload.get("e")),
+                    ("pay_epoch(pe)", payload.get("pe")),
+                    ("as", payload.get("as")),
+                    ("de", payload.get("de")),
+                    ("has_inv", str(bool(preview_inv)).lower()),
+                ],
+                style="bold cyan",
             )
         except IPFSError as ie:
             pretty.log(f"[yellow]IPFS publish failed (no fallback): {ie}[/yellow]")
@@ -108,7 +121,7 @@ class CommitmentsEngine:
     # ---------- utils ----------
     def _is_master_now(self) -> bool:
         """
-        Minimal master check: requires a known treasury for our hotkey and stake >= S_MIN_MASTER_VALIDATOR.
+        Minimal master check: requires a known treasury for our hotkey and stake ≥ S_MIN_MASTER_VALIDATOR.
         """
         tre = VALIDATOR_TREASURIES.get(self.parent.hotkey_ss58)
         if not tre:
