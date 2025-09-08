@@ -1,16 +1,20 @@
 # ╭────────────────────────────────────────────────────────────────────────╮
-# metahash/validator/rewards.py
+# metahash/validator/rewards.py — Simple monetary helpers + alloc utilities
+#
+#  • rao_to_tao_slippage(): convert α (rao) → TAO with a small slippage model
+#  • compute_epoch_rewards(): optional helper used elsewhere (unchanged signature)
+#  • Allocation helpers (BidInput / WinAllocation / allocate_bids, etc.) kept
+#    to avoid breaking AuctionEngine or other callers.
 # ╰────────────────────────────────────────────────────────────────────────╯
 
 from __future__ import annotations
 
 import asyncio
-import time
+import inspect
 from collections import defaultdict
 from dataclasses import dataclass
 from decimal import Decimal, getcontext
 from typing import (
-    Any,
     Callable,
     Dict,
     Iterable,
@@ -28,25 +32,23 @@ import bittensor as bt
 from metahash.config import (
     K_SLIP,
     SLIP_TOLERANCE,
-    FORBIDDEN_ALPHA_SUBNETS,
     AUCTION_BUDGET_ALPHA,
     PLANCK,
+    FORBIDDEN_ALPHA_SUBNETS,
 )
 
-# ↓ single authoritative event model
-from metahash.validator.alpha_transfers import TransferEvent
+# Authoritative on-chain transfer event model (scanner returns these)
+from metahash.validator.alpha_transfers import TransferEvent  # noqa: F401
 
 # ───────────────────────────── GLOBAL CONSTANTS ───────────────────────── #
 
-getcontext().prec = 60                          # 60‑digit arithmetic precision
-DECIMALS: Decimal = Decimal(10) ** 9            # planck scaling (1 α = 10^9 planck)
-
-# Keep monetary constants in Decimal space
+getcontext().prec = 60                          # high-precision arithmetic
+_1e9: Decimal = Decimal(10) ** 9                # 1 α = 1e9 planck(rao)
 K_SLIP_D: Decimal = Decimal(str(K_SLIP))
 SLIP_TOLERANCE_D: Decimal = Decimal(str(SLIP_TOLERANCE))
 
-# ──────────────────────────────── PROTOCOLS ───────────────────────────── #
 
+# ──────────────────────────────── PROTOCOLS ───────────────────────────── #
 
 @runtime_checkable
 class TransferScanner(Protocol):
@@ -55,8 +57,8 @@ class TransferScanner(Protocol):
 
 @runtime_checkable
 class BalanceLike(Protocol):
-    tao: float          # TAO price of 1 α
-    rao: int | None     # current pool depth (planck)
+    tao: float          # TAO price of 1 α
+    rao: int | None     # optional: current pool depth (planck)
 
 
 @runtime_checkable
@@ -74,206 +76,40 @@ class MinerResolver(Protocol):
     async def __call__(self, coldkey: str) -> int | None: ...
 
 
-# ──────────────────────────────── MODEL ───────────────────────────────── #
+# ────────────────────────────── MONETARY CORE ─────────────────────────── #
 
-@dataclass(slots=True)
-class AlphaDeposit:
+def rao_to_tao_slippage(alpha_rao: int, price_tao_per_alpha: float | Decimal, depth_rao: int) -> float:
     """
-    Intermediate representation: aggregated α coming **into the treasury**
-    from a single cold‑key on a single subnet during an epoch.
+    Convert a *raw* α amount (in rao/planck) into TAO after slippage:
+        slip = K_SLIP * (α / (depth + α))
+        TAO = α * price * (1 - slip)
+    A tiny slip under SLIP_TOLERANCE is ignored for stability.
     """
-    coldkey: str          # origin miner cold‑key
-    subnet_id: int
-    alpha_raw: int
+    if alpha_rao <= 0 or depth_rao <= 0:
+        return 0.0
 
-    # Runtime‑enriched fields
-    miner_uid: int | None = None
-    avg_price: Decimal | None = None
-    tao_value: Decimal | None = None
-    tao_value_post_slip: Decimal | None = None
+    price = Decimal(str(price_tao_per_alpha))
+    if price <= 0:
+        return 0.0
 
-    # Convenience ------------------------------------------------------ #
-    def merge_from(self, other: "AlphaDeposit") -> None:
-        self.alpha_raw += other.alpha_raw
-
-    def __repr__(self) -> str:
-        return (
-            f"AlphaDeposit(coldkey={self.coldkey!r}, uid={self.miner_uid}, "
-            f"subnet={self.subnet_id}, α_raw={self.alpha_raw}, "
-            f"tao_post_slip={self.tao_value_post_slip})"
-        )
-
-# ────────────────────────────── HELPERS ───────────────────────────────── #
-
-
-def _apply_slippage(alpha_raw: int, price: Decimal, depth_rao: int) -> Decimal:
-    """
-    Convert raw α (planck) to **post‑slippage TAO**.
-    All arithmetic is done in Decimal space.
-    """
-    if depth_rao <= 0:
-        return Decimal(0)
-
-    ratio = Decimal(alpha_raw) / (Decimal(depth_rao) + Decimal(alpha_raw))
+    a = Decimal(alpha_rao)
+    d = Decimal(depth_rao)
+    ratio = a / (d + a)
     slip = K_SLIP_D * ratio
-
     if slip <= SLIP_TOLERANCE_D:
         slip = Decimal(0)
-    slip = min(slip, Decimal(1))
+    if slip > 1:
+        slip = Decimal(1)
 
-    return Decimal(alpha_raw) * price * (Decimal(1) - slip) / DECIMALS
-
-# ╭──────────────────────── PHASE 0 – COMBINE ─────────────────────────────╯
-
-
-def _combine_deposits_by_miner_subnet(
-    deposits: List[AlphaDeposit],
-) -> List[AlphaDeposit]:
-    """
-    Aggregate raw α per **(miner_uid | coldkey, subnet)**.
-
-    Unknown miners get bucketed by cold‑key so we don’t accidentally merge
-    unrelated addresses under a single `(None, subnet)` key.
-    """
-    merged: Dict[Tuple[str | int, int], AlphaDeposit] = {}
-    for d in deposits:
-        uid_or_ck: str | int = d.miner_uid if d.miner_uid is not None else d.coldkey
-        k = (uid_or_ck, d.subnet_id)
-        if k in merged:
-            merged[k].merge_from(d)
-        else:
-            merged[k] = d
-    return list(merged.values())
-
-# ╭──────────────────────────── CAST EVENTS ───────────────────────────────╯
+    tao = a * price * (Decimal(1) - slip) / _1e9
+    return float(tao)
 
 
-def cast_events(events: Sequence[TransferEvent]) -> List[AlphaDeposit]:
-    """
-    Convert TransferEvents → AlphaDeposits, *dropping* any event whose
-    destination subnet is listed in `FORBIDDEN_ALPHA_SUBNETS`.
-    """
-    kept: List[AlphaDeposit] = []
-    dropped = 0
-    for ev in events:
-        if ev.subnet_id in FORBIDDEN_ALPHA_SUBNETS:
-            dropped += 1
-            continue
-        kept.append(
-            AlphaDeposit(
-                coldkey=ev.src_coldkey,
-                subnet_id=ev.subnet_id,
-                alpha_raw=ev.amount_rao,
-            )
-        )
-    if dropped:
-        bt.logging.debug(
-            f"[rewards] {dropped} α‑transfers ignored "
-            f"(forbidden subnets: {FORBIDDEN_ALPHA_SUBNETS})"
-        )
-    return kept
-
-# ╭────────────────────────────── PHASE 1 ─────────────────────────────────╯
-
-
-async def scan_transfers(
-    *, scanner: TransferScanner, from_block: int, to_block: int
-) -> List[TransferEvent]:
-    return await scanner.scan(from_block, to_block)
-
-# ╭────────────────────────────── PHASE 2 ─────────────────────────────────╯
-# (no dedicated phase 2 – handled in cast/resolve)
-
-# ╭────────────────────────────── PHASE 3 ─────────────────────────────────╯
-
-
-async def resolve_miners(
-    deposits: List[AlphaDeposit], *, uid_of_coldkey: MinerResolver
-) -> None:
-    """
-    Fill `miner_uid` field by mapping cold‑keys → UIDs.
-    Unknown miners stay as `None` and will have their α burned silently.
-    """
-    coldkeys = {d.coldkey for d in deposits}
-    cache = {ck: await uid_of_coldkey(ck) for ck in coldkeys}
-    for d in deposits:
-        d.miner_uid = cache[d.coldkey]
-
-# ╭────────────────────────────── PHASE 4 ─────────────────────────────────╯
-
-
-async def attach_prices(
-    deposits: List[AlphaDeposit],
-    *,
-    pricing: PricingProvider,
-    epoch_start: int,
-    epoch_end: int,
-) -> None:
-    if not deposits:
-        return
-
-    subnets = {d.subnet_id for d in deposits}
-    price_cache: Dict[int, Decimal] = {}
-    for sid in subnets:
-        p = await pricing(sid, epoch_start, epoch_end)
-        if p is None or p.tao is None:
-            raise RuntimeError(f"Price oracle returned None for subnet {sid}")
-        price_cache[sid] = Decimal(str(p.tao))
-
-    bt.logging.debug(f"[rewards] price_cache: {price_cache}")
-
-    for d in deposits:
-        price = price_cache[d.subnet_id]
-        d.avg_price = price
-        d.tao_value = Decimal(d.alpha_raw) * price / DECIMALS
-
-# ╭────────────────────────────── PHASE 5 ─────────────────────────────────╯
-
-
-async def apply_slippage(
-    deposits: List[AlphaDeposit], *, pool_depth_of: PoolDepthProvider
-) -> None:
-    if not deposits:
-        return
-
-    subnets = {d.subnet_id for d in deposits}
-
-    async def _gather(sid: int) -> Tuple[int, int]:
-        return sid, await pool_depth_of(sid)
-
-    depth_pairs = await asyncio.gather(*(_gather(s) for s in subnets))
-    depth_cache = dict(depth_pairs)
-    bt.logging.debug(f"[rewards] depth_cache: {depth_cache}")
-
-    for d in deposits:
-        depth = depth_cache[d.subnet_id]
-        d.tao_value_post_slip = _apply_slippage(
-            d.alpha_raw, d.avg_price, depth
-        )
-
-# ╭────────────────────────────── PHASE 6 ─────────────────────────────────╯
-
-
-def _aggregate_post_slip_tao(
-    deposits: Iterable[AlphaDeposit],
-) -> Dict[int, Decimal]:
-    """
-    Map of {uid → post‑slippage TAO}.  
-    Deposits whose miner UID could not be resolved are **ignored**.
-    """
-    by_uid: Dict[int, Decimal] = {}
-    for d in deposits:
-        if d.miner_uid is None:
-            continue
-        if d.tao_value_post_slip is None:
-            continue
-        by_uid[d.miner_uid] = (
-            by_uid.get(d.miner_uid, Decimal(0)) + d.tao_value_post_slip
-        )
-    return by_uid
-
-# ╭────────────────────────────── PIPELINE ────────────────────────────────╯
-
+# ╭────────────────────────────── PIPELINE (optional) ─────────────────────╮
+# This preserves the original signature so other code can keep using it.
+# It simply aggregates α paid per (uid, subnet), applies price+depth slippage,
+# and returns a TAO value list aligned to `miner_uids`.
+# ╰────────────────────────────────────────────────────────────────────────╯
 
 async def compute_epoch_rewards(
     *,
@@ -287,115 +123,99 @@ async def compute_epoch_rewards(
     pool_depth_of: PoolDepthProvider,
     log: Callable[[str], None] | None = None,
 ) -> List[float]:
-    """
-    Calculate **post‑slippage TAO rewards** for each `miner_uid`.
-
-    Parameters
-    ----------
-    miner_uids
-        Order of miners that must appear in the output list.
-    start_block / end_block
-        Inclusive block range to inspect.
-
-    Returns
-    -------
-    List[float]
-        Post‑slippage TAO amounts per miner **as native floats**
-        (aligned with `miner_uids`).
-    """
-
-    # 1. TRANSFER COLLECTION ------------------------------------------- #
-    if events is not None:
-        raw = list(events)
-        bt.logging.debug(
-            f"[rewards] Using {len(raw)} injected transfer event(s) "
-            f"for blocks {start_block}-{end_block}"
-        )
-    else:
+    # 1) Get events
+    if events is None:
         if scanner is None:
             raise ValueError("compute_epoch_rewards: need either events or scanner")
-        bt.logging.debug(
-            f"[rewards] Scanning transfers on‑chain "
-            f"({start_block}-{end_block})…"
-        )
-        t0 = time.time()
-        raw = await scan_transfers(
-            scanner=scanner,
-            from_block=start_block,
-            to_block=end_block,
-        )
-        bt.logging.debug(f"[rewards] scan finished in {time.time() - t0:.2f}s")
+        raw = await scanner.scan(from_block=start_block, to_block=end_block)
+    else:
+        raw = list(events)
 
-    # 2. CAST ----------------------------------------------------------- #
-    deposits = cast_events(raw)
-    bt.logging.debug(f"[rewards] deposits(after cast): {deposits}")
+    # 2) Filter forbidden subnets
+    kept: List[TransferEvent] = [ev for ev in raw if ev.subnet_id not in FORBIDDEN_ALPHA_SUBNETS]
 
-    # 3. RESOLVE MINERS ------------------------------------------------- #
-    await resolve_miners(deposits, uid_of_coldkey=uid_of_coldkey)
+    # 3) Resolve coldkeys → UIDs (accept sync or async resolvers)
+    coldkeys = {ev.src_coldkey for ev in kept}
 
-    # 4. COMBINE -------------------------------------------------------- #
-    deposits = _combine_deposits_by_miner_subnet(deposits)
+    async def _resolve(ck: str) -> Tuple[str, Optional[int]]:
+        res = uid_of_coldkey(ck)
+        if inspect.isawaitable(res):
+            return ck, await res  # type: ignore[arg-type]
+        return ck, res  # type: ignore[return-value]
 
-    # 5. PRICE ---------------------------------------------------------- #
-    await attach_prices(
-        deposits,
-        pricing=pricing,
-        epoch_start=start_block,
-        epoch_end=end_block,
+    pairs = await asyncio.gather(*(_resolve(ck) for ck in coldkeys))
+    uid_by_ck: Dict[str, Optional[int]] = dict(pairs)
+
+    # 4) Aggregate α by (uid, subnet)
+    rao_by_uid_sid: Dict[Tuple[int, int], int] = defaultdict(int)
+    for ev in kept:
+        uid = uid_by_ck.get(ev.src_coldkey)
+        if uid is None:
+            continue
+        rao_by_uid_sid[(uid, ev.subnet_id)] += int(ev.amount_rao)
+
+    if not rao_by_uid_sid:
+        return [0.0 for _ in miner_uids]
+
+    # 5) Price & depth caches
+    subnets: Set[int] = {sid for (_, sid) in rao_by_uid_sid.keys()}
+
+    async def _fetch_price(sid: int) -> Tuple[int, float]:
+        p = await pricing(sid, start_block, end_block)
+        val = float(getattr(p, "tao", 0.0) or 0.0)
+        return sid, val
+
+    async def _fetch_depth(sid: int) -> Tuple[int, int]:
+        try:
+            return sid, int(await pool_depth_of(sid))
+        except Exception:
+            return sid, 0
+
+    price_pairs, depth_pairs = await asyncio.gather(
+        asyncio.gather(*(_fetch_price(s) for s in subnets)),
+        asyncio.gather(*(_fetch_depth(s) for s in subnets)),
     )
+    price_cache = dict(price_pairs)   # sid -> float
+    depth_cache = dict(depth_pairs)   # sid -> int
 
-    # 6. SLIPPAGE ------------------------------------------------------- #
-    await apply_slippage(deposits, pool_depth_of=pool_depth_of)
+    # 6) Convert to TAO with slippage and sum per uid
+    tao_by_uid: Dict[int, float] = defaultdict(float)
+    for (uid, sid), rao in rao_by_uid_sid.items():
+        price = price_cache.get(sid, 0.0)
+        depth = depth_cache.get(sid, 0)
+        tao_by_uid[uid] += rao_to_tao_slippage(rao, price, depth)
 
-    # 7. AGGREGATE ------------------------------------------------------ #
-    rewards_dec = _aggregate_post_slip_tao(deposits)
-    bt.logging.debug(f"[rewards] value_per_miner_dict: {rewards_dec}")
-
-    # 8. BUILD FLOAT LIST ---------------------------------------------- #
-    rewards_list_float: List[float] = [
-        float(rewards_dec.get(uid, Decimal(0))) for uid in miner_uids
-    ]
-    total_value = sum(rewards_list_float)
-    bt.logging.debug(f"[rewards] total_value: {total_value}")
-    bt.logging.debug(f"[rewards] rewards_list_float: {rewards_list_float}")
-
-    return rewards_list_float
+    # 7) List aligned to miner_uids
+    return [float(tao_by_uid.get(uid, 0.0)) for uid in miner_uids]
 
 
-# ╭──────────────────────────── Allocation Utils ──────────────────────────╯
+# ╭──────────────────────── Allocation / Budget Helpers ───────────────────╮
+# Kept intact (or near-intact) to avoid breaking other engines.
+# ╰────────────────────────────────────────────────────────────────────────╯
 
 @dataclass(slots=True, frozen=True)
 class BidInput:
-    """
-    Minimal, serializable bid shape used by allocation helpers.
-    """
     miner_uid: int
     coldkey: str
     subnet_id: int
-    alpha: float                # α requested for this line
-    discount_bps: int           # valuation discount in bps (affects ordering/valuation only)
-    weight_bps: int             # subnet weight in bps (0..10_000)
-    idx: int = 0                # stable, per-miner ordering
+    alpha: float                # requested α (in α units, not rao)
+    discount_bps: int           # 0..10_000
+    weight_bps: int             # 0..10_000
+    idx: int = 0                # stable per-miner ordering
 
 
 @dataclass(slots=True)
 class WinAllocation:
-    """
-    A winning allocation after capping and budget constraints are applied.
-    """
     miner_uid: int
     coldkey: str
     subnet_id: int
-    alpha_requested: float      # requested α
-    alpha_accepted: float       # α actually accepted (may be truncated)
+    alpha_requested: float
+    alpha_accepted: float
     discount_bps: int
     weight_bps: int
 
 
 def budget_from_share(*, share: float, auction_budget_alpha: float = AUCTION_BUDGET_ALPHA) -> float:
-    """
-    Compute this validator's α budget from its share among master validators.
-    """
     if share <= 0:
         return 0.0
     return auction_budget_alpha * float(share)
@@ -407,9 +227,6 @@ def compute_budget_share(
     total_master_stake: float,
     auction_budget_alpha: float = AUCTION_BUDGET_ALPHA,
 ) -> tuple[float, float]:
-    """
-    Return (share, budget_α) given my stake and the total active masters' stake.
-    """
     if my_stake <= 0 or total_master_stake <= 0:
         return 0.0, 0.0
     share = float(my_stake) / float(total_master_stake)
@@ -417,46 +234,11 @@ def compute_budget_share(
 
 
 def calc_required_rao(alpha: float, discount_bps: int, *, planck: int = PLANCK) -> int:
-    """
-    Amount a miner must pay for an accepted line **(discount does NOT reduce payment)**.
-    Discount only reduces **valuation** for selection/ordering.
-    """
-    _ = discount_bps  # ignored by design
+    _ = discount_bps  # discount does not reduce payment owed
     return int(round(float(alpha) * float(planck)))
 
 
-def caps_by_reputation_for_bids(
-    bids: Iterable[BidInput],
-    *,
-    my_budget_alpha: float,
-    reputation: Mapping[str, float],
-    baseline_cap_frac: float,
-    max_cap_frac: float,
-) -> dict[str, float]:
-    """
-    Per-coldkey α caps derived from reputation for exactly the coldkeys present in `bids`.
-    """
-    caps: dict[str, float] = {}
-    bcf = float(baseline_cap_frac)
-    mcf = float(max_cap_frac)
-    for b in bids:
-        R = float(reputation.get(b.coldkey, 0.0))
-        R = max(0.0, min(1.0, R))
-        cap_frac = bcf + R * (mcf - bcf)
-        cap_frac = max(bcf, min(mcf, cap_frac))
-        caps[b.coldkey] = my_budget_alpha * cap_frac
-    return caps
-
-
 def _bid_order_key(b: BidInput) -> tuple:
-    """
-    Deterministic order by **per‑unit value**:
-      per_unit_value = weight × (1 − discount)
-
-      1) higher per‑unit value first,
-      2) larger α (to reduce fragmentation),
-      3) earlier index.
-    """
     per_unit_value = (b.weight_bps / 10_000.0) * (1.0 - b.discount_bps / 10_000.0)
     return (-per_unit_value, -float(b.alpha), int(b.idx))
 
@@ -468,19 +250,11 @@ def allocate_bids(
     cap_alpha_by_ck: Mapping[str, float] | None = None,
 ) -> tuple[List[WinAllocation], float, dict]:
     """
-    Greedy, deterministic allocation that:
-      • First pass respects per‑CK caps (reputation).
-      • If caps leave budget unused, a **second pass** ignores caps so the
-        budget is fully utilized (prevents low‑rep miners from being starved
-        when there’s no competition or equal reputations).
-
-    Returns
-    -------
-    wins, budget_left, debug
+    Deterministic greedy allocation with optional per‑CK caps and a
+    second pass to utilize leftover budget.
     """
     ordered = sorted(bids, key=_bid_order_key)
 
-    # Build debug structure
     def _pua(b: BidInput) -> float:
         return (b.weight_bps / 10_000.0) * (1.0 - b.discount_bps / 10_000.0)
 
@@ -499,19 +273,19 @@ def allocate_bids(
         "pass2_takes": [],
     }
 
-    # Internal aggregation so a single bid can be partially filled across passes
-    def _bid_key(b: BidInput) -> tuple:
-        return (b.miner_uid, b.coldkey, b.subnet_id, b.discount_bps, b.weight_bps, b.idx)
-
-    allocated_by_ck: dict[str, float] = defaultdict(float)
-    taken_by_bid: dict[tuple, float] = defaultdict(float)
+    from collections import defaultdict as _dd
+    allocated_by_ck: dict[str, float] = _dd(float)
+    taken_by_bid: dict[tuple, float] = _dd(float)
     alloc_by_key: dict[tuple, WinAllocation] = {}
 
-    def _take_from_bids(pass_caps: Mapping[str, float] | None, budget: float, pass_name: str) -> float:
+    def _key(b: BidInput) -> tuple:
+        return (b.miner_uid, b.coldkey, b.subnet_id, b.discount_bps, b.weight_bps, b.idx)
+
+    def _take(pass_caps: Mapping[str, float] | None, budget: float, pass_name: str) -> float:
         for b in ordered:
             if budget <= 0:
                 break
-            key = _bid_key(b)
+            key = _key(b)
             remaining = float(b.alpha) - taken_by_bid.get(key, 0.0)
             if remaining <= 0:
                 continue
@@ -556,163 +330,29 @@ def allocate_bids(
             })
         return budget
 
-    # Pass 1 — respect caps
     budget = float(my_budget_alpha)
-    budget = _take_from_bids(cap_alpha_by_ck or {}, budget, "pass1")
+    budget = _take(cap_alpha_by_ck or {}, budget, "pass1")
     debug["budget_after_pass1"] = float(budget)
 
-    # Pass 2 — if any budget remains, ignore caps entirely
-    if budget > 0.0:
-        budget = _take_from_bids(None, budget, "pass2")
+    if budget > 0:
+        budget = _take(None, budget, "pass2")
     debug["budget_after_pass2"] = float(budget)
 
     wins: List[WinAllocation] = list(alloc_by_key.values())
     return wins, budget, debug
 
 
-def build_pending_commitment(
-    wins: Iterable[WinAllocation],
-    *,
-    epoch_cleared: int,
-    treasury_coldkey: str,
-    stake_snapshot_block: int,
-    planck: int = PLANCK,
-) -> dict[str, Any]:
-    """
-    Produce the exact pending commitment payload used later when publishing.
-    NOTE: required_rao is **full accepted α** (no discount).
-    """
-    inv: dict[str, dict[str, Any]] = {}
-    for w in wins:
-        uid_key = str(int(w.miner_uid))
-        if uid_key not in inv:
-            inv[uid_key] = {"ck": w.coldkey, "ln": []}
-        req_rao = calc_required_rao(w.alpha_accepted, w.discount_bps, planck=planck)
-        inv[uid_key]["ln"].append(
-            [
-                int(w.subnet_id),
-                int(w.discount_bps),
-                int(w.weight_bps),
-                int(req_rao),
-            ]
-        )
-    return {
-        "e": int(epoch_cleared),
-        "t": str(treasury_coldkey),
-        "inv": inv,
-        "st_blk": int(stake_snapshot_block),
-        # ("pe", "as", "de") are attached at publish time by validator.
-    }
-
-
-# ───────── settlement: commitments + payments → per‑UID value/burn/offenders ────── #
-
-def _line_fill_order_key(ln_tuple: tuple[int, int, int, int, int]) -> tuple[float, int, int]:
-    """
-    Sorting key for commitment invoice lines within a subnet:
-      - **higher effective value first**: weight × (1 − discount),
-      - larger required RAO next (cover bigger full‑α lines),
-      - earlier index last.
-
-    (Discount reduces valuation; it does not reduce payment.)
-    """
-    sid, disc_bps, w_bps, req_rao_paid, idx = ln_tuple
-    score = (w_bps / 10_000.0) * (1.0 - disc_bps / 10_000.0)
-    return (score, req_rao_paid, -idx)
-
-
-def evaluate_commitment_snapshots(
-    *,
-    snapshots: Sequence[dict],
-    rao_by_uid_dest_subnet: Mapping[tuple[int, str, int], int],
-    tao_by_uid_dest_subnet: Mapping[tuple[int, str, int], float],
-    price_cache: Mapping[int, float],
-    planck: int = PLANCK,
-) -> tuple[
-    dict[int, float],       # scores_by_uid
-    float,                  # burn_total_value
-    Set[str],               # offenders_nopay
-    Set[str],               # offenders_partial
-    dict[str, float],       # paid_effective_by_ck
-]:
-    """
-    Core **reward calculation** used at settlement:
-    takes the published commitment snapshots and the actually‑paid transfers
-    → returns per‑UID TAO value, burn amount, and offender sets.
-    """
-    scores_by_uid: Dict[int, float] = defaultdict(float)
-    burn_total_value: float = 0.0
-    offenders_nopay: Set[str] = set()
-    offenders_partial: Set[str] = set()
-    paid_effective_by_ck: Dict[str, float] = defaultdict(float)
-
-    for s in snapshots:
-        tre = s.get("t", "")
-        inv = s.get("inv", {})
-        for uid_s, inv_d in inv.items():
-            try:
-                uid = int(uid_s)
-            except Exception:
-                continue
-
-            ck = inv_d.get("ck")
-            by_subnet: Dict[int, List[tuple[int, int, int, int, int]]] = defaultdict(list)
-            for idx_line, ln in enumerate(inv_d.get("ln", [])):
-                if not (isinstance(ln, list) and len(ln) >= 4):
-                    continue
-                sid, disc_bps, w_bps, req_rao_paid = int(ln[0]), int(ln[1]), int(ln[2]), int(ln[3])
-                by_subnet[sid].append((sid, disc_bps, w_bps, req_rao_paid, idx_line))
-
-            coldkey_any_paid = False
-            coldkey_uncovered_exists = False
-
-            for sid, lines in by_subnet.items():
-                paid_rao_total = int(rao_by_uid_dest_subnet.get((uid, tre, sid), 0))
-                tao_total = float(tao_by_uid_dest_subnet.get((uid, tre, sid), 0.0))
-
-                lines.sort(key=_line_fill_order_key, reverse=True)
-                remain = paid_rao_total
-                covered: List[tuple[int, int, int, int, int]] = []
-                uncovered: List[tuple[int, int, int, int, int]] = []
-
-                for ln_t in lines:
-                    _, _, _, req_rao_paid, _ = ln_t
-                    if remain >= req_rao_paid:
-                        covered.append(ln_t)
-                        remain -= req_rao_paid
-                        coldkey_any_paid = True
-                    else:
-                        uncovered.append(ln_t)
-                        if req_rao_paid > 0:
-                            coldkey_uncovered_exists = True
-
-                if paid_rao_total > 0 and tao_total > 0 and covered:
-                    tao_per_rao = tao_total / float(paid_rao_total)
-                else:
-                    tao_per_rao = 0.0
-
-                # Covered lines → value credited = TAO_paid(line) × subnet_weight
-                for sid2, disc_bps, w_bps, req_rao_paid, _ in covered:
-                    line_tao = tao_per_rao * float(req_rao_paid) if tao_per_rao > 0 else 0.0
-                    eff = line_tao * (w_bps / 10_000.0)
-                    scores_by_uid[uid] += eff
-                    if ck:
-                        paid_effective_by_ck[ck] += eff
-
-                # Uncovered lines → full line value is burned (fallback to price cache if needed)
-                for sid2, disc_bps, w_bps, req_rao_paid, _ in uncovered:
-                    if tao_per_rao > 0:
-                        line_tao = tao_per_rao * float(req_rao_paid)
-                    else:
-                        price = float(price_cache.get(sid2, 0.0))
-                        line_tao = price * (float(req_rao_paid) / float(planck))
-                    eff_burn = line_tao * (w_bps / 10_000.0)
-                    burn_total_value += eff_burn
-
-            if ck:
-                if not coldkey_any_paid:
-                    offenders_nopay.add(ck)
-                elif coldkey_uncovered_exists:
-                    offenders_partial.add(ck)
-
-    return dict(scores_by_uid), float(burn_total_value), offenders_nopay, offenders_partial, dict(paid_effective_by_ck)
+__all__ = [
+    "TransferEvent",
+    "PricingProvider",
+    "PoolDepthProvider",
+    "MinerResolver",
+    "rao_to_tao_slippage",
+    "compute_epoch_rewards",
+    "BidInput",
+    "WinAllocation",
+    "budget_from_share",
+    "compute_budget_share",
+    "calc_required_rao",
+    "allocate_bids",
+]

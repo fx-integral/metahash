@@ -1,11 +1,5 @@
 # ====================================================================== #
 #  metahash/validator/alpha_transfers.py                                 #
-#  Patched 2025-07-12 – forbid non-transfer extrinsics                   #
-#  Patched 2025-07-13 – enable live whitelist & single‑pass scanner      #
-#                           • robust extrinsic filter (_allowed_…)       #
-#                           • close cross‑subnet α‑swap loophole          #
-#                           • single‑pass _accumulate (≈20 % faster)      #
-#                           • keep API 100 % backward‑compatible          #
 # ====================================================================== #
 
 from __future__ import annotations

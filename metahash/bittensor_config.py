@@ -6,9 +6,7 @@ import sys
 import subprocess
 import argparse
 from pathlib import Path
-
 import bittensor as bt
-from metahash.config import PLANCK  # noqa: F401
 
 
 # ───────────────────────── utilities ───────────────────────── #
@@ -88,6 +86,14 @@ def add_validator_args(parser: argparse.ArgumentParser) -> None:
                         help="Enable mock mode (no real chain calls).")
     parser.add_argument("--neuron.moving_average_alpha", type=float, default=1.0,
                         help="Moving average alpha parameter for validator rewards blending.")
+
+    # We dissable autmatic set weitghts
+    parser.add_argument(
+        "--neuron.disable_set_weights",
+        action="store_true",
+        help="Disables setting weights.",
+        default=True,
+    )
 
 
 def add_miner_args(parser: argparse.ArgumentParser) -> None:

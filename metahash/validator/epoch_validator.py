@@ -1,5 +1,6 @@
 # ╭──────────────────────────────────────────────────────────────────────╮
 # metahash/validator/epoch_validator.py                                  #
+# (v2.3 + EPOCH_LENGTH_OVERRIDE support + TESTING bootstrap forward)     #
 # ╰──────────────────────────────────────────────────────────────────────╯
 from __future__ import annotations
 
@@ -8,91 +9,111 @@ from datetime import datetime
 from typing import Optional, Tuple
 
 import bittensor as bt
-from bittensor import BLOCKTIME  # 12 s on Finney
+from bittensor import BLOCKTIME  # 12 s on Finney
 
 from metahash.base.validator import BaseValidatorNeuron
+from metahash.config import EPOCH_LENGTH_OVERRIDE, TESTING
 
 
 class EpochValidatorNeuron(BaseValidatorNeuron):
-    """Validator base‑class with robust epoch rollover handling.
+    """Validator base-class with robust epoch rollover handling.
 
-    *Does not change the definition of epoch start/end – only how we wait
-    for the next head so `forward()` is triggered in the very first
-    blocks of every epoch.*
+    This version additionally honors `EPOCH_LENGTH_OVERRIDE` from
+    `metahash.config`. When > 0, epoch length and the wait loop are driven
+    by the override (e.g., 10 blocks) instead of the chain's tempo.
+    This lets you test full e/e+1/e+2 flows quickly.
+
+    ⚠️ Note: With overrides you are *not* aligned to real chain epoch heads.
+    If you try to call `set_weights()` outside real heads, the chain will
+    reject it. When `TESTING=True`, you should also configure the validator
+    to avoid on-chain `set_weights` (e.g., via `config.no_epoch=True`).
     """
 
-    # ------------------------------------------------------------------ #
     def __init__(self, *args, log_interval_blocks: int = 2, **kwargs):
         super().__init__(*args, **kwargs)
         self._log_interval_blocks = max(1, int(log_interval_blocks))
-        self._epoch_len: Optional[int] = None  # recalculated each epoch
-        self.epoch_end_block: Optional[int] = None  # cached for waiter
+        self._epoch_len: Optional[int] = None
+        self.epoch_end_block: Optional[int] = None
+        self._override_active: bool = False
+        self._bootstrapped: bool = False  # run forward immediately if TESTING
 
     # ----------------------- helpers ---------------------------------- #
     def _discover_epoch_length(self) -> int:
-        """Return the real epoch length, compensating for historical
-        tempo + 1 bug. Re‑evaluated at every head."""
+        try:
+            override = int(EPOCH_LENGTH_OVERRIDE or 0)
+        except Exception:
+            override = 0
+
+        if override > 0:
+            self._override_active = True
+            length = max(1, override)
+            if self._epoch_len != length:
+                bt.logging.info(
+                    f"[epoch] using EPOCH_LENGTH_OVERRIDE = {length} blocks "
+                    f"(TESTING={TESTING})"
+                )
+            self._epoch_len = length
+            return length
+
+        self._override_active = False
         tempo = self.subtensor.tempo(self.config.netuid) or 360
         try:
             head = self.subtensor.get_current_block()
             next_head = self.subtensor.get_next_epoch_start_block(self.config.netuid)
             if next_head is None:
                 raise ValueError("RPC returned None")
-
             derived = next_head - (head - head % tempo)
             length = derived if derived in (tempo, tempo + 1) else tempo + 1
         except Exception as e:
             bt.logging.warning(f"[epoch] RPC error while probing length: {e}")
-            length = tempo + 1  # safest guess
+            length = tempo + 1
 
         if self._epoch_len != length:
-            bt.logging.info(f"[epoch] detected length = {length}")
+            bt.logging.info(f"[epoch] detected length = {length} (chain mode)")
         self._epoch_len = length
         return length
 
     def _epoch_snapshot(self) -> Tuple[int, int, int, int, int]:
-        """Return (head, start, end, index, length) for the *current* epoch."""
         blk = self.subtensor.get_current_block()
         ep_l = self._epoch_len or self._discover_epoch_length()
-
         start = blk - (blk % ep_l)
         end = start + ep_l - 1
         idx = blk // ep_l
-
-        # Cache epoch end for the waiter
         self.epoch_end_block = end
         return blk, start, end, idx, ep_l
 
-    # ------------------------ wait‑loop (patched) ---------------------- #
-    async def _wait_for_next_head(self):
-        """Sleep until the *first block* of the next epoch.
+    def _apply_epoch_state(self, blk: int, start: int, end: int, idx: int, ep_len: int):
+        """Persist epoch fields to the instance and log the head."""
+        self.epoch_start_block = start
+        self.epoch_end_block = end
+        self.epoch_index = idx
+        self.epoch_tempo = ep_len
+        label = "override" if self._override_active else "chain"
+        head_time = datetime.utcnow().strftime("%H:%M:%S")
+        bt.logging.success(
+            f"[epoch {idx} @ {label}] head at block {blk:,} ({head_time} UTC) – len={ep_len}"
+        )
 
-        We compute the target head **once**, outside the loop, so that the
-        comparison remains stable and we return exactly at the epoch head.
-        """
+    async def _wait_for_next_head(self):
         head_block = self.subtensor.get_current_block()
         ep_l = self._epoch_len or self._discover_epoch_length()
-
-        # first block of the next epoch
         target_head = head_block - (head_block % ep_l) + ep_l
+        label = "override" if self._override_active else "chain"
 
         while not self.should_exit:
             blk = self.subtensor.get_current_block()
             if blk >= target_head:
-                return  # ← will be True exactly ONCE, at the head
-
-            remain = target_head - blk
+                return
+            remain = max(0, target_head - blk)
             eta_s = remain * BLOCKTIME
             bt.logging.info(
-                f"[status] Block {blk:,} | {remain} blocks → next epoch "
-                f"(~{eta_s // 60:.0f} m {eta_s % 60:02.0f} s)"
+                f"[status:{label}] Block {blk:,} | {remain} blocks → next {label} head "
+                f"(~{int(eta_s // 60)}m{int(eta_s % 60):02d}s) | len={ep_l}"
             )
-
-            # Sleep a fraction of remaining blocks (1–30) to keep logs fresh
-            sleep_blocks = max(1, min(30, remain // 2))
+            sleep_blocks = max(1, min(30, remain // 2 or 1))
             await asyncio.sleep(sleep_blocks * BLOCKTIME * 0.95)
 
-    # ----------------------------- run -------------------------------- #
+    # ----------------------- main loop -------------------------------- #
     def run(self):  # noqa: D401
         bt.logging.info(
             f"EpochValidator starting at block {self.block:,} (netuid {self.config.netuid})"
@@ -100,65 +121,62 @@ class EpochValidatorNeuron(BaseValidatorNeuron):
 
         async def _loop():
             while not self.should_exit:
-                # Snapshot ---------------------------------------------------
                 blk, start, end, idx, ep_len = self._epoch_snapshot()
 
-                # ───────── Bootstrap: run forward immediately on first loop ─
-                if not getattr(self, "_bootstrapped", False):
-                    self.epoch_start_block = start
-                    self.epoch_end_block = end
-                    self.epoch_index = idx
-                    self.epoch_tempo = ep_len
-
-                    bt.logging.info("[bootstrap] running forward immediately")
-                    try:
-                        self.sync()
-                        await self.concurrent_forward()    # ← runs forward()
-                    except Exception as e:
-                        bt.logging.error(f"bootstrap forward failed: {e}")
-
-                    self._bootstrapped = True
-                # -----------------------------------------------------------
-
-                # Compute same target head used by the waiter for banners
                 next_head = start + ep_len
                 into = blk - start
                 left = max(1, next_head - blk)
                 eta_s = left * BLOCKTIME
+                label = "override" if self._override_active else "chain"
 
                 bt.logging.info(
-                    f"[status] Block {blk:,} | Epoch {idx} "
-                    f"[{into}/{ep_len} blocks] – next epoch in {left} "
-                    f"blocks (~{eta_s // 60:.0f} m {eta_s % 60:02.0f} s)"
+                    f"[status:{label}] Block {blk:,} | Epoch {idx} "
+                    f"[{into}/{ep_len} blocks] – next {label} head in {left} "
+                    f"blocks (~{int(eta_s // 60)}m{int(eta_s % 60):02d}s)"
                 )
 
-                # Wait for rollover -----------------------------------------
-                if not self.config.no_epoch:
-                    await self._wait_for_next_head()
+                # --- TESTING bootstrap: run a forward immediately on first loop ---
+                if TESTING and not self._bootstrapped:
+                    # Treat the *current* position as a head for testing purposes.
+                    # This avoids waiting for the next real/override head on startup.
+                    self._apply_epoch_state(blk, start, end, idx, ep_len)
+                    self._bootstrapped = True
 
-                # -------- new epoch head ------------------------------------
-                self._epoch_len = None  # force re‑probe
+                    try:
+                        self.sync()
+                        await self.concurrent_forward()
+                    except Exception as err:
+                        bt.logging.error(f"bootstrap forward() raised: {err}")
+                    finally:
+                        try:
+                            self.sync()
+                        except Exception as e:
+                            bt.logging.warning(f"wallet sync failed: {e}")
+                        self.step += 1
+
+                    # After bootstrap, continue the loop to await the next head normally (unless no_epoch).
+                    if self.config.no_epoch:
+                        # When no_epoch is True, we keep looping to call forward at each detected head
+                        # (below, after the wait). Skip the wait here so we can refresh the snapshot now.
+                        pass
+                    else:
+                        await self._wait_for_next_head()
+
+                else:
+                    # Normal path: wait for the next head unless explicitly disabled.
+                    if not self.config.no_epoch:
+                        await self._wait_for_next_head()
+
+                # Recompute snapshot *at* the head (or immediately after bootstrap)
+                self._epoch_len = None  # allow re-probe in case tempo/override changed
                 blk2, start2, end2, idx2, ep_len2 = self._epoch_snapshot()
-                head_time = datetime.utcnow().strftime("%H:%M:%S")
+                self._apply_epoch_state(blk2, start2, end2, idx2, ep_len2)
 
-                # Expose to subclasses
-                self.epoch_start_block = start2
-                self.epoch_end_block = end2
-                self.epoch_index = idx2
-                self.epoch_tempo = ep_len2
-
-                bt.logging.success(
-                    f"[epoch {idx2}] head at block {blk2:,} "
-                    f"({head_time} UTC) – len={ep_len2}"
-                )
-
-                # *** validator business logic *******************************
                 try:
-                    self.sync()                   # refresh wallet / weights
+                    self.sync()
                     await self.concurrent_forward()
                 except Exception as err:
                     bt.logging.error(f"forward() raised: {err}")
-
                 finally:
                     try:
                         self.sync()

@@ -71,7 +71,7 @@ class BaseMinerNeuron(BaseNeuron):
         )
 
         # # Attach v2 handlers (typed by synapse)
-        bt.logging.info("Attaching v2 auction handlers to miner axon.")
+        bt.logging.info("Attaching v3 auction handlers to miner axon")
         self.axon.attach(
             forward_fn=self.auctionstart_forward,
             blacklist_fn=self.auctionstart_blacklist,

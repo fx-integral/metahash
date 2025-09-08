@@ -185,3 +185,20 @@ def load_wallet(coldkey_name: str, hotkey_name: str, unlock: bool = True):
         bt.logging.debug(f"Wallet unlocked {w.coldkey.ss58_address} {w.hotkey.ss58_address}")
 
     return w
+
+
+def unlock_wallet(wallet:bt.Wallet, password_env_variable="WALLET_PASSWORD"):
+    pwd = os.getenv(password_env_variable)
+    if not pwd:
+        bt.logging.error(f"{password_env_variable} not set in .env or env")
+        return None
+    try:
+        wallet.coldkey_file.save_password_to_env(pwd)
+        wallet.unlock_coldkey()
+    except Exception as e:  # noqa: BLE001
+        bt.logging.error(f"cannot unlock cold-key: {e}")
+        raise Exception(
+            "Unable to unlock wallet with: coldkey name: {cold}, hotkey name: {hot}"
+        )
+
+    bt.logging.debug(f"Wallet unlocked {wallet.coldkey.ss58_address} {wallet.hotkey.ss58_address}")

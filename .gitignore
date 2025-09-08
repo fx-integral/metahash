@@ -10,3 +10,4 @@ __pycache__/
 .hypothesis
 .pytest_cache
 local/
+test/
