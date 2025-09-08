@@ -88,6 +88,7 @@ class BackgroundPaymentMiner(BaseMinerNeuron, MinerMixins):
                 return
 
             try:
+                print(inv)
                 ok = await transfer_alpha(
                     subtensor=self._async_subtensor,
                     wallet=self.wallet,

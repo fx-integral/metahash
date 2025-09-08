@@ -2,13 +2,19 @@
   "already_bid": {
     "5CtaFaSaJjKgbh1sqgR43knv2rq8RfzWHDPWHxNdiM1b1NRN": [
       [
-        1073837,
+        1073874,
         136,
         100.0,
         1000
       ],
       [
-        1073838,
+        1073875,
+        136,
+        100.0,
+        1000
+      ],
+      [
+        1073876,
         136,
         100.0,
         1000
@@ -20,42 +26,42 @@
   },
   "wins": [
     {
-      "alpha": 100.0,
+      "alpha": 0.9665346573025212,
       "alpha_requested": 100.0,
-      "amount_rao": 100000000000,
+      "amount_rao": 966534657,
       "discount_bps": 1000,
       "epoch_seen": 0,
-      "invoice_id": "f208ae7e033e",
-      "last_attempt_ts": 1757292781.6874616,
+      "invoice_id": "21804ac16c3e",
+      "last_attempt_ts": 1757295015.105079,
+      "last_response": "window over (blk 5369380 > end 5369379)",
+      "paid": false,
+      "pay_attempts": 2,
+      "pay_epoch_index": 1073875,
+      "pay_window_end_block": 5369379,
+      "pay_window_start_block": 5369375,
+      "subnet_id": 136,
+      "treasury_coldkey": "5DLULtxCS9vA3pZRgSTd9gkvGrUwgNje2TNQeLibo9wUWjSS",
+      "validator_key": "5CtaFaSaJjKgbh1sqgR43knv2rq8RfzWHDPWHxNdiM1b1NRN",
+      "was_partial": true
+    },
+    {
+      "alpha": 0.966534856785691,
+      "alpha_requested": 100.0,
+      "amount_rao": 966534857,
+      "discount_bps": 1000,
+      "epoch_seen": 0,
+      "invoice_id": "c101cea48eaf",
+      "last_attempt_ts": 1757295062.7185905,
       "last_response": "rejected",
       "paid": false,
       "pay_attempts": 1,
-      "pay_epoch_index": 1073838,
-      "pay_window_end_block": 5369194,
-      "pay_window_start_block": 5369190,
+      "pay_epoch_index": 1073876,
+      "pay_window_end_block": 5369384,
+      "pay_window_start_block": 5369380,
       "subnet_id": 136,
       "treasury_coldkey": "5DLULtxCS9vA3pZRgSTd9gkvGrUwgNje2TNQeLibo9wUWjSS",
       "validator_key": "5CtaFaSaJjKgbh1sqgR43knv2rq8RfzWHDPWHxNdiM1b1NRN",
-      "was_partial": false
-    },
-    {
-      "alpha": 100.0,
-      "alpha_requested": 100.0,
-      "amount_rao": 100000000000,
-      "discount_bps": 1000,
-      "epoch_seen": 0,
-      "invoice_id": "dd2a7bcf65ad",
-      "last_attempt_ts": 0.0,
-      "last_response": "not yet in window (blk 5369190 < start 5369195)",
-      "paid": false,
-      "pay_attempts": 0,
-      "pay_epoch_index": 1073839,
-      "pay_window_end_block": 5369199,
-      "pay_window_start_block": 5369195,
-      "subnet_id": 136,
-      "treasury_coldkey": "5DLULtxCS9vA3pZRgSTd9gkvGrUwgNje2TNQeLibo9wUWjSS",
-      "validator_key": "5CtaFaSaJjKgbh1sqgR43knv2rq8RfzWHDPWHxNdiM1b1NRN",
-      "was_partial": false
+      "was_partial": true
     }
   ]
 }

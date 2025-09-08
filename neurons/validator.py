@@ -18,7 +18,7 @@ from metahash.config import (
 from metahash.utils.helpers import load_weights
 
 # Services
-from metahash.validator.flags import DRYRUN_WEIGHTS
+from metahash.config import DRYRUN_WEIGHTS
 from metahash.validator.state import StateStore
 from metahash.validator.engines.commitments import CommitmentsEngine
 from metahash.validator.engines.settlement import SettlementEngine
@@ -38,6 +38,10 @@ class Validator(EpochValidatorNeuron):
       • v4 commitments: CID‑only on‑chain, full in IPFS,
       • robust fallback: never publish inline payload > limit,
       • settlement guarded; local pending payload as dev fallback when IPFS decode fails.
+
+    NOTE in this build:
+      • Clearing uses TAO budget (base subnet = this validator's netuid) and TAO-valued bids
+        = α * (1 - disc) * price_tao_per_alpha[subnet] * weight_fraction.
     """
 
     def __init__(self, config=None):
@@ -59,7 +63,7 @@ class Validator(EpochValidatorNeuron):
         # Services / engines
         self.commitments = CommitmentsEngine(self, self.state)
         self.settlement = SettlementEngine(self, self.state)
-        self.clearing = ClearingEngine(self, self.state)  # swap with your concrete implementation
+        self.clearing = ClearingEngine(self, self.state)  # TAO-budget allocator
         self.auction = AuctionEngine(self, self.state, self.weights_bps, clearer=self.clearing)
 
         pretty.banner(

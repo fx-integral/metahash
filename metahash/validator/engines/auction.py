@@ -203,7 +203,7 @@ class AuctionEngine:
             return
 
         pretty.kv_panel(
-            "AuctionStart",
+            "2. AuctionStart",
             [("epoch (e)", self.parent.epoch_index), ("action", "Starting auction…")],
             style="bold cyan",
         )

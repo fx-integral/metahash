@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, replace
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, TypeVar
 
 import bittensor as bt
 import websockets                                           # WS errors
@@ -16,11 +16,22 @@ from substrateinterface.utils.ss58 import (
 )
 
 from metahash.config import MAX_CONCURRENCY
-from metahash.utils.async_substrate import maybe_async
 
 
 # ── extrinsic filter ─────────────────────────────────────────────────── #
 UTILITY_FUNS: set[str] = {"batch", "force_batch", "batch_all"}
+
+T = TypeVar("T")
+
+
+async def maybe_async(fn: Callable[..., T], *args, **kwargs) -> T:          # noqa: N802
+    """
+    Await *fn* whether it is a coroutine or a plain blocking function.
+    Plain calls are off‑loaded to the default thread‑pool.
+    """
+    if asyncio.iscoroutinefunction(fn):
+        return await fn(*args, **kwargs)                                     # type: ignore[misc]
+    return await asyncio.to_thread(fn, *args, **kwargs)       
 
 
 def _name(obj) -> str | None:

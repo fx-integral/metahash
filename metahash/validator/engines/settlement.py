@@ -1,5 +1,5 @@
 # ╭────────────────────────────────────────────────────────────────────────╮
-# metahash/validator/settlement.py — Simple settlement
+# metahash/validator/settlement.py — Simple settlement (TESTING-aware)
 #
 # Policy:
 #   For each master snapshot (fetched from CID in v4 commitments):
@@ -11,10 +11,11 @@
 #               reward_subnet = TAO(required_rao with slippage) and split across lines by α share:
 #               reward_line   = (reward_subnet × line_share) × weight × (1 − discount)
 #           else:
-#               no credit for that subnet (strict full‑pay rule).
+#               no credit for that subnet (strict full-pay rule).
 #
 # No jailing, no reputation updates, no burn accounting beyond the usual
 # burn-all fallback if all scores end up 0 (or FORCE_BURN_WEIGHTS is set).
+# TESTING mode: compute & log everything but DO NOT call set_weights().
 # ╰────────────────────────────────────────────────────────────────────────╯
 
 from __future__ import annotations
@@ -31,11 +32,11 @@ from metahash.utils.commitments import read_all_plain_commitments
 from metahash.validator.alpha_transfers import AlphaTransfersScanner
 from treasuries import VALIDATOR_TREASURIES
 
-from metahash.validator.flags import DRYRUN_WEIGHTS
 from metahash.validator.state import StateStore
 from metahash.utils.helpers import safe_json_loads, safe_int
 
 from metahash.config import (
+    TESTING,                         # ← single switch for "no real set_weights"
     POST_PAYMENT_CHECK_DELAY_BLOCKS,
     FORBIDDEN_ALPHA_SUBNETS,
     LOG_TOP_N,
@@ -54,6 +55,7 @@ SLIP_TOLERANCE_D = Decimal(str(SLIP_TOLERANCE))
 class SettlementEngine:
     """
     Simplified settlement across ALL masters for epoch e−2.
+    TESTING=True → compute everything, show weights, skip on-chain set_weights().
     """
 
     def __init__(self, parent, state: StateStore):
@@ -69,7 +71,9 @@ class SettlementEngine:
 
         st = await self.parent._stxn()
         try:
-            commits = await read_all_plain_commitments(st, netuid=self.parent.config.netuid, block=None)
+            commits = await read_all_plain_commitments(
+                st, netuid=self.parent.config.netuid, block=None
+            )
         except Exception as e:
             pretty.log(f"[red]Commitment read_all failed: {e}[/red]")
             return
@@ -77,8 +81,6 @@ class SettlementEngine:
         masters_hotkeys: Set[str] = set(VALIDATOR_TREASURIES.keys())
         masters_treasuries: Set[str] = set(VALIDATOR_TREASURIES.values())
         snapshots: List[Dict] = []
-
-        print(snapshots)
 
         # ── 1) Extract v4 snapshots (CID) or inline legacy for this epoch ──
         for hk_key, data_raw in (commits or {}).items():
@@ -148,15 +150,17 @@ class SettlementEngine:
         miner_uids_all: List[int] = list(self.parent.get_miner_uids())
 
         if not snapshots:
-            pretty.log("[grey]No master commitments found — applying burn‑all weights (no payments to account).[/grey]")
+            pretty.log("[grey]No master commitments found — applying burn-all weights (no payments to account).[/grey]")
             final_scores = [1.0 if uid == 0 else 0.0 for uid in miner_uids_all]
             self._log_final_scores_table(final_scores, miner_uids_all, reason="no commitments → burn-all")
-            if DRYRUN_WEIGHTS:
-                self._log_would_set_weights(final_scores, miner_uids_all, mode="burn-all")
-            else:
+            self._log_weights_preview(final_scores, miner_uids_all, mode="burn-all (no snapshots)")
+
+            if not TESTING:
                 self.parent.update_scores(final_scores, miner_uids_all)
-                if not self.parent.config.no_epoch:
-                    self.parent.set_weights()
+                self.parent.set_weights()
+            else:
+                pretty.log("[yellow]TESTING: skipping on-chain set_weights().[/yellow]")
+
             self.state.validated_epochs.add(epoch_to_settle)
             self.state.save_validated_epochs()
             return
@@ -184,7 +188,9 @@ class SettlementEngine:
 
         start_block = min(as_vals)
         end_block = max(de_vals)
-        pretty.show_settlement_window(epoch_to_settle, start_block, end_block, POST_PAYMENT_CHECK_DELAY_BLOCKS, len(clean_snapshots))
+        pretty.show_settlement_window(
+            epoch_to_settle, start_block, end_block, POST_PAYMENT_CHECK_DELAY_BLOCKS, len(clean_snapshots)
+        )
         end_block += max(0, int(POST_PAYMENT_CHECK_DELAY_BLOCKS or 0))
 
         # Ensure pay window is closed
@@ -254,7 +260,7 @@ class SettlementEngine:
                     continue
                 src_sid = getattr(ev, "src_subnet_id", ev.subnet_id)
                 if src_sid != ev.subnet_id:
-                    # Guard against cross‑subnet crediting
+                    # Guard against cross-subnet crediting
                     continue
                 paid_rao_by_uid_tre_sid[(uid, ev.dest_coldkey, ev.subnet_id)] += int(ev.amount_rao)
             except Exception:
@@ -265,7 +271,7 @@ class SettlementEngine:
         depth_cache: Dict[int, int] = {}
         await self._populate_price_and_depth_caches(subnets_needed, start_block, end_block, price_cache, depth_cache)
 
-        # ── 5) Score miners (strict full‑pay per subnet; split TAO across lines) ──
+        # ── 5) Score miners (strict full-pay per subnet; split TAO across lines) ──
         scores_by_uid: Dict[int, float] = defaultdict(float)
 
         for s in clean_snapshots:
@@ -311,7 +317,7 @@ class SettlementEngine:
                         disc = 1.0 - (max(0, min(10_000, disc_bps)) / 10_000.0)
                         scores_by_uid[uid] += line_tao * weight * disc
 
-        # ── 6) Produce final scores & set weights (or DRY‑RUN) ──
+        # ── 6) Produce final scores & set weights (or TESTING preview) ──
         miner_uids_all = list(self.parent.get_miner_uids())
         final_scores: List[float] = [float(scores_by_uid.get(uid, 0.0)) for uid in miner_uids_all]
 
@@ -323,19 +329,22 @@ class SettlementEngine:
             burn_reason = "NO_POSITIVE_SCORES"
 
         self._log_final_scores_table(final_scores, miner_uids_all, reason=burn_reason)
+        self._log_weights_preview(final_scores, miner_uids_all, mode="burn-all" if burn_all else "normal")
 
-        if DRYRUN_WEIGHTS:
-            mode = "burn-all" if burn_all else "normal"
-            self._log_would_set_weights(final_scores, miner_uids_all, mode=mode)
-        else:
-            if burn_all:
-                pretty.log(f"[red]Burn‑all triggered – reason: {burn_reason}.[/red]")
-                final_scores = [1.0 if uid == 0 else 0.0 for uid in miner_uids_all]
-            else:
-                pretty.log("[green]Setting weights from final scores.[/green]")
+        if burn_all and not TESTING:
+            pretty.log(f"[red]Burn-all triggered – reason: {burn_reason}.[/red]")
+            final_scores = [1.0 if uid == 0 else 0.0 for uid in miner_uids_all]
+
+        if not TESTING:
+            pretty.log("[green]Applying weights on-chain.[/green]")
             self.parent.update_scores(final_scores, miner_uids_all)
-            if not self.parent.config.no_epoch:
-                self.parent.set_weights()
+            self.parent.set_weights()
+        else:
+            pretty.kv_panel("TESTING — on-chain set_weights() suppressed",
+                            [("nonzero_miners", sum(1 for s in final_scores if s > 0)),
+                             ("sum(scores)", f"{sum(final_scores):.6f}"),
+                             ("mode", "burn-all" if burn_all else "normal")],
+                            style="bold magenta")
 
         self.state.validated_epochs.add(epoch_to_settle)
         self.state.save_validated_epochs()
@@ -343,7 +352,7 @@ class SettlementEngine:
                         [("epoch_settled (e−2)", epoch_to_settle),
                          ("miners_scored", sum(1 for x in final_scores if x > 0)),
                          ("snapshots_used", len(clean_snapshots)),
-                         ("mode", "burn-all" if burn_all and not DRYRUN_WEIGHTS else "normal" if not DRYRUN_WEIGHTS else "DRY‑RUN (no set)")],
+                         ("testing", str(TESTING).lower())],
                         style="bold green")
 
     # ---------- helpers ----------
@@ -439,7 +448,7 @@ class SettlementEngine:
 
     def _rao_to_tao(self, alpha_rao: int, price_tao_per_alpha: float, depth_rao: int) -> float:
         """
-        Same slippage model as rewards. Kept local to avoid cross‑module imports.
+        Same slippage model as rewards. Kept local to avoid cross-module imports.
         """
         if alpha_rao <= 0 or depth_rao <= 0 or price_tao_per_alpha <= 0:
             return 0.0
@@ -477,7 +486,7 @@ class SettlementEngine:
         lines.append("└───────────────────────────┘")
         pretty.log("\n".join(lines))
 
-    def _log_would_set_weights(self, scores: List[float], uids: List[int], mode: str):
+    def _log_weights_preview(self, scores: List[float], uids: List[int], mode: str):
         total = sum(scores) or 1.0
         weights = [s / total for s in scores]
         pairs = list(zip(uids, weights))
@@ -485,11 +494,11 @@ class SettlementEngine:
         top_n = max(1, int(LOG_TOP_N))
         rows = [[uid, f"{w:.6f}", f"{(w*100):.2f}%"] for uid, w in pairs[:top_n]]
         pretty.table(
-            f"[magenta]WOULD SET WEIGHTS (DRY‑RUN) — mode={mode}[/magenta]",
+            f"[magenta]WEIGHTS PREVIEW — mode={mode}[/magenta]",
             ["UID", "Weight", "% of total"],
             rows
         )
-        pretty.kv_panel("DRY‑RUN (weights suppressed)",
+        pretty.kv_panel("Weights Summary",
                         [("nonzero", sum(1 for w in weights if w > 0)),
                          ("sum(weights)", f"{sum(weights):.6f}"),
                          ("max", f"{max(weights) if weights else 0:.6f}")],

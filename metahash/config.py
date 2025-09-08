@@ -11,6 +11,7 @@ from decimal import Decimal
 load_dotenv()
 
 # ╭─────────────────────────── ENVIRONMENT ────────────────────────────╮
+METAHASH_SUBNET_ID = 73
 DEFAULT_BITTENSOR_NETWORK: str = os.getenv("BITTENSOR_NETWORK", "finney")
 
 # Gate v2 logic until chain reaches this height (validators idle before this)
@@ -22,8 +23,13 @@ FORCE_BURN_WEIGHTS: bool = os.getenv("FORCE_BURN_WEIGHTS", "false").lower() == "
 
 # Monetary base unit (α planck)
 PLANCK: int = 10**9
+
+DRYRUN_WEIGHTS = TESTING
 # ╰────────────────────────────────────────────────────────────────────╯
 
+# ╭───────────────────────────── IPFS and Commitments ────────────────────────────────╮
+ALLOW_INLINE_FALLBACK: bool = True
+RAW_BYTES_CEILING = 120
 
 # ╭───────────────────────────── EPOCH ────────────────────────────────╮
 EPOCH_LENGTH_OVERRIDE: int = int(os.getenv("EPOCH_LENGTH_OVERRIDE", "5"))

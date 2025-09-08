@@ -5,6 +5,7 @@
 #  • compute_epoch_rewards(): optional helper used elsewhere (unchanged signature)
 #  • Allocation helpers (BidInput / WinAllocation / allocate_bids, etc.) kept
 #    to avoid breaking AuctionEngine or other callers.
+#  • NEW: budget_tao_from_share() — derive TAO budget from α budget of base subnet.
 # ╰────────────────────────────────────────────────────────────────────────╯
 
 from __future__ import annotations
@@ -216,9 +217,25 @@ class WinAllocation:
 
 
 def budget_from_share(*, share: float, auction_budget_alpha: float = AUCTION_BUDGET_ALPHA) -> float:
+    """(Legacy) Returns an α-denominated budget = share * AUCTION_BUDGET_ALPHA."""
     if share <= 0:
         return 0.0
     return auction_budget_alpha * float(share)
+
+
+def budget_tao_from_share(
+    *,
+    share: float,
+    auction_budget_alpha: float = AUCTION_BUDGET_ALPHA,
+    price_tao_per_alpha_base: float,
+) -> float:
+    """
+    New: Convert the base α budget (for validator's netuid) to a TAO budget for allocation:
+        budget_tao = share * auction_budget_alpha (α) * price_tao_per_alpha_base
+    """
+    if share <= 0 or auction_budget_alpha <= 0 or price_tao_per_alpha_base <= 0:
+        return 0.0
+    return float(share) * float(auction_budget_alpha) * float(price_tao_per_alpha_base)
 
 
 def compute_budget_share(
@@ -251,7 +268,7 @@ def allocate_bids(
 ) -> tuple[List[WinAllocation], float, dict]:
     """
     Deterministic greedy allocation with optional per‑CK caps and a
-    second pass to utilize leftover budget.
+    second pass to utilize leftover budget. (Legacy α‑budget variant.)
     """
     ordered = sorted(bids, key=_bid_order_key)
 
@@ -352,6 +369,7 @@ __all__ = [
     "BidInput",
     "WinAllocation",
     "budget_from_share",
+    "budget_tao_from_share",
     "compute_budget_share",
     "calc_required_rao",
     "allocate_bids",
