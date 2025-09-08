@@ -11,3 +11,6 @@ __pycache__/
 .pytest_cache
 local/
 test/
+miner_state.json
+pending_commits.json
+validated_epochs.json
