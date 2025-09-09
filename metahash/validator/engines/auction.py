@@ -416,10 +416,26 @@ class AuctionEngine:
             if reason_rows:
                 pretty.table("Rejection counts (top)", ["Reason", "Count"], reason_rows)
 
-        # Clear & notify (fills pending_commits for epoch e with winners window).
         if self._wins_notified_for != self.parent.epoch_index:
             if self.clearer is not None:
-                await self.clearer.clear_now_and_notify(epoch_to_clear=self.parent.epoch_index)
+                ok = await self.clearer.clear_now_and_notify(epoch_to_clear=self.parent.epoch_index)
+
+                # NEW: after clear, show what keys exist in pending_commits so we know the staging worked.
+                try:
+                    keys = list(self.state.pending_commits.keys()) if isinstance(self.state.pending_commits, dict) else []
+                except Exception:
+                    keys = []
+                pretty.kv_panel(
+                    "Post-clear staging snapshot",
+                    [
+                        ("epoch_cleared(e)", self.parent.epoch_index),
+                        ("staged_key_expected", str(self.parent.epoch_index)),
+                        ("#pending_keys", len(keys)),
+                        ("keys(sample)", ", ".join(keys[:8])),
+                        ("clear_ok", str(bool(ok)).lower()),
+                    ],
+                    style="bold magenta",
+                )
             else:
                 pretty.log("[yellow]Clearing engine not configured; skipping clear_now_and_notify.[/yellow]")
             self._wins_notified_for = self.parent.epoch_index

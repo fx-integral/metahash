@@ -491,7 +491,7 @@ class ClearingEngine:
             rows_w,
         )
 
-        # 5) Stash pending commitment snapshot (publish later with SAME window)
+       # 5) Stash pending commitment snapshot (publish later with SAME window)
         pay_epoch = int(epoch_to_clear + 1)
         epoch_len = int(self.parent.epoch_end_block - self.parent.epoch_start_block + 1)
         win_start = int(self.parent.epoch_end_block) + 1
@@ -510,20 +510,44 @@ class ClearingEngine:
                 ]
             )
 
-        # Persist to StateStore so CommitmentsEngine can publish in e+1
-        self.state.pending_commits[str(epoch_to_clear)] = {
-            "v": 3,  # payload schema label
+        # --- NEW: ensure pending_commits is a dict; then stage under str(e) and log it.
+        if not isinstance(self.state.pending_commits, dict):
+            self.state.pending_commits = {}
+
+        payload = {
+            "v": 3,  # payload schema label (content-only; on-chain entry is v4 CID stub)
             "e": int(epoch_to_clear),
             "pe": pay_epoch,
             "as": int(win_start),
             "de": int(win_end),
             "hk": self.parent.hotkey_ss58,
             "t": VALIDATOR_TREASURIES.get(self.parent.hotkey_ss58, ""),
+            # Compact winner inventory:
+            #   inv: { "<uid>": {"ck": "<coldkey or empty>"}, ... }
+            #   i:   [ [uid, [ [sid, disc_bps, w_bps, rao_acc, value_mu], ... ] ], ... ]
             "inv": {str(uid): {"ck": ""} for uid in inv_i.keys()},
             "i": [[uid, lines] for uid, lines in inv_i.items()],
         }
+
+        key = str(epoch_to_clear)
+        self.state.pending_commits[key] = payload
         if hasattr(self.state, "save_pending_commits"):
             self.state.save_pending_commits()
+
+        # NEW: loud staging confirmation
+        pretty.kv_panel(
+            "Staged commit payload",
+            [
+                ("key", key),
+                ("e", payload["e"]),
+                ("pe", payload["pe"]),
+                ("as", payload["as"]),
+                ("de", payload["de"]),
+                ("#miners", len(payload["inv"])),
+                ("#lines_total", sum(len(v) for _, v in inv_i.items())),
+            ],
+            style="bold magenta",
+        )
 
         # 6) Human-friendly invoice preview (α to pay = accepted α)
         preview_rows = []
