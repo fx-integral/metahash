@@ -154,7 +154,8 @@ class Validator(EpochValidatorNeuron):
 
         # 3) Publish previous epoch’s cleared winners (e−1)
         try:
-            await self.commitments.publish_commitment_for(epoch_cleared=e - 1)
+            await self.commitments.publish_catch_up(up_to_epoch=e - 1)
+
         except asyncio.CancelledError as ce:
             pretty.log(f"[yellow]Publish commitments cancelled by RPC: {ce}[/yellow]")
         except Exception as exc:

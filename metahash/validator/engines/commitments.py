@@ -145,3 +145,24 @@ class CommitmentsEngine:
             for i, hk in enumerate(getattr(self.parent.metagraph, "hotkeys")):
                 mapping[hk] = i
         return mapping
+    
+    async def publish_catch_up(self, up_to_epoch: int):
+        """
+        Publish any staged payloads with key <= up_to_epoch.
+        This prevents gaps if a previous epoch missed publishing.
+        """
+        if not self._is_master_now():
+            return
+
+        # Collect int keys safely
+        keys: list[int] = []
+        pcs = self.state.pending_commits if isinstance(self.state.pending_commits, dict) else {}
+        for k in list(pcs.keys()):
+            try:
+                ki = int(k)
+                keys.append(ki)
+            except Exception:
+                pretty.log(f"[yellow]Skipping non-integer pending key: {k!r}[/yellow]")
+
+        for e in sorted(ki for ki in keys if ki <= int(up_to_epoch)):
+            await self.publish_commitment_for(e)
