@@ -48,6 +48,7 @@ def _isatty() -> bool:
 
 
 def _pause(msg: str):
+    return
     """Optional interactive pause."""
     if not PAUSE_ON_CHECKPOINTS or not _isatty():
         return
