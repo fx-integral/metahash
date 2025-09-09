@@ -1,4 +1,4 @@
-# metahash/validator/engines/settlement.py — Modular settlement (step-by-step, VALUE-based, with rich debug)
+# metahash/validator/engines/settlement.py — Modular settlement (VALUE-based) + Budget Burn
 from __future__ import annotations
 
 import asyncio
@@ -80,20 +80,22 @@ def _kv_preview(d: dict, n=8) -> dict:
 
 class SettlementEngine:
     """
-    Modular settlement flow:
+    Modular settlement flow (+ budget-aware burn):
       1) Load snapshots from commitments (v4 → IPFS payloads; legacy inline supported).
       2) Merge payment window [as, de] across masters; wait until closed (de + delay).
       3) Scan α transfers (miners → master treasuries) in the merged window.
       4) Build paid index (uid, treasury, subnet) → paid_rao (drop forbidden / cross-subnet).
       5) Score miners using VALUE stored in payload lines, gated by payment checks:
            - STRICT_PER_SUBNET=True → every line's required_rao must be paid on that subnet.
-           - else                     total paid per miner must cover total required across subnets.
-      6) Apply weights or preview (TESTING=True suppresses on-chain set_weights).
+           - else                   → miner_total_paid_rao must cover total required_rao.
+      6) **Budget burn:** If a snapshot carries a budget target (TAO VALUE) > spent VALUE, add the
+         delta to UID 0 so normalized weights reflect SPENT + BURN == BUDGET.
+      7) Apply weights or preview (TESTING=True suppresses on-chain set_weights).
 
     Notes:
       • This module *does not* re-compute VALUE; we trust `value_mu` (μTAO) from payload.
-      • If any miner fails the payment gate, they get 0 from that master's snapshot.
-      • Aggregation: scores from *all masters' snapshots* are summed per miner.
+      • Budget target is taken from payload if present (`bt_mu`, or `spent_mu + bl_mu`).
+      • If a snapshot has no recognizable budget signals, we skip burn for that snapshot.
     """
 
     def __init__(self, parent, state: StateStore):
@@ -131,7 +133,7 @@ class SettlementEngine:
         if not ok:
             return  # postponed; logs already printed
 
-        # 3) Scan α transfers in [as, de] (optionally you could add +delay here; we already extended end in step 2)
+        # 3) Scan α transfers in [as, de]
         events = await self._scan_alpha_transfers(start_block, end_block)
         if events is None:
             pretty.kv_panel("Settlement postponed", [("epoch", epoch_to_settle), ("reason", "scanner failed")], style="bold yellow")
@@ -142,11 +144,11 @@ class SettlementEngine:
         self._log_paid_index_stats(paid_idx, drop_stats)
 
         # 5) Score miners from snapshots using VALUE (payload) gated by payments
-        final_scores, credit_rows = self._score_miners_from_snapshots_value_only(snapshots, paid_idx)
+        scores_by_uid, credit_rows, budget_metrics = self._score_miners_and_collect_budget(snapshots, paid_idx)
         self._log_credit_rows(credit_rows)
 
-        # 6) Apply weights (or preview in TESTING)
-        self._apply_weights_or_preview(epoch_to_settle, final_scores)
+        # 6) Apply weights (or preview in TESTING), with **budget-aware burn**
+        self._apply_weights_or_preview(epoch_to_settle, scores_by_uid, budget_metrics)
 
         pretty.rule("[bold cyan]SETTLEMENT — END[/bold cyan]")
 
@@ -227,7 +229,7 @@ class SettlementEngine:
                             pretty.log(f"[yellow]Skip hk={hk_key[:6]}… — failed to fetch CID: {ipfs_exc}[/yellow]")
                             continue
 
-                # Legacy inline (for completeness)
+                # Legacy inline
                 if s.get("e") == epoch_to_settle and s.get("pe") == (epoch_to_settle + 1) and "as" in s and "de" in s:
                     chosen = dict(s)
                     chosen.setdefault("hk", hk_key)
@@ -456,32 +458,40 @@ class SettlementEngine:
             pretty.log("[dim]paid(sample): " + _j(sample) + (" …" if len(paid_idx) > 6 else "") + "[/dim]")
         _pause("After paid α aggregation")
 
-    # ───────── Step 5: scoring using VALUE in payload only ─────────
-    def _score_miners_from_snapshots_value_only(
+    # ───────── Step 5: scoring using VALUE + collect budget ─────────
+    def _score_miners_and_collect_budget(
         self,
         snapshots: List[Dict],
         paid_idx: Dict[Tuple[int, str, int], int],
-    ) -> Tuple[List[float], List[List[str | int | float]]]:
+    ) -> Tuple[Dict[int, float], List[List[str | int | float]], Dict[str, float]]:
         """
-        Scoring rule (per master snapshot):
-          * Collect a miner's winning lines (each has [sid, disc_bps, w_bps, required_rao, value_mu]).
-          * Gate: if STRICT_PER_SUBNET → for EVERY subnet: paid_rao(uid, tre, sid) >= sum(required_rao on that sid).
-                  else               → sum_paid_rao(uid, tre, ANY sid) >= sum_all_required_rao.
-          * If gate fails → miner gets 0 from that snapshot.
-          * Else reward = sum(decode(value_mu)) across all lines.
-        Aggregate rewards across all masters.
+        Return:
+          - scores_by_uid: TAO VALUE credited per miner (not normalized)
+          - credit_rows:   table rows for pretty logs
+          - budget_metrics:
+              {
+                "spent_tao": <sum of credited VALUE>,
+                "budget_tao": <sum of targets we could infer>,
+                "burn_tao": <budget_tao - spent_tao, clipped at 0>,
+              }
         """
         scores_by_uid: Dict[int, float] = defaultdict(float)
-        credit_rows: List[List[str | int | float]] = []  # per-miner summary rows
+        credit_rows: List[List[str | int | float]] = []
 
-        # stable ordering
+        spent_total_tao = 0.0     # VALUE actually credited (miners)
+        budget_total_tao = 0.0    # VALUE budget target inferred from payloads
+
+        # stable ordering (not strictly needed for scoring)
         miner_uids_all: List[int] = list(self.parent.get_miner_uids())
 
         for s in snapshots:
             tre: str = s.get("t", "") or ""
             inv: Dict[str, Dict] = s.get("inv", {}) or {}
 
-            # Build per-miner required/pay/value
+            # --- collect lines per miner & score ---
+            # also accumulate SPENT VALUE for this snapshot (post gate)
+            snapshot_spent_value_tao = 0.0
+
             for uid_s, inv_d in inv.items():
                 try:
                     uid = int(uid_s)
@@ -493,7 +503,6 @@ class SettlementEngine:
                 total_required = 0
                 total_value_tao = 0.0
 
-                # Lines may be in s["i"] (compact) rather than inv_d, normalize both:
                 # Preferred source: compact "i" pairs
                 lines_compact: List[List[int]] = []
                 if "i" in s and isinstance(s["i"], list):
@@ -508,6 +517,7 @@ class SettlementEngine:
                             for ln in lines:
                                 if isinstance(ln, list) and len(ln) >= 4:
                                     lines_compact.append(ln)
+
                 # Fallback: inv_d["ln"] style if present
                 if not lines_compact and isinstance(inv_d, dict) and isinstance(inv_d.get("ln"), list):
                     for ln in inv_d.get("ln", []):
@@ -525,13 +535,11 @@ class SettlementEngine:
                     by_sid_required[sid] += req_rao
                     total_required += req_rao
 
-                    # VALUE metric: μTAO if present (int)
                     val_mu = int(ln[4]) if len(ln) >= 5 else 0
                     if val_mu > 0:
                         total_value_tao += decode_value_mu(val_mu)
 
                 if total_required <= 0:
-                    # no actual requirement -> no credit (or skip)
                     continue
 
                 # Determine paid α for this miner to THIS master's treasury (strictly per-subnet or total)
@@ -544,7 +552,6 @@ class SettlementEngine:
                             break
                 else:
                     total_paid = 0
-                    # sum paid to this treasury on any subnet (only those we considered)
                     for sid in by_sid_required.keys():
                         total_paid += int(paid_idx.get((uid, tre, sid), 0))
                     fully_paid = (total_paid >= total_required)
@@ -557,25 +564,109 @@ class SettlementEngine:
 
                 if fully_paid and total_value_tao > 0:
                     scores_by_uid[uid] += total_value_tao
+                    snapshot_spent_value_tao += total_value_tao
 
-        final_scores = [float(scores_by_uid.get(uid, 0.0)) for uid in miner_uids_all]
-        return final_scores, credit_rows
+            # --- try to infer a budget target for this snapshot ---
+            snapshot_budget_tao = self._infer_snapshot_budget_value_tao(s)
 
-    def _log_credit_rows(self, rows: List[List[str | int | float]]):
-        if rows:
-            pretty.table(
-                "[cyan]Miner credit (per snapshot) — Required α vs Paid α → VALUE sum[/cyan]",
-                ["UID", "Treasury", "Gate", "α_required(rao)", "α_paid(rao?)", "Credit?", "VALUE_sum(TAO)"],
-                rows[: max(12, int(LOG_TOP_N))],
-            )
-            extra = len(rows) - max(12, int(LOG_TOP_N))
-            if extra > 0:
-                pretty.log(f"[dim]… +{extra} more rows[/dim]")
+            # accumulate totals
+            spent_total_tao += snapshot_spent_value_tao
+            if snapshot_budget_tao is not None:
+                budget_total_tao += snapshot_budget_tao
 
-    # ───────── Step 6: apply weights or preview ─────────
-    def _apply_weights_or_preview(self, epoch_to_settle: int, final_scores: List[float]):
+        # compute burn only for the portion where we could infer a target
+        burn_tao = max(0.0, budget_total_tao - spent_total_tao)
+
+        metrics = dict(spent_tao=spent_total_tao, budget_tao=budget_total_tao, burn_tao=burn_tao)
+        return scores_by_uid, credit_rows, metrics
+
+    def _infer_snapshot_budget_value_tao(self, s: Dict) -> Optional[float]:
+        """
+        Best-effort extraction of the snapshot's budget target in TAO VALUE.
+
+        Priority:
+          1) bt_mu / budget_mu / budget_value_mu (int, μTAO)
+          2) bt_tao / budget_tao / budget_value_tao (float)
+          3) If we have `bl_mu` / `leftover_mu` plus we can sum per-line `value_mu`,
+             then target = spent + leftover.
+          4) Otherwise, return None (skip burn for this snapshot).
+        """
+        # (1) integer μTAO keys
+        for k in ("bt_mu", "budget_mu", "budget_value_mu"):
+            v = s.get(k)
+            if isinstance(v, int) and v > 0:
+                return float(Decimal(v) / _1e9)
+
+        # (2) float TAO keys
+        for k in ("bt_tao", "budget_tao", "budget_value_tao"):
+            v = s.get(k)
+            try:
+                if v is not None:
+                    vf = float(v)
+                    if vf > 0.0:
+                        return vf
+            except Exception:
+                pass
+
+        # (3) leftover + sum(value_mu)
+        leftover_mu = None
+        for k in ("bl_mu", "leftover_mu", "budget_left_mu", "leftover_value_mu"):
+            vm = s.get(k)
+            if isinstance(vm, int) and vm >= 0:
+                leftover_mu = vm
+                break
+
+        if leftover_mu is not None:
+            spent_mu = 0
+            # Sum per-line value_mu from compact "i" pairs (preferred)
+            if "i" in s and isinstance(s["i"], list):
+                for pair in s["i"]:
+                    if not (isinstance(pair, list) and len(pair) == 2):
+                        continue
+                    _uid2, lines = pair
+                    if isinstance(lines, list):
+                        for ln in lines:
+                            if isinstance(ln, list) and len(ln) >= 5:
+                                try:
+                                    spent_mu += int(ln[4])
+                                except Exception:
+                                    pass
+            else:
+                # or from normalized inv["ln"]
+                inv = s.get("inv", {}) or {}
+                for _uid_s, inv_d in inv.items():
+                    if isinstance(inv_d, dict):
+                        for ln in inv_d.get("ln", []) or []:
+                            if isinstance(ln, list) and len(ln) >= 5:
+                                try:
+                                    spent_mu += int(ln[4])
+                                except Exception:
+                                    pass
+
+            # if we were able to compute anything, return total
+            total_mu = spent_mu + int(leftover_mu)
+            if total_mu > 0:
+                return float(Decimal(total_mu) / _1e9)
+
+        # (4) no budget signals
+        return None
+
+    # ───────── Step 6: apply weights or preview (with burn) ─────────
+    def _apply_weights_or_preview(self, epoch_to_settle: int, scores_by_uid: Dict[int, float], budget_metrics: Dict[str, float]):
         miner_uids_all = list(self.parent.get_miner_uids())
 
+        spent = float(budget_metrics.get("spent_tao", 0.0))
+        budget = float(budget_metrics.get("budget_tao", 0.0))
+        burn = float(budget_metrics.get("burn_tao", 0.0))
+
+        # If we inferred any budget at all, add burn to UID 0
+        if budget > 0.0 and burn > 0.0:
+            scores_by_uid[0] += burn
+
+        # Prepare final_scores array in miner UID order
+        final_scores = [float(scores_by_uid.get(uid, 0.0)) for uid in miner_uids_all]
+
+        # Determine if we should force burn-all (unchanged logic)
         burn_reason = None
         burn_all = FORCE_BURN_WEIGHTS or (not any(final_scores))
         if FORCE_BURN_WEIGHTS:
@@ -583,8 +674,21 @@ class SettlementEngine:
         elif not any(final_scores):
             burn_reason = "NO_POSITIVE_SCORES"
 
+        # Logs — final scores and weights preview
         self._log_final_scores_table(final_scores, miner_uids_all, reason=burn_reason)
-        self._log_weights_preview(final_scores, miner_uids_all, mode="burn-all" if burn_all else "normal")
+        mode = "burn-all" if burn_all else ("normal+budget-burn" if budget > 0 else "normal")
+        self._log_weights_preview(final_scores, miner_uids_all, mode=mode)
+
+        # Budget accounting panel
+        if budget > 0.0:
+            pretty.kv_panel(
+                "Budget accounting (VALUE in TAO)",
+                [("budget_tao", f"{budget:.6f}"),
+                 ("spent_tao", f"{spent:.6f}"),
+                 ("burn_tao→uid0", f"{burn:.6f}")],
+                style="bold magenta",
+            )
+
         _pause("Before applying weights (or preview in TESTING)")
 
         # Burn-all substitution if needed (and not testing)
@@ -600,7 +704,7 @@ class SettlementEngine:
             pretty.kv_panel("TESTING — on-chain set_weights() suppressed",
                             [("nonzero_miners", sum(1 for s in final_scores if s > 0)),
                              ("sum(scores)", f"{sum(final_scores):.6f}"),
-                             ("mode", "burn-all" if (FORCE_BURN_WEIGHTS or not any(final_scores)) else "normal")],
+                             ("mode", mode)],
                             style="bold magenta")
 
         self.state.validated_epochs.add(epoch_to_settle)
@@ -641,7 +745,6 @@ class SettlementEngine:
                     uid_int = int(uid)
                 except Exception:
                     continue
-                # coldkey not strictly required in inventory for settlement gate
                 ln_list: List[List[int]] = []
                 for ln in (lines or []):
                     if not (isinstance(ln, list) and len(ln) >= 4):
