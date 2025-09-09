@@ -152,4 +152,3 @@ class SettlementEngine:
             pretty.log("[yellow]No matching v4 CIDs for the requested epoch were found among masters.[/yellow]")
 
         pretty.rule("[bold cyan]SETTLEMENT (DEBUG) — DONE[/bold cyan]")
-    
