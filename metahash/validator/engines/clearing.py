@@ -48,6 +48,11 @@ class ClearingEngine:
         VALUE_TAO(α) = weight × (1 − discount) × post_slip(price, depth, α)
 
     If REPUTATION_ENABLED, we enforce per-coldkey caps in VALUE (TAO).
+
+    NEW (budget signals for settlement burn):
+      - We serialize `bt_mu` (total budget VALUE in μTAO) and
+        `bl_mu` (leftover VALUE in μTAO) into the staged payload.
+      - This lets Settlement infer the target budget and burn underfill to uid 0.
     """
 
     def __init__(self, parent, state: StateStore):
@@ -433,10 +438,6 @@ class ClearingEngine:
             if cap_left_tao and ck_cap_left != float("inf"):
                 cap_left_tao[ck] = max(0.0, ck_cap_left - tao_consumed)
 
-            # If we still have budget and also more from this same bid could be taken,
-            # the greedy pass will continue later if the bid remains highest by VALUE
-            # (we keep a single pass; typical cases suffice to exhaust budget to dust)
-
         if dbg_rows:
             pretty.table(
                 "Allocations — TAO Budget (caps enforced in TAO, partial fills)",
@@ -491,7 +492,7 @@ class ClearingEngine:
             rows_w,
         )
 
-       # 5) Stash pending commitment snapshot (publish later with SAME window)
+        # 5) Stash pending commitment snapshot (publish later with SAME window)
         pay_epoch = int(epoch_to_clear + 1)
         epoch_len = int(self.parent.epoch_end_block - self.parent.epoch_start_block + 1)
         win_start = int(self.parent.epoch_end_block) + 1
@@ -510,9 +511,13 @@ class ClearingEngine:
                 ]
             )
 
-        # --- NEW: ensure pending_commits is a dict; then stage under str(e) and log it.
+        # --- ensure pending_commits is a dict; then stage under str(e) and log it.
         if not isinstance(self.state.pending_commits, dict):
             self.state.pending_commits = {}
+
+        # === NEW: include budget signals so Settlement can burn underfill ===
+        bt_mu = int(round(my_budget_tao * 1_000_000_000))           # total budget VALUE in μTAO
+        bl_mu = int(round(remaining_budget_tao * 1_000_000_000))    # leftover VALUE in μTAO
 
         payload = {
             "v": 3,  # payload schema label (content-only; on-chain entry is v4 CID stub)
@@ -527,6 +532,12 @@ class ClearingEngine:
             #   i:   [ [uid, [ [sid, disc_bps, w_bps, rao_acc, value_mu], ... ] ], ... ]
             "inv": {str(uid): {"ck": ""} for uid in inv_i.keys()},
             "i": [[uid, lines] for uid, lines in inv_i.items()],
+            # --- Budget markers for settlement burn:
+            "bt_mu": bt_mu,                         # preferred by Settlement (total budget μTAO)
+            "bl_mu": bl_mu,                         # optional leftover μTAO (used as fallback too)
+            # (human-readable mirrors for debugging)
+            "bt_tao": float(my_budget_tao),
+            "bl_tao": float(remaining_budget_tao),
         }
 
         key = str(epoch_to_clear)
@@ -534,7 +545,7 @@ class ClearingEngine:
         if hasattr(self.state, "save_pending_commits"):
             self.state.save_pending_commits()
 
-        # NEW: loud staging confirmation
+        # Loud staging confirmation
         pretty.kv_panel(
             "Staged commit payload",
             [

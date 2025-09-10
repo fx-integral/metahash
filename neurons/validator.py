@@ -1,4 +1,9 @@
-# neurons/validator.py – SN-73 v2.3.4 (modularized, cleaned, recv-safe)
+# neurons/validator.py – SN-73 v2.3.5
+# Flow tweaks:
+#   • Publish any pending commitments BEFORE settlement (prevents settle e−2 with "no snapshots"),
+#   • Keep weights-first semantics for the epoch, but ensure snapshots exist,
+#   • Same auction/clear and catch-up logic; TESTING still suppresses on-chain set_weights.
+
 from __future__ import annotations
 
 import asyncio
@@ -31,13 +36,14 @@ from metahash.validator.epoch_validator import EpochValidatorNeuron
 
 class Validator(EpochValidatorNeuron):
     """
-    v2.3.4 (modular):
-      • DRY-RUN set_weights (suppresses on-chain, logs WOULD-SET),
+    v2.3.5:
+      • DRY-RUN set_weights (TESTING=True suppresses on-chain),
       • single-pass quotas by normalized reputation,
       • early winner notification, window recorded (pe, as, de),
       • v4 commitments: CID-only on-chain, full in IPFS,
-      • commitment publisher: strict (no inline fallback or size checks),
-      • settlement guarded; optional local pending payload as dev fallback if IPFS fails.
+      • strict commitment publisher (no inline fallback),
+      • settlement guarded; budget-aware burn handled in SettlementEngine,
+      • ordering fix: publish-catch-up happens BEFORE settlement to avoid "no snapshots".
 
     NOTE:
       • Clearing uses TAO budget (base subnet = this validator's netuid) and TAO-valued bids
@@ -60,11 +66,11 @@ class Validator(EpochValidatorNeuron):
         # Strategy (weights per subnet)
         self.weights_bps = load_weights(STRATEGY_PATH)
 
-        # Engines (they will call back into _stxn() to reuse the single client)
+        # Engines (they reuse the single client)
         self.commitments = CommitmentsEngine(self, self.state)
-        self.settlement = SettlementEngine(self, self.state)
-        self.clearing = ClearingEngine(self, self.state)
-        self.auction = AuctionEngine(self, self.state, self.weights_bps, clearer=self.clearing)
+        self.settlement   = SettlementEngine(self, self.state)
+        self.clearing     = ClearingEngine(self, self.state)
+        self.auction      = AuctionEngine(self, self.state, self.weights_bps, clearer=self.clearing)
 
         pretty.banner(
             f"Validator v{__version__} initialized",
@@ -95,6 +101,7 @@ class Validator(EpochValidatorNeuron):
         return stxn
 
     def _apply_epoch_override(self):
+        """Keep the fast test cadence if EPOCH_LENGTH_OVERRIDE is set."""
         try:
             if EPOCH_LENGTH_OVERRIDE and EPOCH_LENGTH_OVERRIDE > 0:
                 L = int(EPOCH_LENGTH_OVERRIDE)
@@ -109,10 +116,12 @@ class Validator(EpochValidatorNeuron):
 
     async def forward(self):
         """
-        Per-epoch driver (weights-first):
-          1) Settle epoch (e−2) and set weights (from commitments).
-          2) Masters: auction & clear NOW (epoch e).
-          3) Masters: publish previous epoch’s cleared winners (e−1) using stored window.
+        Per-epoch driver:
+          (Publish-first ordering to avoid settle with missing snapshots)
+          0) Ensure single AsyncSubtensor client; apply epoch override.
+          1) Publish catch-up (<= e−1) so settlement of e−2 can find snapshots.
+          2) Settle epoch (e−2) and set weights (from commitments) [weights-first].
+          3) Masters: auction & clear NOW (epoch e) — stage payload for (e−1) to be published next epoch.
         """
         await self._stxn()          # ensure single client exists
         self._apply_epoch_override()
@@ -136,10 +145,20 @@ class Validator(EpochValidatorNeuron):
             style="bold white",
         )
 
-        # 1) WEIGHTS FIRST: settle older epoch (e−2)
+        # 1) Publish any pending commitments up to e−1 BEFORE settlement,
+        #    so settlement(e−2) will see snapshots and not fall back to burn-all.
+        try:
+            await self.commitments.publish_catch_up(up_to_epoch=e - 1)
+        except asyncio.CancelledError as ce:
+            pretty.log(f"[yellow]Publish commitments cancelled by RPC: {ce}[/yellow]")
+        except Exception as exc:
+            pretty.log(f"[yellow]Publish commitments failed: {exc}[/yellow]")
+
+        # 2) WEIGHTS FIRST: settle older epoch (e−2)
         await self.settlement.settle_and_set_weights_all_masters(epoch_to_settle=e - 2)
 
-        # 2) Masters: broadcast & clear immediately (if master)
+        # 3) Masters: broadcast & clear immediately (if master). The staged payload for e
+        #    will be published on the NEXT epoch by the catch-up at the top of this method.
         if not self.auction._is_master_now() and getattr(self.auction, "_not_master_log_epoch", None) != e:
             pretty.log("[yellow]Validator is not a master — skipping broadcast/clear for this epoch.[/yellow]")
             self.auction._not_master_log_epoch = e
@@ -151,15 +170,6 @@ class Validator(EpochValidatorNeuron):
             return
         except Exception as exc:
             pretty.log(f"[yellow]AuctionStart failed: {exc}[/yellow]")
-
-        # 3) Publish previous epoch’s cleared winners (e−1)
-        try:
-            await self.commitments.publish_catch_up(up_to_epoch=e - 1)
-
-        except asyncio.CancelledError as ce:
-            pretty.log(f"[yellow]Publish commitments cancelled by RPC: {ce}[/yellow]")
-        except Exception as exc:
-            pretty.log(f"[yellow]Publish commitments failed: {exc}[/yellow]")
 
         # cleanup bid books older than (e−1)
         self.auction.cleanup_old_epoch_books(before_epoch=e - 2)

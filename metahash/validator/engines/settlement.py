@@ -1,8 +1,12 @@
-# metahash/validator/engines/settlement.py — Modular settlement (VALUE-based) + Budget Burn
+# metahash/validator/engines/settlement.py — VALUE-based settlement + Budget-aware burn
+# Rewards = sum(value_mu) per miner gated by α-payments (strict per-subnet).
+# If payload advertises a budget target, we burn the underfill by assigning delta to UID 0.
+
 from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 from collections import defaultdict
 from decimal import Decimal, getcontext
@@ -30,9 +34,9 @@ from metahash.config import (
 getcontext().prec = 60
 _1e9 = Decimal(10) ** 9
 
-# Debugging UX
+# Debugging UX (can disable pauses in TESTING to avoid timing drift)
 VERBOSE_DUMPS = True
-PAUSE_ON_CHECKPOINTS = True  # auto-disabled when not TTY
+PAUSE_ON_CHECKPOINTS = os.getenv("SETTLEMENT_PAUSE", "false").lower() == "true"  # default off
 
 # Payment check policy:
 # If True: require per-subnet paid_rao >= required_rao for *every* line of a miner (strict).
@@ -48,7 +52,6 @@ def _isatty() -> bool:
 
 
 def _pause(msg: str):
-    return
     """Optional interactive pause."""
     if not PAUSE_ON_CHECKPOINTS or not _isatty():
         return
@@ -69,16 +72,6 @@ def _j(obj) -> str:
             return "<unprintable>"
 
 
-def _kv_preview(d: dict, n=8) -> dict:
-    out = {}
-    for i, (k, v) in enumerate(d.items()):
-        if i >= n:
-            out["…"] = f"+{len(d)-n} more"
-            break
-        out[k] = v
-    return out
-
-
 class SettlementEngine:
     """
     Modular settlement flow (+ budget-aware burn):
@@ -86,17 +79,21 @@ class SettlementEngine:
       2) Merge payment window [as, de] across masters; wait until closed (de + delay).
       3) Scan α transfers (miners → master treasuries) in the merged window.
       4) Build paid index (uid, treasury, subnet) → paid_rao (drop forbidden / cross-subnet).
-      5) Score miners using VALUE stored in payload lines, gated by payment checks:
+      5) Score miners using VALUE stored in payload lines, gated by payments:
            - STRICT_PER_SUBNET=True → every line's required_rao must be paid on that subnet.
            - else                   → miner_total_paid_rao must cover total required_rao.
       6) **Budget burn:** If a snapshot carries a budget target (TAO VALUE) > spent VALUE, add the
          delta to UID 0 so normalized weights reflect SPENT + BURN == BUDGET.
       7) Apply weights or preview (TESTING=True suppresses on-chain set_weights).
 
-    Notes:
-      • This module *does not* re-compute VALUE; we trust `value_mu` (μTAO) from payload.
-      • Budget target is taken from payload if present (`bt_mu`, or `spent_mu + bl_mu`).
-      • If a snapshot has no recognizable budget signals, we skip burn for that snapshot.
+    Budget inference (per snapshot):
+      • Preferred:  bt_mu / budget_mu / budget_value_mu   (μTAO)
+      • Or:        bt_tao / budget_tao / budget_value_tao (TAO)
+      • Or:        (sum(value_mu) + bl_mu)  → target μTAO
+      • Else:      budget unknown → no burn for that snapshot.
+
+    NOTE: To enable burning underfill, make sure your clearing payload includes *either*
+          `bt_mu` (total budget VALUE μTAO) *or* `bl_mu` (leftover VALUE μTAO).
     """
 
     def __init__(self, parent, state: StateStore):
@@ -490,7 +487,6 @@ class SettlementEngine:
             inv: Dict[str, Dict] = s.get("inv", {}) or {}
 
             # --- collect lines per miner & score ---
-            # also accumulate SPENT VALUE for this snapshot (post gate)
             snapshot_spent_value_tao = 0.0
 
             for uid_s, inv_d in inv.items():
@@ -526,7 +522,7 @@ class SettlementEngine:
                             lines_compact.append(ln)
 
                 for ln in lines_compact:
-                    # Expected normalized order in our payload: [sid, disc_bps, w_bps, required_rao, value_mu?]
+                    # Expected order: [sid, disc_bps, w_bps, required_rao, value_mu?]
                     try:
                         sid = int(ln[0]); req_rao = int(ln[3])
                     except Exception:
@@ -543,7 +539,7 @@ class SettlementEngine:
                 if total_required <= 0:
                     continue
 
-                # Determine paid α for this miner to THIS master's treasury (strictly per-subnet or total)
+                # Determine paid α to THIS master's treasury (strictly per-subnet or total)
                 if STRICT_PER_SUBNET:
                     fully_paid = True
                     for sid, need in by_sid_required.items():
@@ -567,7 +563,7 @@ class SettlementEngine:
                     scores_by_uid[uid] += total_value_tao
                     snapshot_spent_value_tao += total_value_tao
 
-            # --- try to infer a budget target for this snapshot ---
+            # --- infer a budget target for this snapshot (for burn accounting) ---
             snapshot_budget_tao = self._infer_snapshot_budget_value_tao(s)
 
             # accumulate totals
@@ -575,9 +571,7 @@ class SettlementEngine:
             if snapshot_budget_tao is not None:
                 budget_total_tao += snapshot_budget_tao
 
-        # compute burn only for the portion where we could infer a target
         burn_tao = max(0.0, budget_total_tao - spent_total_tao)
-
         metrics = dict(spent_tao=spent_total_tao, budget_tao=budget_total_tao, burn_tao=burn_tao)
         return scores_by_uid, credit_rows, metrics
 
@@ -588,8 +582,8 @@ class SettlementEngine:
         Priority:
           1) bt_mu / budget_mu / budget_value_mu (int, μTAO)
           2) bt_tao / budget_tao / budget_value_tao (float)
-          3) If we have `bl_mu` / `leftover_mu` plus we can sum per-line `value_mu`,
-             then target = spent + leftover.
+          3) If we have `bl_mu` (leftover μTAO) plus sum of per-line `value_mu`,
+             then target = spent + leftover
           4) Otherwise, return None (skip burn for this snapshot).
         """
         # (1) integer μTAO keys
@@ -644,7 +638,6 @@ class SettlementEngine:
                                 except Exception:
                                     pass
 
-            # if we were able to compute anything, return total
             total_mu = spent_mu + int(leftover_mu)
             if total_mu > 0:
                 return float(Decimal(total_mu) / _1e9)
@@ -723,8 +716,8 @@ class SettlementEngine:
             "<uid>": { "ck": "<coldkey|empty>", "ln": [[sid, disc_bps, weight_bps, required_rao, value_mu?], ...] },
             ...
           }
-        Accepts our compact `i: [[uid, [[sid, disc_bps, w_bps, rao, value_mu?], ...]], ...]`
-        and legacy variants (ln with [sid, w_bps, rao, disc?, value_mu?]).
+        Accepts compact `i: [[uid, [[sid, disc_bps, w_bps, rao, value_mu?], ...]], ...]`
+        and legacy variants.
         """
         inv: Dict[str, Dict] | None = s.get("inv")  # type: ignore[assignment]
         if isinstance(inv, dict) and inv:
@@ -735,7 +728,7 @@ class SettlementEngine:
                                 style="bold cyan")
             return inv
 
-        # fall back to legacy/compact "i"
+        # fall back to compact "i"
         inv_tmp: Dict[str, Dict] = {}
         if "i" in s and isinstance(s["i"], list):
             for item in s["i"]:
