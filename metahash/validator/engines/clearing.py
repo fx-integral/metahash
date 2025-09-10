@@ -516,8 +516,8 @@ class ClearingEngine:
             self.state.pending_commits = {}
 
         # === NEW: include budget signals so Settlement can burn underfill ===
-        bt_mu = int(round(my_budget_tao * 1_000_000_000))           # total budget VALUE in μTAO
-        bl_mu = int(round(remaining_budget_tao * 1_000_000_000))    # leftover VALUE in μTAO
+        bt_mu = int(encode_value_mu(my_budget_tao))           # total budget in μTAO
+        bl_mu = int(encode_value_mu(remaining_budget_tao))    # leftover in μTAO
 
         payload = {
             "v": 3,  # payload schema label (content-only; on-chain entry is v4 CID stub)
