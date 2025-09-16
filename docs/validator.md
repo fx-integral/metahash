@@ -1,4 +1,4 @@
-# 🧪 MetaHash Validator Setup Guide (Subnet 73)
+# MetaHash Validator Setup Guide (Subnet 73)
 
 This guide outlines how to set up and operate a **MetaHash SN73 Validator**, which is responsible for:
 - Tracking cross-subnet alpha deposits,
@@ -7,7 +7,7 @@ This guide outlines how to set up and operate a **MetaHash SN73 Validator**, whi
 
 ---
 
-## 📦 Prerequisites
+## Prerequisites
 1. **Subtensor lite node with `--pruning=2000`** configured
 2. **Python 3.10+** installed
 3. **pip/venv** for isolated environment
@@ -15,7 +15,7 @@ This guide outlines how to set up and operate a **MetaHash SN73 Validator**, whi
 
 ---
 
-## 🧪 Setup Environment
+## Setup Environment
 
 ```bash
 # Clone the MetaHash repository
@@ -32,7 +32,7 @@ uv pip install -e .
 
 ---
 
-## ⚙️ Configuration
+## Configuration
 
 ### 1. `.env` — Environment Variables
 
@@ -46,7 +46,7 @@ BT_NETWORK=finney
 
 ---
 
-### 2. 🧊 Wallet Initialization
+### 2. Wallet Initialization
 
 If needed, create and register your validator wallet:
 
@@ -65,15 +65,15 @@ btcli subnets register --wallet.name mywallet --wallet.hotkey myhotkey --netuid 
 
 ---
 
-## 🚀 Running the Validator
+## Running the Validator
 
-### ✅ Using PM2 (recommended)
+### Using PM2 (recommended)
 
 ```bash
 pm2 start python --name metahash-validator -- neurons/validator.py --netuid 73 --subtensor.network finney --wallet.name validator-wallet --wallet.hotkey validator-hotkey --logging.debug
 ```
 
-### 🔁 Development Mode
+### Development Mode
 
 ```bash
 python neurons/validator.py --netuid 73 --subtensor.network finney --wallet.name validator-wallet --wallet.hotkey validator-hotkey --logging.debug
@@ -88,7 +88,7 @@ This validator will:
 
 ---
 
-## 🧠 How It Works
+## How It Works
 
 - Validators run `EpochValidatorNeuron`, executing once per chain tempo
 - Events are scanned from the chain using `alpha_transfers.py`
@@ -98,7 +98,7 @@ This validator will:
 
 ---
 
-## ⚖️ Reward Mechanics
+## Reward Mechanics
 
 Validators apply:
 
@@ -112,7 +112,7 @@ Validators apply:
 
 ---
 
-## 🛡️ Safeguards
+## Safeguards
 
 - Wallet sync is enforced on failure to avoid dehydration
 - Rewards only emitted if valid scores exist (`E-2` guard)
@@ -121,7 +121,7 @@ Validators apply:
 
 ---
 
-## 📓 Logs & Debugging
+## Logs & Debugging
 
 Use PM2 to view logs:
 
@@ -137,7 +137,7 @@ python neurons/validator.py --logging.debug
 
 ---
 
-## 🧩 System Components
+## System Components
 
 - `alpha_transfers.py`: monitors alpha inflow events
 - `rewards.py`: calculates SN73 reward weights
@@ -147,7 +147,7 @@ python neurons/validator.py --logging.debug
 
 ---
 
-## ✅ You're Validating!
+## You're Validating!
 
 Once running, your validator:
 - Accepts OTC alpha deposits from bonded coldkeys
@@ -155,8 +155,8 @@ Once running, your validator:
 - Incentivizes contributors with appropriately priced SN73 rewards
 - Builds the MetaHash alpha treasury to benefit all SN73 holders
 
-## 🔗 Resources
+## Resources
 
-- 📁 **GitHub**: https://github.com/fx-integral/metahash/
-- 📚 **Bittensor Docs**: https://docs.bittensor.com/
-- 🔐 **Coldkey and Hotkey Workstation Security**: https://docs.learnbittensor.org/getting-started/coldkey-hotkey-security/
+- **GitHub**: https://github.com/fx-integral/metahash/
+- **Bittensor Docs**: https://docs.bittensor.com/
+- **Coldkey and Hotkey Workstation Security**: https://docs.learnbittensor.org/getting-started/coldkey-hotkey-security/

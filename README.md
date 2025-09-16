@@ -11,11 +11,11 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Twitter Follow](https://img.shields.io/twitter/follow/MetaHashSn73?style=social)](https://twitter.com/MetaHashSn73)
 
-🌐 [Website](https://metahash73.com) • ⛏️ [Mining Guide](docs/miner.md) • 🧑‍🏫 [Validator Guide](docs/validator.md)
+[Website](https://metahash73.com) • [Mining Guide](docs/miner.md) • [Validator Guide](docs/validator.md)
 </div>
 
 ---
-## 🚀 Overview
+## Overview
 **Metahash (Subnet 73)** is a decentralized over-the-counter (OTC) layer that allows dTAO holders swap **$ALPHA** directly for **$META**, eliminating slippage and price impact on their native subnets.
 
 All incoming **$ALPHA** is routed to the **Treasury**, where it can be used to  
@@ -30,44 +30,44 @@ All incoming **$ALPHA** is routed to the **Treasury**, where it can be used to
 
 ---
 
-## 🔥 Value Proposition
-### 🧑‍🌾 For DTAO Holders 
-- Participation open to **anyone**, not just "miners" of other subnets. 
-- Specially usefull for **miners** and **subnet owners**. 
+## Value Proposition
+### For DTAO Holders
+- Participation open to **anyone**, not just "miners" of other subnets.
+- Specially usefull for **miners** and **subnet owners**.
 - Swap $ALPHA for $META via seamless OTC trades.  
 - Dodge slippage and pool price impact on origin subnets in exchange of a **discount**.
 
-### 🧍‍♀️ For SN73 Holders  
+### For SN73 Holders  
 - Exposure to a decentralized suite of OTC strategies.  
 - Portfolio of diversified, discounted $ALPHA.
 
-### 🧠 For the Network  
+### For the Network  
 - Provides liquidity across Bittensor.
 - Serves as a “stimulus check” that allows Bittensor to bet on itself.
 
 
-## ⚙️ How It Works
+## How It Works
 
-### 🔁 Epoch Lifecycle
+### Epoch Lifecycle
 
 Metahash operates on a structured, three-phase cycle that starts at the beginning of each epoch.
 Each epoch functions like an **“auction”** for $META, in which miners compete to acquire it.
 
-#### Phase 1: 📊 Reward Calculations For Previous Auction
+#### Phase 1: Reward Calculations For Previous Auction
 - Track alpha transfers from the previous epoch
 - Aggregate total per miner
 - Apply slippage-adjusted to valuation
 - Adjust base on bond curve
 - Give miners their corresponding $META by setting weights
 
-#### Phase 2: ⏳ Preparation (Blocks 1–49)
+#### Phase 2: Preparation (Blocks 1–49)
 - Miners prepare for the auction
 - Validators finalize reward calculations and weight setting of previous epoch
 - In future iterations, this period will be use to notify miner of auction details
 
 > Auction opens at block 50 each epoch.
 
-#### Phase 3: 💸 Dutch Auction
+#### Phase 3: Dutch Auction
 - Discount miners give starts low and increases as alpha reach the treasury
 - Bonding curve determines the discount each miner is accepting when transfering the alpha
 - Early miners receive higher rewards
@@ -76,7 +76,7 @@ Each epoch functions like an **“auction”** for $META, in which miners compet
 
 ---
 
-## ⚡ Auction Flow
+## Auction Flow
 
 ### Budget
 
@@ -113,11 +113,11 @@ Where `361` is the number of blocks per epoch, and `0.41` is the mining emission
 | **Miner incentives**| Favors guessing & collusion.                  | Rewards speed & individual optimisation.                |
 | **Subnet risk**   | Unlimited volatility.                           | Upside and downside capped; unused budget burns.        |
 
-Uniform Valuation of alpha creates a dynamic where miners compete **TOGETHER** agains the subnet trying to make the subnet over pay. 
+Uniform Valuation of alpha creates a dynamic where miners compete **TOGETHER** agains the subnet trying to make the subnet over pay.
 
 Bond Curve valuation limits upside and downside. Subnet now is limited on how much "profit" it can generate but it makes miners compete against **EACH OTHER** and subnet neves losses money as $META is burned in the case of under-subscription of the auction (not enough alpha was sent to compensate mining emissions value)
 
-### 🧮 Reward Rate Formula
+### Reward Rate Formula
 
 ```math
 rate(m) = max(r_min, C₀ / (1 + β · m))
@@ -134,7 +134,7 @@ rate(m) = max(r_min, C₀ / (1 + β · m))
 
 ---
 
-## 🛡️ Risk Mitigation
+## Risk Mitigation
 
 Several attack vectors have already been assessed:
 
@@ -146,16 +146,16 @@ Several attack vectors have already been assessed:
 ---
 
 
-## 📜 Proposals
+## Proposals
 
 To know more about the future of Metahash and next iterations pls check this!
 
-[➡️ View our proposals](proposals.md)
+[View our proposals](proposals.md)
 
 ---
 
 
-## 🔥 Welcome to MetaHash — The Evolution of Merit
+## Welcome to MetaHash — The Evolution of Merit
 
 Join us in building a decentralized OTC infrastructure for Bittensor.  
 Trade alpha, manage treasury, and create the next generation of market mechanisms.
