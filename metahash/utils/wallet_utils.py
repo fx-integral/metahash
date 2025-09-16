@@ -130,15 +130,15 @@ async def transfer_alpha(
             if not wait_for_finalization and not wait_for_inclusion:
                 return True
 
-            bt.logging.success(":white_heavy_check_mark: [green]Finalized[/green]")
+            bt.logging.success("[green]Finalized[/green]")
 
             return True
         else:
-            bt.logging.error(f":cross_mark: [red]Failed[/red]: {err_msg}")
+            bt.logging.error(f"[red]Failed[/red]: {err_msg}")
             return False
 
     except Exception as e:
-        bt.logging.error(f":cross_mark: [red]Failed[/red]: {str(e)}")
+        bt.logging.error(f"[red]Failed[/red]: {str(e)}")
         return False
 
 
