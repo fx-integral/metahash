@@ -107,10 +107,11 @@ def _format_range(start: int, length: int) -> str:
 def _status_line(head: int, open_: int, epoch_start: int, epoch_len: int) -> str:
     epoch_end = epoch_start + epoch_len - 1
     blocks_left = epoch_end - head
-    state = "⏳ pending" if head < open_ else "🟢 active "
+    state = "pending" if head < open_ else "active"
     eid = head // epoch_len
+    state_label = f"{state:<8}"
     return (
-        f"{state}│ Epoch {eid} [{_format_range(epoch_start, epoch_len)}] │ "
+        f"{state_label}│ Epoch {eid} [{_format_range(epoch_start, epoch_len)}] │ "
         f"Block {head} │ {blocks_left} blk left"
     )
 

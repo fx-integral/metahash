@@ -64,11 +64,11 @@ def _allowed_extrinsic_indices(                       # noqa: PLR0911
             if self.debug_extr:
                 bt.logging.debug(f"[blk {block_num}] ex#{idx}  {pallet}.{func}")
 
-            # 1️⃣ direct α‑stake transfer
+            # 1 direct α‑stake transfer
             if (pallet, func) == ("SubtensorModule", "transfer_stake"):
                 allowed.add(idx)
 
-            # 2️⃣ optional Utility batches
+            # 2 optional Utility batches
             elif (
                 pallet == "Utility"
                 and func in UTILITY_FUNS
@@ -351,7 +351,7 @@ class AlphaTransfersScanner:
         )
 
         bt.logging.info(
-            f"✓ scan finished: {blk_cnt} blk, {ev_cnt} ev, {keep_cnt} kept"
+            f"scan finished: {blk_cnt} blk, {ev_cnt} ev, {keep_cnt} kept"
         )
         await _flush_progress()
 

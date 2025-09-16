@@ -253,7 +253,7 @@ class Validator(EpochValidatorNeuron):
             else:
                 self.update_scores(rewards, miner_uids)
 
-            # ── ✅  broadcast weights on-chain  ────────────────────────── #
+            # ── broadcast weights on-chain ────────────────────────── #
             if not self.config.no_epoch:          # honour --no-epoch flag
                 self.set_weights()
                 self._validated_epochs.add(prev_epoch_index)
@@ -263,7 +263,7 @@ class Validator(EpochValidatorNeuron):
     async def forward(self) -> None:
         """Runs once per epoch head – Phase 1 plus bookkeeping."""
         bt.logging.success(
-            f"▶︎ forward() called at block {self.block:,} (epoch {self.epoch_index})"
+            f"forward() called at block {self.block:,} (epoch {self.epoch_index})"
         )
 
         await self._ensure_async_subtensor()

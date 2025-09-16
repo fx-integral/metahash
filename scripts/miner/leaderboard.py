@@ -156,9 +156,9 @@ async def _snapshot(
         })
 
     # ───── status banner ───── #
-    status_emoji = "🟢" if head >= auction_open else "⏳"
+    status_label = "Active" if head >= auction_open else "Pending"
     banner_txt = (
-        f"{status_emoji}  "
+        f"{status_label}  "
         f"Epoch {eid}  "
         f"[{_format_range(epoch_start, epoch_len)}]  ·  "
         f"Block {head}"
@@ -180,8 +180,8 @@ async def _snapshot(
         # Raw events from the patched scanner
         new_raw = await scanner.scan(start_blk, head)
 
-        # ‼️  Re‑wrap into the *rewards* TransferEvent dataclass ‼️
-        #     (compute_epoch_rewards expects this type)
+        # Re-wrap into the *rewards* TransferEvent dataclass
+        # (compute_epoch_rewards expects this type)
         new_events = [
             TransferEvent(
                 block=ev.block,

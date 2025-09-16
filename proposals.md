@@ -1,7 +1,7 @@
-## 📈 Proposals for the Future
+## Proposals for the Future
 
 ---
-### 🧾 Proposal 1: Off-Chain Buy-Offer Sync (Miner ↔ Validator)
+### Proposal 1: Off-Chain Buy-Offer Sync (Miner ↔ Validator)
 
 **Pain point**  
 On-chain bidding is noisy, unpredictable, and vulnerable to frontrunning.
@@ -22,7 +22,7 @@ Introduce a lightweight buy-offer protocol over HTTP:
 
 ---
 
-### 💼 Proposal 2: Validators as Hedge Funds
+### Proposal 2: Validators as Hedge Funds
 
 **Problem:** No current strategic asset selection exists.
 
@@ -50,13 +50,13 @@ Validator Budget = (361 × 0.41) × (Validator Stake / Total Stake)
 - Validators validate auctions for every other validator
 
 
-### 📋 What Validators Can Control
+### What Validators Can Control
 
 - **Subnet Selection:** Prefer or exclude specific subnets
 - **Dynamic Pricing:** Customize bonding curve per subnet
 - **Deal Terms:** Lock periods, discount tiers, bonus incentives
 
-### 💰 Why Validators Care
+### Why Validators Care
 
 Validators are rewarded by:
 
@@ -65,7 +65,7 @@ Validators are rewarded by:
 - **Capital Control:** Choose how to use earned alpha
 
 
-## 🫂 Aligning Holders with Performance
+## Aligning Holders with Performance
 
 **Problem:** No incentive for holders to choose top validators
 
