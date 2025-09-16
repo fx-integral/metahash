@@ -41,7 +41,7 @@ def setup_logging(level: str = "INFO") -> None:
 
 
 def die(msg: str) -> None:
-    logger.error(f"✗ {msg}")
+    logger.error(msg)
     sys.exit(1)
 
 
@@ -99,7 +99,7 @@ async def run(args: argparse.Namespace) -> None:
         logger.error("Alpha transfer failed")  # ← logger
         sys.exit(1)
     current_block = await subtensor.get_current_block()
-    logger.success(f"✓ Alpha transfer included in block {current_block} 🎉")  # ← logger
+    logger.success(f"Alpha transfer included in block {current_block}")  # ← logger
 
 
 # ────────────────────────── CLI ────────────────────────────

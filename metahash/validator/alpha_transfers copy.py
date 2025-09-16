@@ -302,7 +302,7 @@ class AlphaTransfersScanner:
         )
 
         bt.logging.info(
-            f"✓ scan finished: {blk_cnt} blk, {ev_cnt} ev, {keep_cnt} kept"
+            f"scan finished: {blk_cnt} blk, {ev_cnt} ev, {keep_cnt} kept"
         )
         await _flush_progress()
 
@@ -384,7 +384,7 @@ class AlphaTransfersScanner:
                 if dump:
                     bt.logging.info(
                         f"[blk {block_hint_single}] cross‑net α‑transfer "
-                        f"{te.src_subnet_id} ➞ {te.subnet_id}  "
+                        f"{te.src_subnet_id} -> {te.subnet_id}  "
                         f"(amount={te.amount_rao})  **IGNORED**"
                     )
                 continue

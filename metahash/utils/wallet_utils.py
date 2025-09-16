@@ -80,7 +80,7 @@ def check_coldkeys_and_signatures(
 
         verified.append({"address": addr, "signature": sig_hex})
 
-    clog.success(f"✓ All {len(verified)} cold‑keys verified", color="green")
+    clog.success(f"All {len(verified)} cold‑keys verified", color="green")
     return verified
 
 

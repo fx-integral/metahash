@@ -143,7 +143,7 @@ def make_uid_resolver(mapping: Dict[str, int]):
 
 
 # ======================================================================
-# 1️⃣  Bond‑curve: first‑mover advantage
+# 1 Bond‑curve: first‑mover advantage
 # ======================================================================
 @pytest.mark.asyncio
 @pytest.mark.integration
@@ -187,7 +187,7 @@ async def test_bond_curve_ordering(live_chain, bond_curve_params):
 
 
 # ======================================================================
-# 2️⃣  Slippage: shallow pool ⇒ award < TAO value
+# 2 Slippage: shallow pool ⇒ award < TAO value
 # ======================================================================
 @pytest.mark.asyncio
 @pytest.mark.integration
@@ -236,7 +236,7 @@ async def test_slippage_kicks_in(live_chain, bond_curve_params):
 
 
 # ======================================================================
-# 3️⃣  Bag cap & surplus burn
+# 3 Bag cap & surplus burn
 # ======================================================================
 @pytest.mark.asyncio
 @pytest.mark.integration
