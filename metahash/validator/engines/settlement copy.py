@@ -14,7 +14,7 @@ from metahash.utils.ipfs import aget_json
 from metahash.utils.commitments import read_all_plain_commitments
 from metahash.validator.alpha_transfers import AlphaTransfersScanner, TransferEvent
 from metahash.treasuries import VALIDATOR_TREASURIES
-from metahash.validator.valuation import decode_value_mu, effective_value_tao
+from metahash.utils.valuation import decode_value_mu, effective_value_tao
 from metahash.validator.state import StateStore
 from metahash.utils.helpers import safe_json_loads, safe_int
 

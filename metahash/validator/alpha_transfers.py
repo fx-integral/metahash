@@ -101,6 +101,8 @@ LOG_EVERY = 50
 DUMP_LAST = 5
 
 # ── dataclasses ─────────────────────────────────────────────────────────
+
+
 @dataclass(slots=True, frozen=True)
 class TransferEvent:
     """Container for a single α-stake transfer."""

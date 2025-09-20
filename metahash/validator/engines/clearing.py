@@ -28,7 +28,7 @@ from metahash.treasuries import VALIDATOR_TREASURIES
 
 # Price oracle (for ordering & budget conversion; prices are NOT written into commitments)
 from metahash.utils.subnet_utils import average_price, average_depth
-from metahash.validator.valuation import (
+from metahash.utils.valuation import (
     effective_value_tao,
     encode_value_mu,
 )

@@ -1,9 +1,11 @@
-# neurons/commitments.py — Strict v4 publisher (CID-only on-chain; full payload in IPFS)
+# metahash/validator/engines/commitments.py — Strict v4 publisher (CID-only on-chain; full payload in IPFS)
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Dict
 
+from bittensor import BLOCKTIME
 from metahash.utils.ipfs import aadd_json, minidumps as ipfs_minidumps, IPFSError
 from metahash.utils.pretty_logs import pretty
 from metahash.utils.commitments import write_plain_commitment_json
@@ -30,7 +32,7 @@ class CommitmentsEngine:
         self.parent = parent
         self.state = state
 
-    async def publish_commitment_for(self, epoch_cleared: int):
+    async def publish_commitment_for(self, epoch_cleared: int, *, max_retries: int = 3) -> None:
         """
         Publish winners payload for epoch (e − 1) that was cleared.
         Reads payload from state.pending_commits[str(epoch_cleared)] and does:
@@ -38,7 +40,7 @@ class CommitmentsEngine:
           1) IPFS: add the full payload as-is.
           2) On-chain: write v4 CID-only commitment with e=epoch_cleared, pe=epoch_cleared+1.
 
-        If anything fails, it logs and returns (no fallback).
+        Retries on common pool errors like "Priority is too low".
         """
         if epoch_cleared < 0:
             return
@@ -79,7 +81,7 @@ class CommitmentsEngine:
             pretty.log(f"[yellow]IPFS publish failed (no fallback): {e}[/yellow]")
             return
 
-        # 2) Write v4, CID-only commitment on-chain
+        # 2) Write v4, CID-only commitment on-chain — with retry on pool priority
         commit_v4 = {
             "v": 4,
             "e": int(epoch_cleared),
@@ -88,18 +90,7 @@ class CommitmentsEngine:
         }
         commit_str = ipfs_minidumps(commit_v4, sort_keys=True)
 
-        try:
-            st = await self.parent._stxn()
-            ok = await write_plain_commitment_json(
-                st,
-                wallet=self.parent.wallet,
-                data=commit_str,
-                netuid=self.parent.config.netuid,
-            )
-        except Exception as e:
-            pretty.log(f"[yellow]On-chain commitment write failed (no fallback): {e}[/yellow]")
-            return
-
+        ok = await self._write_commitment_with_retry(commit_str, max_retries=max_retries)
         if ok:
             pretty.kv_panel(
                 "Commitment Published (v4 CID-only, full payload in IPFS)",
@@ -116,7 +107,7 @@ class CommitmentsEngine:
             self.state.pending_commits.pop(key, None)
             self.state.save_pending_commits()
         else:
-            pretty.log("[yellow]Commitment publish returned False (no fallback).[/yellow]")
+            pretty.log("[yellow]Commitment publish failed after retries (no fallback).[/yellow]")
 
     # ---------- utils ----------
     def _is_master_now(self) -> bool:
@@ -145,11 +136,12 @@ class CommitmentsEngine:
             for i, hk in enumerate(getattr(self.parent.metagraph, "hotkeys")):
                 mapping[hk] = i
         return mapping
-    
-    async def publish_catch_up(self, up_to_epoch: int):
+
+    async def publish_catch_up(self, up_to_epoch: int, *, max_retries: int = 3):
         """
         Publish any staged payloads with key <= up_to_epoch.
         This prevents gaps if a previous epoch missed publishing.
+        (Used post‑settlement in the validator to avoid overwriting e−2.)
         """
         if not self._is_master_now():
             return
@@ -165,4 +157,44 @@ class CommitmentsEngine:
                 pretty.log(f"[yellow]Skipping non-integer pending key: {k!r}[/yellow]")
 
         for e in sorted(ki for ki in keys if ki <= int(up_to_epoch)):
-            await self.publish_commitment_for(e)
+            await self.publish_commitment_for(e, max_retries=max_retries)
+
+    # ---------- internal: write with retry ----------
+    async def _write_commitment_with_retry(self, commit_str: str, *, max_retries: int = 3) -> bool:
+        """
+        Sends the commitment extrinsic, retrying on common pool errors (e.g., 'Priority is too low').
+        Uses the parent's RPC lock to serialize submissions from this process.
+        """
+        last_exc: Exception | None = None
+        for attempt in range(1, int(max_retries) + 1):
+            try:
+                st = await self.parent._stxn()
+                async with self.parent._rpc_lock:
+                    ok = await write_plain_commitment_json(
+                        st,
+                        wallet=self.parent.wallet,
+                        data=commit_str,
+                        netuid=self.parent.config.netuid,
+                    )
+                if ok:
+                    return True
+                # Returned False (uncommon), wait a block and retry.
+                pretty.log(f"[yellow]Commitment write returned False (attempt {attempt}/{max_retries}). Retrying…[/yellow]")
+            except Exception as e:
+                last_exc = e
+                msg = str(e) if e else ""
+                # Typical pool contention: same nonce / same priority in the same block.
+                if "Priority is too low" in msg or "Transaction is outdated" in msg or "already imported" in msg:
+                    pretty.log(f"[yellow]Commitment write pool conflict (attempt {attempt}/{max_retries}): {msg} — waiting ~1 block…[/yellow]")
+                else:
+                    pretty.log(f"[yellow]Commitment write exception (attempt {attempt}/{max_retries}): {msg} — waiting ~1 block…[/yellow]")
+
+            # Wait approximately one block before retrying
+            try:
+                await asyncio.sleep(max(1.0, float(BLOCKTIME)))
+            except Exception:
+                await asyncio.sleep(2.0)
+
+        if last_exc:
+            pretty.log(f"[yellow]On-chain commitment write failed after {max_retries} retries: {last_exc}[/yellow]")
+        return False
