@@ -227,7 +227,7 @@ class MinerMixins:
             w.pay_attempts,
             (w.invoice_id[:8] + "…"),
             (w.last_response or "")[:24] + ("…" if len(w.last_response or "") > 24 else "")
-        ] for w in sorted(done, key=lambda x: (-w.last_attempt_ts))[:LOG_TOP_N]]
+        ] for w in sorted(done, key=lambda row: -(getattr(row, "last_attempt_ts", 0) or 0))[:LOG_TOP_N]]
 
         if rows_pend:
             pretty.table(
