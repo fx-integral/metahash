@@ -53,6 +53,11 @@ class ClearingEngine:
       - We serialize `bt_mu` (total budget VALUE in μTAO) and
         `bl_mu` (leftover VALUE in μTAO) into the staged payload.
       - This lets Settlement infer the target budget and burn underfill to uid 0.
+
+    FIX (v2.3.7):
+      - Two-pass allocation: pass1 honors reputation caps; pass2 relaxes caps to
+        consume leftover budget if any bids remain (no reason to leave VALUE idle).
+      - Track accepted α per bid across passes to never exceed request.
     """
 
     def __init__(self, parent, state: StateStore):
@@ -222,6 +227,10 @@ class ClearingEngine:
         """
         Clear and notify winners for the current epoch epoch_to_clear using
         PARTIAL FILLS to greedily exhaust the TAO budget (down to dust).
+
+        FIX: two-pass:
+          - pass1 honors per-CK TAO caps (reputation)
+          - pass2 (if leftover) relaxes caps to consume remaining budget
         """
         if epoch_to_clear is None or epoch_to_clear < 0:
             return False
@@ -346,6 +355,8 @@ class ClearingEngine:
 
         winners: List[WinAllocation] = []
         dbg_rows = []
+        # FIX: track accepted per bid to support pass2 (relaxed)
+        accepted_alpha_by_key: Dict[Tuple[int, int, int], float] = defaultdict(float)  # (uid, subnet_id, idx) -> α accepted
 
         # helper: solve α such that VALUE(α) ≤ limit (monotone → bisection), α ∈ [0, want]
         def _solve_take_alpha_for_limit(b: BidInput, want_alpha: float, limit_tao: float) -> float:
@@ -382,28 +393,20 @@ class ClearingEngine:
                 kwargs["alpha_requested"] = float(b.alpha)
             return WinAllocation(**kwargs)
 
-        for b in ordered:
-            if remaining_budget_tao <= EPS_VALUE:
-                break
-            ck = b.coldkey
-            want_alpha = max(0.0, float(b.alpha))
-            if want_alpha <= EPS_ALPHA:
-                continue
-
-            # TAO limit available for this allocation (global + per-CK cap)
-            if cap_left_tao:
-                ck_cap_left = float(cap_left_tao.get(ck, 0.0))
-            else:
-                ck_cap_left = float("inf")
-            tao_limit = min(remaining_budget_tao, ck_cap_left)
-
+        def _consider_bid(b: BidInput, tao_limit: float, pass_label: str):
+            """Inner step used by both passes."""
+            nonlocal remaining_budget_tao
             if tao_limit <= EPS_VALUE:
-                continue
-
-            # Solve α to consume up to tao_limit VALUE (partial if needed)
+                return
+            key = (b.miner_uid, b.subnet_id, b.idx)
+            already = accepted_alpha_by_key.get(key, 0.0)
+            want_total = max(0.0, float(b.alpha))
+            want_alpha = max(0.0, want_total - already)
+            if want_alpha <= EPS_ALPHA:
+                return
             take_alpha = _solve_take_alpha_for_limit(b, want_alpha, tao_limit)
             if take_alpha <= EPS_ALPHA:
-                continue
+                return
 
             w = _make_winalloc(b, take_alpha)
             winners.append(w)
@@ -411,38 +414,65 @@ class ClearingEngine:
             tao_consumed = line_value_tao(b, take_alpha)
             per_alpha = tao_consumed / max(EPS_ALPHA, take_alpha)
 
-            # Debug row: show α vs TAO *value* and caps in TAO-value
-            if cap_left_tao and ck_cap_left != float("inf"):
-                cap_note = f"{ck_cap_left:.6f}→{max(0.0, ck_cap_left - tao_consumed):.6f} TAO"
-            else:
-                cap_note = "—"
-
             dbg_rows.append(
                 [
                     b.miner_uid,
-                    str(ck)[:8] + "…",
+                    str(b.coldkey)[:8] + "…",
                     b.subnet_id,
-                    f"{want_alpha:.4f} α",                 # requested
-                    f"{take_alpha:.4f} α",                 # accepted (partial/full)
+                    f"{want_total:.4f} α",
+                    f"{already + take_alpha:.4f} α ({'+' if already>0 else ''}{take_alpha:.4f})",
                     f"{per_alpha:.10f} TAO/α",
                     f"{tao_consumed:.6f} TAO(VALUE)",
                     b.discount_bps,
                     b.weight_bps,
-                    f"{remaining_budget_tao:.6f}→{max(0.0, remaining_budget_tao - tao_consumed):.6f} TAO",
-                    cap_note,
+                    pass_label,
                 ]
             )
 
-            # Update budgets
+            accepted_alpha_by_key[key] = already + take_alpha
             remaining_budget_tao = max(0.0, remaining_budget_tao - tao_consumed)
+
+        # ----- PASS 1: with caps -----
+        for b in ordered:
+            if remaining_budget_tao <= EPS_VALUE:
+                break
+            ck = b.coldkey
+            # TAO limit available for this allocation (global + per-CK cap)
+            if cap_left_tao:
+                ck_cap_left = float(cap_left_tao.get(ck, 0.0))
+            else:
+                ck_cap_left = float("inf")
+            tao_limit = min(remaining_budget_tao, ck_cap_left)
+            if tao_limit <= EPS_VALUE:
+                continue
+            _consider_bid(b, tao_limit, "cap")
+
+            # Update per-CK cap if used
             if cap_left_tao and ck_cap_left != float("inf"):
+                # consumed was reflected via remaining_budget_tao, but to reduce per-CK cap
+                # we need to recompute how much was consumed for this bid:
+                # We approximate by the last row added (safe for logs; cap update exactness not critical).
+                # For strict correctness, we'd recompute line_value_tao for the "take_alpha" we just accepted.
+                # For simplicity, get "take_alpha" from accepted map delta:
+                key = (b.miner_uid, b.subnet_id, b.idx)
+                take_alpha = accepted_alpha_by_key[key]  # total accepted so far on this bid
+                # compute consumed just for this bid acceptance: value at "take_alpha" minus previous acceptance value
+                # (assume previous acceptance was 0.0 on pass1)
+                tao_consumed = line_value_tao(b, take_alpha)
                 cap_left_tao[ck] = max(0.0, ck_cap_left - tao_consumed)
+
+        # ----- PASS 2: relax caps if budget left -----
+        if remaining_budget_tao > EPS_VALUE:
+            for b in ordered:
+                if remaining_budget_tao <= EPS_VALUE:
+                    break
+                # no per-CK cap in pass2
+                _consider_bid(b, remaining_budget_tao, "relaxed")
 
         if dbg_rows:
             pretty.table(
-                "Allocations — TAO Budget (caps enforced in TAO, partial fills)",
-                ["UID", "CK", "Subnet", "Req α", "Take α", "TAO/α", "Spend TAO(VALUE)", "Disc_bps", "W_bps",
-                 "Budget TAO (before→after)", "CK Cap (before→after)"],
+                "Allocations — TAO Budget (caps enforced then relaxed)",
+                ["UID", "CK", "Subnet", "Req α", "Acc α (cum)", "TAO/α", "Spend TAO(VALUE)", "Disc_bps", "W_bps", "Pass"],
                 dbg_rows[: max(20, LOG_TOP_N)],
             )
 
@@ -511,11 +541,10 @@ class ClearingEngine:
                 ]
             )
 
-        # --- ensure pending_commits is a dict; then stage under str(e) and log it.
         if not isinstance(self.state.pending_commits, dict):
             self.state.pending_commits = {}
 
-        # === NEW: include budget signals so Settlement can burn underfill ===
+        # === include budget signals so Settlement can burn underfill ===
         bt_mu = int(encode_value_mu(my_budget_tao))           # total budget in μTAO
         bl_mu = int(encode_value_mu(remaining_budget_tao))    # leftover in μTAO
 
@@ -527,15 +556,12 @@ class ClearingEngine:
             "de": int(win_end),
             "hk": self.parent.hotkey_ss58,
             "t": VALIDATOR_TREASURIES.get(self.parent.hotkey_ss58, ""),
-            # Compact winner inventory:
-            #   inv: { "<uid>": {"ck": "<coldkey or empty>"}, ... }
-            #   i:   [ [uid, [ [sid, disc_bps, w_bps, rao_acc, value_mu], ... ] ], ... ]
+            # inventory (compact):
             "inv": {str(uid): {"ck": ""} for uid in inv_i.keys()},
             "i": [[uid, lines] for uid, lines in inv_i.items()],
-            # --- Budget markers for settlement burn:
-            "bt_mu": bt_mu,                         # preferred by Settlement (total budget μTAO)
-            "bl_mu": bl_mu,                         # optional leftover μTAO (used as fallback too)
-            # (human-readable mirrors for debugging)
+            # budget markers
+            "bt_mu": bt_mu,
+            "bl_mu": bl_mu,
             "bt_tao": float(my_budget_tao),
             "bl_tao": float(remaining_budget_tao),
         }
@@ -545,7 +571,6 @@ class ClearingEngine:
         if hasattr(self.state, "save_pending_commits"):
             self.state.save_pending_commits()
 
-        # Loud staging confirmation
         pretty.kv_panel(
             "Staged commit payload",
             [
@@ -594,7 +619,7 @@ class ClearingEngine:
             preview_rows[: max(20, LOG_TOP_N)],
         )
 
-        # 7) Notify winners immediately; payment window = next epoch (e+1) with **defined end**
+        # 7) Notify winners immediately; payment window = next epoch (e+1)
         ack_ok = 0
         calls_sent = 0
         targets_resolved = 0
@@ -673,5 +698,4 @@ class ClearingEngine:
             style="bold green",
         )
 
-        # Attempted to notify anyone? (conservative success flag)
         return calls_sent > 0

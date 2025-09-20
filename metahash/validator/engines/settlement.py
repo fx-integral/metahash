@@ -1,4 +1,4 @@
-# metahash/validator/engines/settlement.py — Budget-aware settlement
+# metahash/validator/engines/settlement.py — Budget-aware settlement (v2.3.7)
 from __future__ import annotations
 
 import asyncio
@@ -91,11 +91,8 @@ def _decode_mu_unknown_scale(x: int | None) -> float:
         v = int(x)
     except Exception:
         return 0.0
-    # Heuristic: values from Clearing via encode_value_mu(...) are μTAO (≈ up to a few millions).
-    # If someone mistakenly used 1e9, the number will look 1000x larger.
     if v >= 10**9:   # treat as 1e9 scale
         return float(Decimal(v) / Decimal(10**9))
-    # else micro-TAO (preferred)
     try:
         return float(decode_value_mu(v))
     except Exception:
@@ -108,10 +105,15 @@ class SettlementEngine:
       1) Load snapshots from commitments (v4 → IPFS payloads; legacy inline supported).
       2) Merge payment window [as, de] across masters; wait until closed (de + delay).
       3) Scan α transfers (miners → master treasuries) in the merged window.
-      4) Build paid index (uid, treasury, subnet) → paid_rao (drop forbidden / cross-subnet).
-      5) Score miners using VALUE stored in payload lines, **gated by payments**.
+      4) Build **paid α pools by (coldkey, treasury, subnet)** (drop forbidden / cross-subnet).
+      5) Score miners using VALUE stored in payload lines, **gated by allocated paid α**.
+         Allocation per pool is proportional (no double-count if multiple UIDs share coldkey).
       6) **Budget accounting**: burn deficit = target_budget_value − credited_value (→ UID 0).
       7) Apply weights (or preview when TESTING=True).
+
+    FIX:
+      - Replace per-UID paid index with per-coldkey pools + proportional allocation across UIDs
+        of the same coldkey (no double counting).
     """
 
     def __init__(self, parent, state: StateStore):
@@ -155,41 +157,34 @@ class SettlementEngine:
             pretty.kv_panel("Settlement postponed", [("epoch", epoch_to_settle), ("reason", "scanner failed")], style="bold yellow")
             return
 
-        # 4) Build paid α index
-        paid_idx, drop_stats = self._build_paid_rao_index(snapshots, events)
-        self._log_paid_index_stats(paid_idx, drop_stats)
+        # 4) Build paid α pools (by coldkey, treasury, subnet)
+        paid_pool, drop_stats = self._build_paid_alpha_pool(snapshots, events)
+        self._log_paid_pool_stats(paid_pool, drop_stats)
 
         # 5) Score miners with payment gate; also compute credited total and spent total (from payload)
         final_scores, credit_rows, credited_total_tao, spent_total_mu = \
-            self._score_miners_from_snapshots_value_only(snapshots, paid_idx)
+            self._score_miners_from_snapshots_value_only(snapshots, paid_pool)
         self._log_credit_rows(credit_rows)
 
         # 6) Budget accounting (+ burn deficit → UID 0)
-        #    Target budget is "spent VALUE (from payload lines) + leftover VALUE"
-        #    Leftover is read from staged 'bl_mu' if present; otherwise try 'bt_mu'.
         spent_tao = float(decode_value_mu(int(spent_total_mu))) if spent_total_mu else 0.0
         leftover_tao = 0.0
         bt_tao = 0.0
         for s in (snapshots or []):
-            # primary: leftover (bl_mu)
             leftover_tao += _decode_mu_unknown_scale(s.get("bl_mu"))
-            # secondary: full budget (bt_mu) if we end up needing a fallback
             bt_tao += _decode_mu_unknown_scale(s.get("bt_mu"))
 
         target_budget_tao = spent_tao + leftover_tao
         if target_budget_tao <= 0 and bt_tao > 0:
             target_budget_tao = bt_tao  # fallback when bl_mu missing
 
-        # burn_deficit = target - credited
         burn_deficit_tao = max(0.0, (target_budget_tao or 0.0) - (credited_total_tao or 0.0))
 
-        # Add burn to UID 0 in the final scores (list aligned with miner_uids_all)
         miner_uids_all = list(self.parent.get_miner_uids())
         uid_to_idx = {u: i for i, u in enumerate(miner_uids_all)}
         if burn_deficit_tao > 0 and 0 in uid_to_idx:
             final_scores[uid_to_idx[0]] += burn_deficit_tao
 
-        # log budget accounting for operator visibility
         pretty.kv_panel(
             "Budget Accounting — settlement",
             [
@@ -264,7 +259,6 @@ class SettlementEngine:
                             payload.setdefault("t", VALIDATOR_TREASURIES.get(hk_key, ""))
                             chosen = dict(payload)
 
-                            # Human visibility
                             inv = payload.get("inv") or payload.get("i")
                             pretty.kv_panel(
                                 "Payload fetched (IPFS)",
@@ -350,11 +344,9 @@ class SettlementEngine:
             epoch_to_settle, start_block, end_block, POST_PAYMENT_CHECK_DELAY_BLOCKS, len(clean)
         )
 
-        # extend end by post-payment delay
         end_block += max(0, int(POST_PAYMENT_CHECK_DELAY_BLOCKS or 0))
         _pause("After windows merged (as/de)")
 
-        # Ensure pay window is closed
         if self.parent.block < end_block:
             remain = end_block - self.parent.block
             eta_s = remain * BLOCKTIME
@@ -439,111 +431,117 @@ class SettlementEngine:
         _pause("After scanning & coercing events")
         return events
 
-    # ───────── Step 4: build paid α index & stats ─────────
-    def _build_paid_rao_index(
+    # ───────── Step 4: build paid α pools & stats ─────────
+    def _build_paid_alpha_pool(
         self, snapshots: List[Dict], events: List[TransferEvent]
-    ) -> Tuple[Dict[Tuple[int, str, int], int], Dict[str, int]]:
+    ) -> Tuple[Dict[Tuple[str, str, int], int], Dict[str, int]]:
+        """
+        Returns:
+          paid_pool: (src_coldkey, dest_treasury, subnet_id) -> total paid α (rao)
+          drop_stats: counters for dropped events
+        """
         master_treasuries: Set[str] = {VALIDATOR_TREASURIES.get(s.get("hk", ""), s.get("t", "")) for s in snapshots}
 
-        # UIDs present (limit ck→uid mapping)
-        uids_present: Set[int] = set()
-        for s in snapshots:
-            inv = s.get("inv", {}) or {}
-            for uid_s in inv.keys():
-                try:
-                    uids_present.add(int(uid_s))
-                except Exception:
-                    pass
-
-        ck_to_uid: Dict[str, int] = {}
-        try:
-            for uid, ck in enumerate(self.parent.metagraph.coldkeys):
-                if uid in uids_present:
-                    ck_to_uid[ck] = uid
-        except Exception:
-            pass
-
-        paid_idx: Dict[Tuple[int, str, int], int] = defaultdict(int)
+        paid_pool: Dict[Tuple[str, str, int], int] = defaultdict(int)
         drop_stats = dict(
-            not_master=0, forbidden=0, uid_missing=0, cross_subnet=0,
+            not_master=0, forbidden=0, ck_missing=0, cross_subnet=0,
         )
 
         for ev in (events or []):
             try:
-                if ev.dest_coldkey not in master_treasuries:
+                tre = ev.dest_coldkey or ev.dest_coldkey_raw
+                ck = ev.src_coldkey or ev.src_coldkey_raw
+                if not tre or tre not in master_treasuries:
                     drop_stats["not_master"] += 1
+                    continue
+                if not ck:
+                    drop_stats["ck_missing"] += 1
                     continue
                 if ev.subnet_id in FORBIDDEN_ALPHA_SUBNETS:
                     drop_stats["forbidden"] += 1
-                    continue
-                uid = ck_to_uid.get(ev.src_coldkey)
-                if uid is None or uid not in uids_present:
-                    drop_stats["uid_missing"] += 1
                     continue
                 src_sid = ev.src_subnet_id if getattr(ev, "src_subnet_id", None) is not None else ev.subnet_id
                 if src_sid != ev.subnet_id:
                     drop_stats["cross_subnet"] += 1
                     continue
-                paid_idx[(uid, ev.dest_coldkey, ev.subnet_id)] += int(ev.amount_rao)
+                paid_pool[(ck, tre, ev.subnet_id)] += int(ev.amount_rao)
             except Exception:
                 continue
 
-        return paid_idx, drop_stats
+        return paid_pool, drop_stats
 
-    def _log_paid_index_stats(self, paid_idx: Dict[Tuple[int, str, int], int], drop_stats: Dict[str, int]):
+    def _log_paid_pool_stats(self, paid_pool: Dict[Tuple[str, str, int], int], drop_stats: Dict[str, int]):
         pretty.kv_panel(
-            "Paid α aggregation",
+            "Paid α pools (by coldkey, treasury, subnet)",
             [
-                ("#paid_keys", len(paid_idx)),
+                ("#pools", len(paid_pool)),
                 ("dropped_not_master", drop_stats.get("not_master", 0)),
                 ("dropped_forbidden", drop_stats.get("forbidden", 0)),
-                ("dropped_uid_missing", drop_stats.get("uid_missing", 0)),
+                ("dropped_ck_missing", drop_stats.get("ck_missing", 0)),
                 ("dropped_cross_subnet", drop_stats.get("cross_subnet", 0)),
             ],
             style="bold cyan",
         )
-        if VERBOSE_DUMPS and paid_idx:
+        if VERBOSE_DUMPS and paid_pool:
             sample = []
-            for i, (k, v) in enumerate(paid_idx.items()):
+            for i, (k, v) in enumerate(paid_pool.items()):
                 if i >= 6:
                     break
-                uid, tre, sid = k
-                sample.append({"uid": uid, "tre": tre[:10] + "…", "sid": sid, "paid_rao": v})
-            pretty.log("[dim]paid(sample): " + _j(sample) + (" …" if len(paid_idx) > 6 else "") + "[/dim]")
-        _pause("After paid α aggregation")
+                ck, tre, sid = k
+                sample.append({"ck": ck[:10] + "…", "tre": tre[:10] + "…", "sid": sid, "paid_rao": v})
+            pretty.log("[dim]paid_pools(sample): " + _j(sample) + (" …" if len(paid_pool) > 6 else "") + "[/dim]")
+        _pause("After paid α pool build")
 
-    # ───────── Step 5: scoring using VALUE in payload only ─────────
+    # ───────── Step 5: scoring using VALUE in payload + allocated α ─────────
     def _score_miners_from_snapshots_value_only(
         self,
         snapshots: List[Dict],
-        paid_idx: Dict[Tuple[int, str, int], int],
+        paid_pool: Dict[Tuple[str, str, int], int],
     ) -> Tuple[List[float], List[List[str | int | float]], float, int]:
         """
-        Scoring rule (per master snapshot):
-          * Collect a miner's winning lines (each has [sid, disc_bps, w_bps, required_rao, value_mu]).
-          * Gate: if STRICT_PER_SUBNET → for EVERY subnet: paid_rao(uid, tre, sid) >= sum(required_rao on that sid).
-                  else               → sum_paid_rao(uid, tre, ANY sid) >= sum_all_required_rao.
-          * If gate fails → miner gets 0 from that master's snapshot.
-          * Else reward = sum(decode(value_mu)) across that miner's lines.
-        Also returns:
-          - credited_total_tao : TOTAL VALUE (TAO) credited to miners who passed the gate.
-          - spent_total_mu     : TOTAL VALUE (μTAO) that was "spent" in payload lines (irrespective of gate).
+        Scoring per master snapshot:
+          • Build per-UID required α by subnet from snapshot lines.
+          • Determine each UID's coldkey (inv.ck or metagraph.coldkeys[uid]).
+          • For each (coldkey, treasury, subnet) pool, allocate paid α proportionally
+            across that coldkey's UIDs that demand α on that subnet (largest remainder).
+          • Gate: STRICT_PER_SUBNET => credited_by_uid_sid >= required_by_uid_sid for *every* subnet.
+                  else            => sum(credited_by_uid_sid) >= sum(required_by_uid_sid).
+          • If gate OK, credit VALUE sum (decode_value_mu of lines) to that UID.
+
+        Returns:
+          final_scores (aligned to parent.get_miner_uids),
+          credit_rows (debug),
+          credited_total_tao,
+          spent_total_mu (sum over all lines irrespective of gate)
         """
         scores_by_uid: Dict[int, float] = defaultdict(float)
         credit_rows: List[List[str | int | float]] = []
 
-        # stable ordering
         miner_uids_all: List[int] = list(self.parent.get_miner_uids())
 
         credited_total_tao = 0.0
         spent_total_mu = 0  # sum of value_mu across all lines (payload)
+
+        # helper: get coldkey of uid
+        def _uid_ck(uid: int, inv: Dict[str, Dict]) -> Optional[str]:
+            ck = None
+            try:
+                ck = inv.get(str(uid), {}).get("ck")
+            except Exception:
+                ck = None
+            if ck:
+                return ck
+            # fallback to metagraph
+            try:
+                return self.parent.metagraph.coldkeys[uid]
+            except Exception:
+                return None
 
         for s in snapshots:
             tre: str = s.get("t", "") or ""
             inv: Dict[str, Dict] = s.get("inv", {}) or {}
 
             # For "spent" tally we need ALL lines once
-            # Prefer compact "i" payload pairs: [uid, [[sid,disc,w,rao,val_mu], ...]]
             lines_by_uid: Dict[int, List[List[int]]] = defaultdict(list)
             if "i" in s and isinstance(s["i"], list):
                 for pair in s["i"]:
@@ -559,7 +557,6 @@ class SettlementEngine:
                             if isinstance(ln, list) and len(ln) >= 4:
                                 lines_by_uid[uid_any].append(ln)
 
-            # Fallback: legacy inv["ln"] structure
             if not lines_by_uid and isinstance(inv, dict):
                 for uid_s, inv_d in inv.items():
                     try:
@@ -580,13 +577,18 @@ class SettlementEngine:
                         except Exception:
                             pass
 
-            # Build per-miner required/pay/value with gating
-            for uid, lines in lines_by_uid.items():
-                # Gather required and values by subnet
-                by_sid_required: Dict[int, int] = defaultdict(int)
-                total_required = 0
-                total_value_tao = 0.0
+            # Build per-miner required/pay/value with gating (per snapshot/treasury)
+            # 1) collect requirements per uid per subnet, and total values
+            required_by_uid_sid: Dict[int, Dict[int, int]] = defaultdict(lambda: defaultdict(int))
+            required_total_by_uid: Dict[int, int] = defaultdict(int)
+            value_sum_by_uid_tao: Dict[int, float] = defaultdict(float)
+            ck_by_uid: Dict[int, str] = {}
 
+            for uid, lines in lines_by_uid.items():
+                ck = _uid_ck(uid, inv)
+                if not ck:
+                    continue
+                ck_by_uid[uid] = ck
                 for ln in lines:
                     try:
                         sid = int(ln[0])
@@ -595,53 +597,110 @@ class SettlementEngine:
                         continue
                     if req_rao <= 0:
                         continue
-                    by_sid_required[sid] += req_rao
-                    total_required += req_rao
+                    required_by_uid_sid[uid][sid] += req_rao
+                    required_total_by_uid[uid] += req_rao
 
                     val_mu = int(ln[4]) if len(ln) >= 5 else 0
                     if val_mu > 0:
-                        total_value_tao += float(decode_value_mu(val_mu))
+                        try:
+                            value_sum_by_uid_tao[uid] += float(decode_value_mu(val_mu))
+                        except Exception:
+                            pass
 
-                if total_required <= 0:
-                    continue
+            if not required_by_uid_sid:
+                continue
 
-                # Determine paid α for this miner to THIS master's treasury
+            # 2) group UIDs by coldkey
+            uids_by_ck: Dict[str, List[int]] = defaultdict(list)
+            for uid, ck in ck_by_uid.items():
+                uids_by_ck[ck].append(uid)
+
+            # 3) proportional allocation of paid α pools per (ck, tre, sid)
+            credited_by_uid_sid: Dict[int, Dict[int, int]] = defaultdict(lambda: defaultdict(int))
+
+            for ck, uid_list in uids_by_ck.items():
+                # subnet universe for this ck
+                sids: Set[int] = set()
+                for uid in uid_list:
+                    sids |= set(required_by_uid_sid[uid].keys())
+                for sid in sids:
+                    pool = int(paid_pool.get((ck, tre, sid), 0))
+                    if pool <= 0:
+                        continue
+                    total_req = sum(int(required_by_uid_sid[uid].get(sid, 0)) for uid in uid_list)
+                    if total_req <= 0:
+                        continue
+
+                    # proportional shares with largest remainder
+                    # compute raw shares
+                    tmp = []
+                    sum_floor = 0
+                    for uid in uid_list:
+                        need = int(required_by_uid_sid[uid].get(sid, 0))
+                        if need <= 0:
+                            tmp.append([uid, 0.0, 0])
+                            continue
+                        raw = (pool * need) / float(total_req)
+                        floor = int(raw)
+                        tmp.append([uid, raw - floor, floor])
+                        sum_floor += floor
+                    remainder = pool - sum_floor
+                    # distribute remainder by largest fractional residue
+                    tmp.sort(key=lambda x: (-x[1], x[0]))
+                    i = 0
+                    while remainder > 0 and i < len(tmp):
+                        uid = tmp[i][0]
+                        need = int(required_by_uid_sid[uid].get(sid, 0))
+                        if need > 0:
+                            tmp[i][2] += 1
+                            remainder -= 1
+                        i += 1
+                        if i >= len(tmp):
+                            i = 0
+                    # commit allocations
+                    for uid, _frac, alloc in tmp:
+                        if alloc > 0:
+                            credited_by_uid_sid[uid][sid] += int(alloc)
+
+            # 4) apply gate per uid
+            for uid in required_by_uid_sid.keys():
+                req_map = required_by_uid_sid[uid]
                 if STRICT_PER_SUBNET:
                     fully_paid = True
-                    for sid, need in by_sid_required.items():
-                        got = int(paid_idx.get((uid, tre, sid), 0))
+                    for sid, need in req_map.items():
+                        got = int(credited_by_uid_sid[uid].get(sid, 0))
                         if got < need:
                             fully_paid = False
                             break
+                    paid_total = None  # not reported in strict mode
                 else:
-                    total_paid = 0
-                    for sid in by_sid_required.keys():
-                        total_paid += int(paid_idx.get((uid, tre, sid), 0))
-                    fully_paid = (total_paid >= total_required)
+                    need_total = int(required_total_by_uid[uid])
+                    got_total = sum(int(credited_by_uid_sid[uid].get(s, 0)) for s in req_map.keys())
+                    fully_paid = (got_total >= need_total)
+                    paid_total = got_total
 
+                value_sum = float(value_sum_by_uid_tao.get(uid, 0.0))
                 credit_rows.append([
                     uid,
-                    tre[:8] + "…",
+                    (ck_by_uid.get(uid, "")[:8] + "…"),
                     ("strict" if STRICT_PER_SUBNET else "total"),
-                    total_required,
-                    (None if STRICT_PER_SUBNET else total_paid if total_required > 0 else 0),
+                    int(required_total_by_uid[uid]),
+                    (None if STRICT_PER_SUBNET else paid_total),
                     "OK" if fully_paid else "NO",
-                    f"{total_value_tao:.6f}",
+                    f"{value_sum:.6f}",
                 ])
+                if fully_paid and value_sum > 0:
+                    scores_by_uid[uid] += value_sum
+                    credited_total_tao += value_sum
 
-                if fully_paid and total_value_tao > 0:
-                    scores_by_uid[uid] += total_value_tao
-                    credited_total_tao += total_value_tao
-
-        # align to full miner uid list
         final_scores = [float(scores_by_uid.get(uid, 0.0)) for uid in miner_uids_all]
         return final_scores, credit_rows, credited_total_tao, int(spent_total_mu)
 
     def _log_credit_rows(self, rows: List[List[str | int | float]]):
         if rows:
             pretty.table(
-                "[cyan]Miner credit (per snapshot) — Required α vs Paid α → VALUE sum[/cyan]",
-                ["UID", "Treasury", "Gate", "α_required(rao)", "α_paid(rao?)", "Credit?", "VALUE_sum(TAO)"],
+                "[cyan]Miner credit (per snapshot) — Required α vs Allocated α → VALUE sum[/cyan]",
+                ["UID", "Coldkey", "Gate", "α_required(rao)", "α_alloc(rao?)", "Credit?", "VALUE_sum(TAO)"],
                 rows[: max(12, int(LOG_TOP_N))],
             )
             extra = len(rows) - max(12, int(LOG_TOP_N))
@@ -663,7 +722,6 @@ class SettlementEngine:
         self._log_weights_preview(final_scores, miner_uids_all, mode="burn-all" if burn_all else "normal")
         _pause("Before applying weights (or preview in TESTING)")
 
-        # Burn-all substitution if needed (and not testing)
         if burn_all and not TESTING:
             pretty.log(f"[red]Burn-all triggered – reason: {burn_reason}.[/red]")
             final_scores = [1.0 if uid == 0 else 0.0 for uid in miner_uids_all]
@@ -706,7 +764,6 @@ class SettlementEngine:
                                 style="bold cyan")
             return inv
 
-        # fall back to compact "i"
         inv_tmp: Dict[str, Dict] = {}
         if "i" in s and isinstance(s["i"], list):
             for item in s["i"]:

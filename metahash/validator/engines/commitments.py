@@ -61,7 +61,6 @@ class CommitmentsEngine:
                 pin=True,
                 sort_keys=True,  # deterministic canonicalization for hash stability
             )
-            # Helpful visibility on what we actually stored:
             preview_inv = payload.get("inv") or payload.get("i")
             pretty.kv_panel(
                 "Commit Payload (preview)",
@@ -178,18 +177,15 @@ class CommitmentsEngine:
                     )
                 if ok:
                     return True
-                # Returned False (uncommon), wait a block and retry.
                 pretty.log(f"[yellow]Commitment write returned False (attempt {attempt}/{max_retries}). Retrying…[/yellow]")
             except Exception as e:
                 last_exc = e
                 msg = str(e) if e else ""
-                # Typical pool contention: same nonce / same priority in the same block.
                 if "Priority is too low" in msg or "Transaction is outdated" in msg or "already imported" in msg:
                     pretty.log(f"[yellow]Commitment write pool conflict (attempt {attempt}/{max_retries}): {msg} — waiting ~1 block…[/yellow]")
                 else:
                     pretty.log(f"[yellow]Commitment write exception (attempt {attempt}/{max_retries}): {msg} — waiting ~1 block…[/yellow]")
 
-            # Wait approximately one block before retrying
             try:
                 await asyncio.sleep(max(1.0, float(BLOCKTIME)))
             except Exception:

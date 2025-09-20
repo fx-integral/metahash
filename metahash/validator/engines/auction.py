@@ -272,7 +272,7 @@ class AuctionEngine:
         if w <= 0.0:
             return False, f"subnet weight {w:.4f} ≤ 0 (sid={subnet_id})"
 
-        # enforce one uid per coldkey (per epoch per master)
+        # enforce one uid per coldkey (per epoch per master)  ← anti DDOS / anti split
         ck_map = self._ck_uid_epoch[epoch]
         existing_uid = ck_map.get(ck)
         if existing_uid is not None and existing_uid != uid:
@@ -284,7 +284,7 @@ class AuctionEngine:
         if first_on_subnet and count >= MAX_BIDS_PER_MINER:
             return False, "per-coldkey bid limit reached"
 
-        # accept / upsert
+        # accept / upsert (one (uid,subnet) entry per epoch)
         ck_map.setdefault(ck, uid)
         if first_on_subnet:
             self._ck_subnets_bid[epoch][ck] = count + 1
@@ -420,7 +420,7 @@ class AuctionEngine:
             if self.clearer is not None:
                 ok = await self.clearer.clear_now_and_notify(epoch_to_clear=self.parent.epoch_index)
 
-                # NEW: after clear, show what keys exist in pending_commits so we know the staging worked.
+                # Post-clear staging snapshot
                 try:
                     keys = list(self.state.pending_commits.keys()) if isinstance(self.state.pending_commits, dict) else []
                 except Exception:
