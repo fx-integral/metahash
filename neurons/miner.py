@@ -1,12 +1,8 @@
 #!/usr/bin/env python3
-# neurons/miner.py — Event-driven bidder v2.7 (no background daemon; per-invoice concurrent retries)
-#
-# - Removes BackgroundPaymentMiner dependency and daemon.
-# - Each Win schedules a lightweight asyncio task to pay within [start,end] with retries.
-# - Stable invoice ids keyed by window.
-# - Visual log panels for schedule/attempt/ok/fail.
+# neurons/miner.py — Event-driven bidder v2.7.1 (no daemon; per-invoice retries with clearer LastResp)
 
 import asyncio
+import time
 from math import isfinite
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
@@ -66,7 +62,7 @@ class Miner(BaseMinerNeuron, MinerMixins):
 
         unlock_wallet(wallet=self.wallet)
 
-        # Payment source / retry config (lazy-init in handlers as well)
+        # Payment source / retry config
         self._pay_cfg_initialized: bool = False
         self._pay_rr_index: int = 0
         self._pay_pool: List[str] = []
@@ -171,6 +167,11 @@ class Miner(BaseMinerNeuron, MinerMixins):
         t = self._payment_tasks.get(inv.invoice_id)
         if t and not t.done():
             return  # already scheduled
+
+        # Update UX immediately
+        inv.last_response = f"scheduled (wait ≥{self._pay_start_safety_blocks} blk)"
+        asyncio.create_task(self._async_save_state())
+
         task = asyncio.create_task(self._payment_worker(inv), name=f"pay_{inv.invoice_id}")
         self._payment_tasks[inv.invoice_id] = task
 
@@ -190,7 +191,8 @@ class Miner(BaseMinerNeuron, MinerMixins):
     async def _payment_worker(self, inv: WinInvoice):
         """Try to pay inside the window with retries; exits when paid/expired/attempts exceeded."""
         try:
-            # Wait until window opens (with optional safety)
+            await self._ensure_async_subtensor()
+
             start = int(inv.pay_window_start_block or 0)
             end = int(inv.pay_window_end_block or 0)
             allowed_start = start + int(self._pay_start_safety_blocks or 0)
@@ -201,8 +203,10 @@ class Miner(BaseMinerNeuron, MinerMixins):
 
                 # Too early
                 if start and (blk <= 0 or blk < allowed_start):
-                    to_open = max(0, allowed_start - blk)
-                    sleep_s = max(0.5, min(10 * float(BLOCKTIME), to_open * float(BLOCKTIME)))
+                    inv.last_response = f"waiting (blk {blk} < start {allowed_start})"
+                    await self._async_save_state()
+                    sleep_blocks = max(1, allowed_start - blk)
+                    sleep_s = max(0.5, min(10 * float(BLOCKTIME), sleep_blocks * float(BLOCKTIME)))
                     pretty.kv_panel(
                         "[blue]PAY wait[/blue]",
                         [("inv", inv.invoice_id), ("blk", blk), ("allowed_start", allowed_start), ("sleep", f"{sleep_s:.1f}s")],
@@ -214,6 +218,7 @@ class Miner(BaseMinerNeuron, MinerMixins):
                 # Window over
                 if end and blk > end:
                     inv.last_response = f"window over (blk {blk} > end {end})"
+                    await self._async_save_state()
                     pretty.kv_panel(
                         "[yellow]PAY exit[/yellow]",
                         [("inv", inv.invoice_id), ("reason", "window over"), ("blk", blk), ("end", end)],
@@ -223,6 +228,8 @@ class Miner(BaseMinerNeuron, MinerMixins):
 
                 # Attempt payment (under lock)
                 attempt += 1
+                inv.last_attempt_ts = time.time()
+                await self._async_save_state()
                 pretty.kv_panel(
                     "[white]PAY attempt[/white]",
                     [("inv", inv.invoice_id), ("try", f"{attempt}/{self._retry_max_attempts}"), ("blk", blk), ("win", f"[{start},{end}]")],
@@ -232,6 +239,7 @@ class Miner(BaseMinerNeuron, MinerMixins):
                 async with self._pay_lock:
                     if inv.paid:
                         inv.last_response = "already paid"
+                        await self._async_save_state()
                         break
 
                     # Fresh height under the lock too
@@ -267,6 +275,7 @@ class Miner(BaseMinerNeuron, MinerMixins):
 
                     if ok:
                         inv.paid = True
+                        await self._async_save_state()
                         pretty.kv_panel(
                             "[green]Payment OK[/green]",
                             [
@@ -279,11 +288,11 @@ class Miner(BaseMinerNeuron, MinerMixins):
                             ],
                             style="bold green",
                         )
-                        await self._async_save_state()
                         self._status_tables()
                         self._log_aggregate_summary()
                         break
                     else:
+                        await self._async_save_state()
                         pretty.kv_panel(
                             "[red]Payment FAILED[/red]",
                             [
@@ -294,10 +303,11 @@ class Miner(BaseMinerNeuron, MinerMixins):
                             ],
                             style="bold red",
                         )
-                        await self._async_save_state()
 
                 # Exit conditions
                 if attempt >= int(self._retry_max_attempts or 1):
+                    inv.last_response = f"max attempts ({attempt})"
+                    await self._async_save_state()
                     pretty.kv_panel(
                         "[yellow]PAY exit[/yellow]",
                         [("inv", inv.invoice_id), ("reason", "max attempts"), ("attempts", attempt)],
@@ -309,14 +319,19 @@ class Miner(BaseMinerNeuron, MinerMixins):
                 await asyncio.sleep(max(0.5, float(self._retry_every_blocks) * float(BLOCKTIME)))
 
         except asyncio.CancelledError:
+            inv.last_response = "cancelled"
+            await self._async_save_state()
             pretty.kv_panel("[grey]PAY cancelled[/grey]", [("inv", inv.invoice_id)], style="bold magenta")
             raise
         except Exception as e:
+            inv.last_response = f"error: {e}"
+            await self._async_save_state()
             pretty.kv_panel(
                 "[yellow]PAY worker error[/yellow]",
                 [("inv", getattr(inv, "invoice_id", "?")), ("err", str(e)[:120])],
                 style="bold yellow",
             )
+            return
         finally:
             # cleanup finished/cancelled task
             t = self._payment_tasks.get(inv.invoice_id)
@@ -393,8 +408,7 @@ class Miner(BaseMinerNeuron, MinerMixins):
 
             if budget_alpha > 0 and ln.alpha > budget_alpha:
                 pretty.log(
-                    f"[grey58]Note:[/grey58] line α {ln.alpha:.4f} exceeds validator budget α {budget_alpha:.4f}; "
-                    f"may be partially filled."
+                    f"[grey58]Note:[/grey58] line α {ln.alpha:.4f} exceeds validator budget α {budget_alpha:.4f}; may be partially filled."
                 )
 
             bid_id = self._make_bid_id(vkey, epoch, ln.subnet_id, ln.alpha, ln.discount_bps)
@@ -526,7 +540,7 @@ class Miner(BaseMinerNeuron, MinerMixins):
         self._status_tables()
 
         synapse.ack = True
-        # We expose last-known status; actual payment occurs in the task.
+        # Latest known status; actual payment occurs in the task.
         synapse.payment_attempted = inv.pay_attempts > 0
         synapse.payment_ok = inv.paid
         synapse.attempts = inv.pay_attempts

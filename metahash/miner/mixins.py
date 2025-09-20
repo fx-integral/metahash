@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-# neurons/miner_mixins.py — state I/O, helpers, chain info helpers
-#
-# Changes for no-daemon build:
-#   - Window-stable invoice_id (no epoch_seen).
-#   - Loader recomputes missing invoice_id using the new identity.
-#   - _get_current_block: fresh height with ~1s TTL cache (prevents stale decisions).
+# metahash/miner/mixins.py — state I/O, helpers, chain info helpers (no write to self.block)
 
 import os
 import json
@@ -64,8 +59,7 @@ class MinerMixins:
         pay_epoch_index: int | None = None,
     ) -> str:
         """
-        Window-stable identity for an accepted allocation.
-        Note: we intentionally do NOT include epoch_seen; we include the window.
+        Window-stable identity for an accepted allocation (no epoch_seen).
         """
         payload = (
             f"{validator_key}|{int(subnet_id)}|{alpha:.12f}|{int(discount_bps)}|"
@@ -233,7 +227,7 @@ class MinerMixins:
             w.pay_attempts,
             (w.invoice_id[:8] + "…"),
             (w.last_response or "")[:24] + ("…" if len(w.last_response or "") > 24 else "")
-        ] for w in sorted(done, key=lambda x: (-x.last_attempt_ts))[:LOG_TOP_N]]
+        ] for w in sorted(done, key=lambda x: (-w.last_attempt_ts))[:LOG_TOP_N]]
 
         if rows_pend:
             pretty.table(
@@ -284,15 +278,14 @@ class MinerMixins:
         Returns mapping: subnet_id -> (alpha_bidded_total, alpha_won_total, alpha_paid_total)
         All totals are lifetime (current process state file).
         """
-        from collections import defaultdict as _dd
-        bidded = _dd(float)
+        bidded = defaultdict(float)
         for _vkey, recs in self._already_bid.items():
             for epoch, subnet, alpha, _disc in recs:
                 if isfinite(alpha) and alpha > 0:
                     bidded[int(subnet)] += float(alpha)
 
-        won = _dd(float)
-        paid = _dd(float)
+        won = defaultdict(float)
+        paid = defaultdict(float)
         for w in self._wins:
             sid = int(w.subnet_id)
             won[sid] += float(w.alpha or 0.0)
@@ -322,7 +315,6 @@ class MinerMixins:
             stxn = bt.AsyncSubtensor(network=self.config.subtensor.network)
             await stxn.initialize()
             self._async_subtensor = stxn
-        # Capture loop only if we are inside one (handlers run inside axon loop).
         try:
             if getattr(self, "_loop", None) is None:
                 self._loop = asyncio.get_running_loop()
@@ -331,18 +323,19 @@ class MinerMixins:
 
     async def _get_current_block(self) -> int:
         """
-        Fresh block height with a very short TTL cache to avoid hammering RPC,
-        but also to prevent acting on stale heights.
+        Return a fresh(ish) block height.
+        - Never assigns to self.block (read-only in BaseNeuron).
+        - Uses a ~1s TTL cache to avoid RPC hammering.
         """
         await self._ensure_async_subtensor()
         stxn = self._async_subtensor
         now = time.time()
-        last_ts = float(getattr(self, "_blk_cache_ts", 0.0) or 0.0)
-        cached = int(getattr(self, "_blk_cache_height", 0) or getattr(self, "block", 0) or 0)
 
-        # Use cache if it's fresh (< 1s)
-        if cached > 0 and (now - last_ts) < 1.0:
-            return cached
+        cached_h = int(getattr(self, "_blk_cache_height", 0) or 0)
+        cached_ts = float(getattr(self, "_blk_cache_ts", 0.0) or 0.0)
+
+        if cached_h > 0 and (now - cached_ts) < 1.0:
+            return cached_h
 
         height = 0
 
@@ -369,15 +362,16 @@ class MinerMixins:
                 if substrate is not None:
                     meth = getattr(substrate, "get_block_number", None)
                     if callable(meth):
-                        height = int(meth(None) or 0)
+                        b = int(meth(None) or 0)
+                        if b > 0:
+                            height = b
             except Exception:
                 height = 0
 
         if height > 0:
-            self.block = height
             self._blk_cache_height = height
             self._blk_cache_ts = now
             return height
 
-        # Fallback to cached if fetch failed
-        return cached
+        # Last resort: stale cache or 0
+        return cached_h
