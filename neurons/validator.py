@@ -1,9 +1,14 @@
 # neurons/validator.py – SN-73 v2.3.7 (strict e−1 publisher; no pre-settlement re-commit; no catch-up)
+# START_V3_BLOCK gates *when* the v3 pipeline starts; before that we still set weights
+# but we *burn all* (independent of FORCE_BURN). FORCE_BURN remains orthogonal and
+# may still be honored by engines in v3.
+#
 # Flow tweaks:
 #   • Keep weights-first semantics for the epoch,
 #   • After settlement & clear, publish ONLY e−1 (strict; no catch-up),
 #   • Same auction/clear logic; TESTING still suppresses on-chain set_weights.
 #   • v2.3.7: Settlement anti-double-counting by coldkey; Clearing 2-pass (caps then relaxed)
+#   • Pre‑v3 branch: settle & set weights, then burn-all (no auction/clear/publish)
 
 from __future__ import annotations
 
@@ -21,7 +26,15 @@ from metahash.config import (
     START_V3_BLOCK,
     EPOCH_LENGTH_OVERRIDE,
     TESTING,
+    # FORCE_BURN is *not* used here; it stays engine-level & should work even in v3.
+    # If it does not exist in older configs, the try/except below will handle it.
 )
+try:
+    # Optional import; we don't branch on this here to keep FORCE_BURN orthogonal.
+    from metahash.config import FORCE_BURN  # noqa: F401
+except Exception:  # pragma: no cover
+    FORCE_BURN = False  # type: ignore
+
 from metahash.utils.helpers import load_weights
 
 # State & Engines
@@ -46,9 +59,16 @@ class Validator(EpochValidatorNeuron):
       • settlement guarded; budget-aware burn handled in SettlementEngine.
       • FIX: anti double-count at settlement by coldkey; 2-pass clearing (caps then relaxed).
 
+    PRE‑V3 BEHAVIOR (this file):
+      • If head_block < START_V3_BLOCK:
+          - Still apply weights-first settlement (e−2),
+          - Then *burn all* for the current epoch (unconditional),
+          - Skip auction/clear and commitment publishing in this mode.
+
     NOTE:
       • Clearing uses TAO budget (base subnet = this validator's netuid) and TAO-valued bids
         = α × (1 − disc) × price_tao_per_alpha[subnet] × weight_fraction (with α-slippage).
+      • FORCE_BURN (if present) stays engine-level and remains valid even in v3.
     """
 
     def __init__(self, config=None):
@@ -115,26 +135,78 @@ class Validator(EpochValidatorNeuron):
         except Exception:
             pass  # non-fatal
 
+    async def _burn_all_pre_v3(self, e: int) -> None:
+        """
+        Pre‑v3 branch:
+          1) Weights‑first: settle epoch (e−2) + set weights,
+          2) Then unconditionally burn all for epoch e (independent of FORCE_BURN),
+          3) Skip auction/clear/publish.
+        """
+        pretty.banner(
+            f"Epoch {e} (pre‑v3 burn‑all mode)",
+            f"head_block={self.block} | start={self.epoch_start_block} | end={self.epoch_end_block}\n"
+            f"• PRE‑V3: settle e−2 → {e-2} (weights‑first)\n"
+            f"• PRE‑V3: burn ALL spendable weights/budget for e={e}\n"
+            f"• PRE‑V3: skip auction/clear and commitment publish",
+            style="bold yellow",
+        )
+
+        # 1) WEIGHTS FIRST: settle older epoch (e−2) and set weights
+        await self.settlement.settle_and_set_weights_all_masters(epoch_to_settle=e - 2)
+
+        # 2) Attempt to *burn all* for epoch e using available engine methods.
+        #    We try Clearing first, then Settlement. If none exist, we log and carry on.
+        burned = False
+        for engine in (self.clearing, self.settlement):
+            for method_name in ("burn_all", "force_burn_all", "burn_epoch"):
+                fn = getattr(engine, method_name, None)
+                if callable(fn):
+                    try:
+                        # Prefer async; support sync just in case.
+                        maybe_coro = fn(epoch=e)
+                        if asyncio.iscoroutine(maybe_coro):
+                            await maybe_coro
+                        burned = True
+                        pretty.log(f"[green]Pre‑v3 burn-all via {engine.__class__.__name__}.{method_name}()[/green]")
+                        break
+                    except asyncio.CancelledError as ce:
+                        pretty.log(f"[yellow]Pre‑v3 burn-all cancelled by RPC: {ce}[/yellow]")
+                        raise
+                    except Exception as exc:
+                        pretty.log(
+                            f"[yellow]Pre‑v3 burn-all via {engine.__class__.__name__}.{method_name}() failed: {exc}[/yellow]"
+                        )
+            if burned:
+                break
+
+        if not burned:
+            pretty.log(
+                "[yellow]Pre‑v3: no engine burn method found (burn_all / force_burn_all / burn_epoch). "
+                "Weights were still set (weights‑first), but nothing was explicitly burned.[/yellow]"
+            )
+
     async def forward(self):
         """
         Per-epoch driver:
           0) Ensure single AsyncSubtensor client; apply epoch override.
-          1) Settle epoch (e−2) and set weights (from commitments) [weights-first].
-          2) Masters: auction & clear NOW (epoch e) — stage payload for (e−1).
-          3) Publish ONLY e−1 AFTER settlement (strict; no catch-up for older epochs).
+          1) If pre‑v3 (head_block < START_V3_BLOCK): settle e−2, then BURN ALL, and return.
+          2) Else (v3+):
+               a) Settle epoch (e−2) and set weights (weights‑first),
+               b) Masters: auction & clear NOW (epoch e) — stage payload for (e−1),
+               c) Publish ONLY e−1 AFTER settlement (strict; no catch-up for older epochs).
         """
         await self._stxn()          # ensure single client exists
         self._apply_epoch_override()
 
-        if self.block < START_V3_BLOCK:
-            pretty.banner(
-                "Waiting for START_V3_BLOCK",
-                f"current_block={self.block} < start_v3={START_V3_BLOCK}",
-                style="bold yellow",
-            )
-            return
-
         e = self.epoch_index
+
+        # --- PRE‑V3 BRANCH ---------------------------------------------------
+        if self.block < START_V3_BLOCK:
+            await self._burn_all_pre_v3(e)
+            return
+        # ---------------------------------------------------------------------
+
+        # --- V3+ STRICT PIPELINE ---------------------------------------------
         pretty.banner(
             f"Epoch {e} (label: e)",
             f"head_block={self.block} | start={self.epoch_start_block} | end={self.epoch_end_block}\n"
@@ -172,6 +244,7 @@ class Validator(EpochValidatorNeuron):
             pretty.log(f"[yellow]Publish e−1 cancelled by RPC: {ce}[/yellow]")
         except Exception as exc:
             pretty.log(f"[yellow]Publish e−1 failed: {exc}[/yellow]")
+        # ---------------------------------------------------------------------
 
 
 if __name__ == "__main__":
