@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # metahash/miner/mixins.py — state I/O, helpers, chain info helpers (no write to self.block)
+# v2.8.0: parse miner.bids.raw_discount flag; improve config summary to show discount mode
 
 import os
 import json
@@ -33,6 +34,7 @@ class MinerMixins:
       - self._async_subtensor: Optional[bt.AsyncSubtensor]
       - self._loop: Optional[asyncio.AbstractEventLoop]
       - self.lines: List[BidLine]
+      - self._bids_raw_discount: bool  # NEW: if True, send configured discounts as-is
     """
 
     # ---------------------- state I/O ----------------------
@@ -150,6 +152,16 @@ class MinerMixins:
     # ---------------------- helpers ----------------------
 
     def _parse_discount_token(self, tok: str) -> int:
+        """
+        Parse discount tokens into BPS (0..10_000). Supports:
+          - "2500bps" → 2500
+          - "25%"     → 2500
+          - "25"      → 2500
+          - "2500"    → 2500
+        Note: Interpretation depends on mode:
+          - raw_discount=True  → this is the raw discount to send (1 - discount) part.
+          - raw_discount=False → this is the EFFECTIVE factor = weight * (1 - raw_discount).
+        """
         t = str(tok).strip().lower().replace("%", "")
         if t.endswith("bps"):
             try:
@@ -157,16 +169,36 @@ class MinerMixins:
                 return max(0, min(10_000, bps))
             except Exception:
                 pass
-        val = float(t)
+        try:
+            val = float(t)
+        except Exception:
+            return 0
         if val > 100:
             return max(0, min(10_000, int(round(val))))
         return max(0, min(10_000, int(round(val * 100))))
 
     def _build_lines_from_config(self) -> List[BidLine]:
-        bids = getattr(self.config, "miner", None)
-        nets = getattr(getattr(bids, "bids", bids), "netuids", []) if bids else []
-        amts = getattr(getattr(bids, "bids", bids), "amounts", []) if bids else []
-        discs = getattr(getattr(bids, "bids", bids), "discounts", []) if bids else []
+        """
+        Reads config:
+          miner.bids.netuids:   [sid1, sid2, ...]
+          miner.bids.amounts:   [α1, α2, ...]
+          miner.bids.discounts: [d1, d2, ...]  (bps)
+          miner.bids.raw_discount: bool (optional; default False)
+        """
+        cfg_miner = getattr(self.config, "miner", None)
+        cfg_bids = getattr(cfg_miner, "bids", cfg_miner)
+
+        nets = getattr(cfg_bids, "netuids", []) if cfg_bids else []
+        amts = getattr(cfg_bids, "amounts", []) if cfg_bids else []
+        discs = getattr(cfg_bids, "discounts", []) if cfg_bids else []
+
+        # NEW: discount interpretation flag (default False = EFFECTIVE mode)
+        raw_flag = False
+        try:
+            raw_flag = bool(getattr(cfg_bids, "raw_discount", False))
+        except Exception:
+            raw_flag = False
+        self._bids_raw_discount = bool(raw_flag)
 
         netuids = [int(x) for x in list(nets or [])]
         amounts = [float(x) for x in list(amts or [])]
@@ -187,9 +219,11 @@ class MinerMixins:
         return lines
 
     def _log_cfg_summary(self):
+        mode = "RAW (pass-through)" if getattr(self, "_bids_raw_discount", False) else "EFFECTIVE (weight-adjusted)"
         rows = [[i, ln.subnet_id, f"{ln.alpha:.4f} α", f"{ln.discount_bps} bps"] for i, ln in enumerate(self.lines)]
         if rows:
-            pretty.table("Configured Bid Lines", ["#", "Subnet", "Alpha", "Discount"], rows)
+            pretty.table("Configured Bid Lines", ["#", "Subnet", "Alpha", "Discount (cfg)"], rows)
+            pretty.log(f"[cyan]Discount interpretation[/cyan]: {mode}")
 
     def _status_tables(self):
         pend = [w for w in self._wins if not w.paid]

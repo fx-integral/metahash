@@ -123,6 +123,14 @@ def add_miner_args(parser: argparse.ArgumentParser) -> None:
                         help="α amounts for each bid, e.g. 1000 500 200.")
     parser.add_argument("--miner.bids.discounts", nargs="+", type=str, default=[],
                         help="Discounts per bid: percent or bps tokens (e.g., 10 5 1000bps).")
+    parser.add_argument(
+        "--miner.bids.raw_discount", action="store_true", default=False,
+        help=(
+            "Interpret --miner.bids.discounts as RAW discounts to send (legacy). "
+            "If omitted (default), --miner.bids.discounts are EFFECTIVE factors "
+            "that the miner converts to raw discounts using the validator's weights."
+        ),
+    )
 
     # NEW: Origin hotkey selection for payments
     parser.add_argument("--payment.validators", nargs="+", type=str, default=[],

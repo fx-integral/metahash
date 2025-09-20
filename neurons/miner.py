@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-# neurons/miner.py — Event-driven bidder v2.7.1 (no daemon; per-invoice retries with clearer LastResp)
+# neurons/miner.py — Event-driven bidder v2.8.0
+# - Effective-discount mode (default): users configure discount as subnet_weight * (1 - raw_discount)
+# - Add --miner.bids.raw_discount flag to pass configured discount as-is (no transform)
 
 import asyncio
 import time
@@ -44,6 +46,10 @@ class Miner(BaseMinerNeuron, MinerMixins):
 
         # Per-invoice tasks (no global daemon)
         self._payment_tasks: Dict[str, asyncio.Task] = {}
+
+        # Discount mode: default False (use effective-discount transformation)
+        # Will be finalized by _build_lines_from_config()
+        self._bids_raw_discount: bool = False
 
         # Optional: start fresh
         if getattr(self.config, "fresh", False):
@@ -344,6 +350,40 @@ class Miner(BaseMinerNeuron, MinerMixins):
             if not w.paid:
                 self._schedule_payment(w)
 
+    # ---------------------- discount math (effective -> raw) ----------------------
+
+    @staticmethod
+    def _clamp_bps(x: int) -> int:
+        return 0 if x < 0 else (10_000 if x > 10_000 else x)
+
+    @staticmethod
+    def _compute_raw_discount_bps(effective_factor_bps: int, weight_bps: int) -> int:
+        """
+        Given:
+          - effective_factor_bps in [0..10_000], representing:  effective_factor = weight * (1 - raw_discount)
+          - weight_bps in [0..10_000], representing the validator's subnet weight
+
+        Solve for raw_discount (bps) to send to the validator.
+
+        raw_discount = 1 - (effective_factor / weight)   [clamped to 0..1]
+        """
+        w_bps = Miner._clamp_bps(int(weight_bps or 0))
+        ef_bps = Miner._clamp_bps(int(effective_factor_bps or 0))
+
+        if w_bps <= 0:
+            # No weight → product will be 0 regardless. Best we can do is not self-penalize.
+            return 0
+
+        w = w_bps / 10_000.0
+        ef = ef_bps / 10_000.0
+
+        raw = 1.0 - (ef / w)
+        if raw < 0.0:
+            raw = 0.0
+        elif raw > 1.0:
+            raw = 1.0
+        return int(round(raw * 10_000))
+
     # ---------------------- auction handlers ----------------------
 
     async def auctionstart_forward(self, synapse: AuctionStartSynapse) -> AuctionStartSynapse:
@@ -365,6 +405,25 @@ class Miner(BaseMinerNeuron, MinerMixins):
         budget_alpha = float(getattr(synapse, "auction_budget_alpha", 0.0) or 0.0)
         min_stake_alpha = float(getattr(synapse, "min_stake_alpha", S_MIN_ALPHA_MINER) or S_MIN_ALPHA_MINER)
 
+        # Weights (bps) sent by validator for this auction
+        weights_bps_raw = getattr(synapse, "weights_bps", {}) or {}
+        # Be defensive about key types
+        weights_bps: Dict[int, int] = {}
+        try:
+            for k, v in list(weights_bps_raw.items()):
+                try:
+                    kk = int(k)
+                except Exception:
+                    kk = k
+                try:
+                    vv = int(v)
+                except Exception:
+                    vv = 0
+                weights_bps[int(kk)] = self._clamp_bps(vv)
+        except Exception:
+            # fallback: no weights known
+            weights_bps = {}
+
         pretty.kv_panel(
             "[cyan]AuctionStart[/cyan]",
             [
@@ -372,6 +431,8 @@ class Miner(BaseMinerNeuron, MinerMixins):
                 ("epoch (e)", epoch),
                 ("budget α", f"{budget_alpha:.3f}"),
                 ("min_stake", f"{min_stake_alpha:.3f} α"),
+                ("weights", f"{len(weights_bps)} subnet(s)"),
+                ("discount_mode", "RAW (pass-through)" if self._bids_raw_discount else "EFFECTIVE (weight-adjusted)"),
                 ("timeline", f"bid now (e) → pay in (e+1={epoch+1}) → weights from e in (e+2={epoch+2})"),
             ],
             style="bold cyan",
@@ -403,7 +464,23 @@ class Miner(BaseMinerNeuron, MinerMixins):
             if not (0 <= ln.discount_bps <= 10_000):
                 pretty.log(f"[yellow]Invalid discount {ln.discount_bps} bps – skipping line.[/yellow]")
                 continue
-            if self._has_bid(vkey, epoch, ln.subnet_id, ln.alpha, ln.discount_bps):
+
+            # Determine the "raw" discount to send (possibly transformed)
+            subnet_id = int(ln.subnet_id)
+            weight_bps = weights_bps.get(subnet_id, 10_000)  # default to 1.0 if absent
+
+            if self._bids_raw_discount:
+                send_disc_bps = int(ln.discount_bps)
+                eff_factor_bps = int(round(weight_bps * (1.0 - (send_disc_bps / 10_000.0))))
+                mode_note = "raw"
+            else:
+                # ln.discount_bps is interpreted as the EFFECTIVE multiplier (weight * (1 - raw_discount))
+                send_disc_bps = self._compute_raw_discount_bps(ln.discount_bps, weight_bps)
+                eff_factor_bps = int(round(weight_bps * (1.0 - (send_disc_bps / 10_000.0))))
+                mode_note = "effective→raw"
+
+            # Skip duplicates for this validator in this epoch with the *actual* discount we will send
+            if self._has_bid(vkey, epoch, subnet_id, ln.alpha, send_disc_bps):
                 continue
 
             if budget_alpha > 0 and ln.alpha > budget_alpha:
@@ -411,21 +488,37 @@ class Miner(BaseMinerNeuron, MinerMixins):
                     f"[grey58]Note:[/grey58] line α {ln.alpha:.4f} exceeds validator budget α {budget_alpha:.4f}; may be partially filled."
                 )
 
-            bid_id = self._make_bid_id(vkey, epoch, ln.subnet_id, ln.alpha, ln.discount_bps)
+            bid_id = self._make_bid_id(vkey, epoch, subnet_id, ln.alpha, send_disc_bps)
             out_bids.append({
-                "subnet_id": int(ln.subnet_id),
+                "subnet_id": subnet_id,
                 "alpha": float(ln.alpha),
-                "discount_bps": int(ln.discount_bps),
+                "discount_bps": int(send_disc_bps),
                 "bid_id": bid_id,
             })
-            self._remember_bid(vkey, epoch, ln.subnet_id, ln.alpha, ln.discount_bps)
+            self._remember_bid(vkey, epoch, subnet_id, ln.alpha, send_disc_bps)
             sent += 1
-            rows_sent.append([ln.subnet_id, f"{ln.alpha:.4f} α", f"{ln.discount_bps} bps", bid_id, epoch])
+
+            # Log: show cfg discount, sent (raw) discount, weight, and implied effective factor
+            rows_sent.append([
+                subnet_id,
+                f"{ln.alpha:.4f} α",
+                f"{ln.discount_bps} bps" + (" (cfg)" if not self._bids_raw_discount else ""),
+                f"{send_disc_bps} bps",
+                f"{weight_bps} w_bps",
+                f"{eff_factor_bps} eff_bps",
+                bid_id,
+                epoch,
+                mode_note,
+            ])
 
         if sent == 0:
             pretty.log("[grey]No bids were added (all lines either invalid or already added).[/grey]")
         else:
-            pretty.table("[yellow]Bids Sent[/yellow]", ["Subnet", "Alpha", "Discount", "BidID", "Epoch"], rows_sent)
+            pretty.table(
+                "[yellow]Bids Sent[/yellow]",
+                ["Subnet", "Alpha", "Disc(cfg)", "Disc(send)", "Weight", "Eff", "BidID", "Epoch", "Mode"],
+                rows_sent,
+            )
 
         await self._async_save_state()
         self._status_tables()
