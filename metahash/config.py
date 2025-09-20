@@ -28,7 +28,7 @@ ALLOW_INLINE_FALLBACK: bool = True
 RAW_BYTES_CEILING = 120
 
 # ╭───────────────────────────── EPOCH ────────────────────────────────╮
-EPOCH_LENGTH_OVERRIDE: int = int(os.getenv("EPOCH_LENGTH_OVERRIDE", "20"))
+EPOCH_LENGTH_OVERRIDE: int = int(os.getenv("EPOCH_LENGTH_OVERRIDE", "10"))
 # ╰────────────────────────────────────────────────────────────────────╯
 
 

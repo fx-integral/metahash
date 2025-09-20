@@ -71,9 +71,9 @@ class Validator(EpochValidatorNeuron):
 
         # Engines (they reuse the single client)
         self.commitments = CommitmentsEngine(self, self.state)
-        self.settlement   = SettlementEngine(self, self.state)
-        self.clearing     = ClearingEngine(self, self.state)
-        self.auction      = AuctionEngine(self, self.state, self.weights_bps, clearer=self.clearing)
+        self.settlement = SettlementEngine(self, self.state)
+        self.clearing = ClearingEngine(self, self.state)
+        self.auction = AuctionEngine(self, self.state, self.weights_bps, clearer=self.clearing)
 
         pretty.banner(
             f"Validator v{__version__} initialized",
