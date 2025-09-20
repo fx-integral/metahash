@@ -330,7 +330,8 @@ class SettlementEngine:
             if a is None or d is None:
                 pretty.log(f"[yellow]Snapshot hk={s.get('hk','')[:8]}… missing as/de — skipping.[/yellow]")
                 continue
-            as_vals.append(a); de_vals.append(d)
+            as_vals.append(a)
+            de_vals.append(d)
             clean.append(s)
 
         if not as_vals or not de_vals:

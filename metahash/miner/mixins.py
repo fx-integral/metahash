@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 # neurons/miner_mixins.py — state I/O, helpers, chain info helpers
+#
+# Changes for no-daemon build:
+#   - Window-stable invoice_id (no epoch_seen).
+#   - Loader recomputes missing invoice_id using the new identity.
+#   - _get_current_block: fresh height with ~1s TTL cache (prevents stale decisions).
 
 import os
 import json
@@ -10,6 +15,8 @@ from dataclasses import asdict
 from math import isfinite
 from typing import Dict, List, Tuple, Optional
 from collections import defaultdict
+import time
+
 import bittensor as bt
 from bittensor import Synapse
 from metahash.miner.models import BidLine, WinInvoice
@@ -48,14 +55,22 @@ class MinerMixins:
     def _make_invoice_id(
         self,
         validator_key: str,
-        epoch: int,
         subnet_id: int,
         alpha: float,
         discount_bps: int,
-        pay_epoch: int,
         amount_rao: int,
+        pay_window_start_block: int,
+        pay_window_end_block: int,
+        pay_epoch_index: int | None = None,
     ) -> str:
-        payload = f"{validator_key}|{epoch}|{subnet_id}|{alpha:.12f}|{discount_bps}|{pay_epoch}|{amount_rao}"
+        """
+        Window-stable identity for an accepted allocation.
+        Note: we intentionally do NOT include epoch_seen; we include the window.
+        """
+        payload = (
+            f"{validator_key}|{int(subnet_id)}|{alpha:.12f}|{int(discount_bps)}|"
+            f"{int(amount_rao)}|{int(pay_window_start_block)}|{int(pay_window_end_block)}|{int(pay_epoch_index or 0)}"
+        )
         return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
 
     def _make_bid_id(self, validator_key: str, epoch: int, subnet_id: int, alpha: float, discount_bps: int) -> str:
@@ -83,12 +98,13 @@ class MinerMixins:
                 if not clean.get("invoice_id"):
                     inv_id = self._make_invoice_id(
                         clean.get("validator_key", ""),
-                        int(clean.get("epoch_seen", 0) or 0),
                         int(clean.get("subnet_id", 0) or 0),
                         float(clean.get("alpha", 0.0) or 0.0),
                         int(clean.get("discount_bps", 0) or 0),
-                        int(clean.get("pay_epoch_index", 0) or 0),
                         int(clean.get("amount_rao", 0) or 0),
+                        int(clean.get("pay_window_start_block", 0) or 0),
+                        int(clean.get("pay_window_end_block", 0) or 0),
+                        int(clean.get("pay_epoch_index", 0) or 0),
                     )
                     clean["invoice_id"] = inv_id
 
@@ -268,14 +284,15 @@ class MinerMixins:
         Returns mapping: subnet_id -> (alpha_bidded_total, alpha_won_total, alpha_paid_total)
         All totals are lifetime (current process state file).
         """
-        bidded = defaultdict(float)
+        from collections import defaultdict as _dd
+        bidded = _dd(float)
         for _vkey, recs in self._already_bid.items():
             for epoch, subnet, alpha, _disc in recs:
                 if isfinite(alpha) and alpha > 0:
                     bidded[int(subnet)] += float(alpha)
 
-        won = defaultdict(float)
-        paid = defaultdict(float)
+        won = _dd(float)
+        paid = _dd(float)
         for w in self._wins:
             sid = int(w.subnet_id)
             won[sid] += float(w.alpha or 0.0)
@@ -314,16 +331,20 @@ class MinerMixins:
 
     async def _get_current_block(self) -> int:
         """
-        Best-effort: use self.block if set; else query AsyncSubtensor with a couple of known names.
+        Fresh block height with a very short TTL cache to avoid hammering RPC,
+        but also to prevent acting on stale heights.
         """
-        blk = int(getattr(self, "block", 0) or 0)
-        if blk > 0:
-            return blk
-
         await self._ensure_async_subtensor()
         stxn = self._async_subtensor
-        if stxn is None:
-            return 0
+        now = time.time()
+        last_ts = float(getattr(self, "_blk_cache_ts", 0.0) or 0.0)
+        cached = int(getattr(self, "_blk_cache_height", 0) or getattr(self, "block", 0) or 0)
+
+        # Use cache if it's fresh (< 1s)
+        if cached > 0 and (now - last_ts) < 1.0:
+            return cached
+
+        height = 0
 
         # Try common async methods/properties
         for name in ("get_current_block", "current_block", "block"):
@@ -336,22 +357,27 @@ class MinerMixins:
                     res = await res
                 b = int(res or 0)
                 if b > 0:
-                    setattr(self, "block", b)
-                    return b
+                    height = b
+                    break
             except Exception:
                 continue
 
         # Fallback via substrate (sync)
-        try:
-            substrate = getattr(stxn, "substrate", None)
-            if substrate is not None:
-                meth = getattr(substrate, "get_block_number", None)
-                if callable(meth):
-                    b = int(meth(None) or 0)
-                    if b > 0:
-                        setattr(self, "block", b)
-                        return b
-        except Exception:
-            pass
+        if height == 0:
+            try:
+                substrate = getattr(stxn, "substrate", None)
+                if substrate is not None:
+                    meth = getattr(substrate, "get_block_number", None)
+                    if callable(meth):
+                        height = int(meth(None) or 0)
+            except Exception:
+                height = 0
 
-        return 0
+        if height > 0:
+            self.block = height
+            self._blk_cache_height = height
+            self._blk_cache_ts = now
+            return height
+
+        # Fallback to cached if fetch failed
+        return cached

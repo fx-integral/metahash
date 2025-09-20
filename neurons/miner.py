@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
-# neurons/miner.py — Event-driven bidder v2.6 (files split, no α cap vs validator budget)
-# Files:
-#   - miner_models.py              (BidLine, WinInvoice)
-#   - miner_mixins.py              (state I/O, helpers, chain info)
-#   - background_payment_miner.py  (payments + background retries)
+# neurons/miner.py — Event-driven bidder v2.7 (no background daemon; per-invoice concurrent retries)
 #
-# Change in this build:
-#   • Do NOT reject bids with alpha > auction budget (or AUCTION_BUDGET_ALPHA).
-#     We warn but still submit; validator’s TAO-based clearing will partially fill.
+# - Removes BackgroundPaymentMiner dependency and daemon.
+# - Each Win schedules a lightweight asyncio task to pay within [start,end] with retries.
+# - Stable invoice ids keyed by window.
+# - Visual log panels for schedule/attempt/ok/fail.
 
 import asyncio
 from math import isfinite
@@ -15,23 +12,23 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
 import bittensor as bt
-from bittensor import Synapse
+from bittensor import Synapse, BLOCKTIME
 
 from metahash.miner.models import BidLine, WinInvoice
-from metahash.miner.payments import BackgroundPaymentMiner
+from metahash.base.miner import BaseMinerNeuron
+from metahash.miner.mixins import MinerMixins
 
 from metahash.base.utils.logging import ColoredLogger as clog
 from metahash.protocol import AuctionStartSynapse, WinSynapse
 from metahash.config import (
     PLANCK,
     S_MIN_ALPHA_MINER,
-    PAYMENT_TICK_SLEEP_SECONDS,
 )
 from metahash.utils.pretty_logs import pretty
-from metahash.utils.wallet_utils import unlock_wallet
+from metahash.utils.wallet_utils import unlock_wallet, transfer_alpha
 
 
-class Miner(BackgroundPaymentMiner):
+class Miner(BaseMinerNeuron, MinerMixins):
     def __init__(self, config=None):
         super().__init__(config=config)
 
@@ -42,16 +39,15 @@ class Miner(BackgroundPaymentMiner):
         self._wins: List[WinInvoice] = []
 
         # Guards
-        self._pay_lock: asyncio.Lock = asyncio.Lock()    # avoid concurrent tx + ws recv
+        self._pay_lock: asyncio.Lock = asyncio.Lock()    # prevent concurrent tx on-chain
         self._state_lock: asyncio.Lock = asyncio.Lock()  # serialize state writes
 
         # Async subtensor bound to axon loop
         self._async_subtensor: Optional[bt.AsyncSubtensor] = None
-
-        # Axon loop + background task
         self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._retry_interval_s: int = PAYMENT_TICK_SLEEP_SECONDS
-        self._payment_retry_task: Optional[asyncio.Task] = None
+
+        # Per-invoice tasks (no global daemon)
+        self._payment_tasks: Dict[str, asyncio.Task] = {}
 
         # Optional: start fresh
         if getattr(self.config, "fresh", False):
@@ -70,10 +66,274 @@ class Miner(BackgroundPaymentMiner):
 
         unlock_wallet(wallet=self.wallet)
 
+        # Payment source / retry config (lazy-init in handlers as well)
+        self._pay_cfg_initialized: bool = False
+        self._pay_rr_index: int = 0
+        self._pay_pool: List[str] = []
+        self._pay_map: Dict[int, str] = {}
+        self._pay_start_safety_blocks: int = 0
+        self._retry_every_blocks: int = 2
+        self._retry_max_attempts: int = 12
+
+    # ---------------------- configuration ----------------------
+
+    def _ensure_payment_config(self):
+        """Load CLI-provided payment sources + retry knobs exactly once."""
+        if self._pay_cfg_initialized:
+            return
+
+        pay_cfg = getattr(self.config, "payment", None)
+
+        # --payment.validators hk1 hk2 ...
+        try:
+            pool = list(getattr(pay_cfg, "validators", [])) if pay_cfg is not None else []
+            self._pay_pool = [hk.strip() for hk in pool if isinstance(hk, str) and hk.strip()]
+            if self._pay_pool:
+                pretty.log(f"[green]Payment pool loaded[/green]: {len(self._pay_pool)} round-robin origin hotkey(s).")
+        except Exception:
+            self._pay_pool = []
+
+        # --payment.map sid:hk sid:hk ...
+        try:
+            pairs = list(getattr(pay_cfg, "map", [])) if pay_cfg is not None else []
+            for item in pairs:
+                if not isinstance(item, str) or ":" not in item:
+                    continue
+                sid_s, hk = item.split(":", 1)
+                sid_s = sid_s.strip()
+                hk = hk.strip()
+                if not sid_s or not hk:
+                    continue
+                try:
+                    sid = int(sid_s)
+                except Exception:
+                    continue
+                self._pay_map[sid] = hk
+            if self._pay_map:
+                pretty.log(f"[green]Payment map loaded[/green]: {len(self._pay_map)} subnet-specific origin hotkey(s).")
+        except Exception:
+            self._pay_map = {}
+
+        # --payment.start_safety_blocks N
+        try:
+            ssb = int(getattr(pay_cfg, "start_safety_blocks", 0) or 0) if pay_cfg is not None else 0
+            self._pay_start_safety_blocks = max(0, ssb)
+            if self._pay_start_safety_blocks:
+                pretty.log(f"[green]Payment start safety[/green]: +{self._pay_start_safety_blocks} block(s) after window start.")
+        except Exception:
+            self._pay_start_safety_blocks = 0
+
+        # --payment.retry_every_blocks N (default 2)
+        try:
+            reb = int(getattr(pay_cfg, "retry_every_blocks", 2) or 2) if pay_cfg is not None else 2
+            self._retry_every_blocks = max(1, reb)
+        except Exception:
+            self._retry_every_blocks = 2
+
+        # --payment.retry_max_attempts N (default 12)
+        try:
+            rma = int(getattr(pay_cfg, "retry_max_attempts", 12) or 12) if pay_cfg is not None else 12
+            self._retry_max_attempts = max(1, rma)
+        except Exception:
+            self._retry_max_attempts = 12
+
+        if not self._pay_map and not self._pay_pool and not self._pay_start_safety_blocks:
+            pretty.log("[yellow]No --payment.map / --payment.validators / --payment.start_safety_blocks; defaults in effect.[/yellow]")
+
+        self._pay_cfg_initialized = True
+
+    def _pick_rr_hotkey(self) -> str:
+        """Round-robin from the pool; if empty, fall back to local wallet hotkey."""
+        if not self._pay_pool:
+            return self.wallet.hotkey.ss58_address
+        hk = self._pay_pool[self._pay_rr_index % len(self._pay_pool)]
+        self._pay_rr_index += 1
+        return hk
+
+    def _origin_hotkey_for_invoice(self, inv: WinInvoice) -> str:
+        """
+        Decide which origin hotkey to use for this invoice:
+          1) If subnet-specific mapping exists → use mapped hotkey.
+          2) Else use round-robin pool (if any).
+          3) Else use local wallet hotkey (default / legacy).
+        """
+        sid = getattr(inv, "subnet_id", None)
+        if isinstance(sid, int) and sid in self._pay_map:
+            return self._pay_map[sid]
+        return self._pick_rr_hotkey()
+
+    # ---------------------- per-invoice scheduler ----------------------
+
+    def _schedule_payment(self, inv: WinInvoice):
+        """Create a single async task to handle paying this invoice; idempotent."""
+        if inv.paid:
+            return
+        t = self._payment_tasks.get(inv.invoice_id)
+        if t and not t.done():
+            return  # already scheduled
+        task = asyncio.create_task(self._payment_worker(inv), name=f"pay_{inv.invoice_id}")
+        self._payment_tasks[inv.invoice_id] = task
+
+        pretty.kv_panel(
+            "[cyan]Payment scheduled[/cyan]",
+            [
+                ("invoice", inv.invoice_id),
+                ("subnet", inv.subnet_id),
+                ("α", f"{inv.amount_rao/PLANCK:.4f}"),
+                ("window", f"[{inv.pay_window_start_block},{inv.pay_window_end_block or '?'}]"),
+                ("safety", f"+{self._pay_start_safety_blocks} blk"),
+                ("retry", f"every {self._retry_every_blocks} blk × {self._retry_max_attempts}"),
+            ],
+            style="bold cyan",
+        )
+
+    async def _payment_worker(self, inv: WinInvoice):
+        """Try to pay inside the window with retries; exits when paid/expired/attempts exceeded."""
+        try:
+            # Wait until window opens (with optional safety)
+            start = int(inv.pay_window_start_block or 0)
+            end = int(inv.pay_window_end_block or 0)
+            allowed_start = start + int(self._pay_start_safety_blocks or 0)
+
+            attempt = 0
+            while True:
+                blk = await self._get_current_block()
+
+                # Too early
+                if start and (blk <= 0 or blk < allowed_start):
+                    to_open = max(0, allowed_start - blk)
+                    sleep_s = max(0.5, min(10 * float(BLOCKTIME), to_open * float(BLOCKTIME)))
+                    pretty.kv_panel(
+                        "[blue]PAY wait[/blue]",
+                        [("inv", inv.invoice_id), ("blk", blk), ("allowed_start", allowed_start), ("sleep", f"{sleep_s:.1f}s")],
+                        style="bold blue",
+                    )
+                    await asyncio.sleep(sleep_s)
+                    continue
+
+                # Window over
+                if end and blk > end:
+                    inv.last_response = f"window over (blk {blk} > end {end})"
+                    pretty.kv_panel(
+                        "[yellow]PAY exit[/yellow]",
+                        [("inv", inv.invoice_id), ("reason", "window over"), ("blk", blk), ("end", end)],
+                        style="bold yellow",
+                    )
+                    break
+
+                # Attempt payment (under lock)
+                attempt += 1
+                pretty.kv_panel(
+                    "[white]PAY attempt[/white]",
+                    [("inv", inv.invoice_id), ("try", f"{attempt}/{self._retry_max_attempts}"), ("blk", blk), ("win", f"[{start},{end}]")],
+                    style="bold white",
+                )
+
+                async with self._pay_lock:
+                    if inv.paid:
+                        inv.last_response = "already paid"
+                        break
+
+                    # Fresh height under the lock too
+                    blk2 = await self._get_current_block()
+                    if start and (blk2 <= 0 or blk2 < allowed_start):
+                        inv.last_response = f"not yet in window (blk {blk2} < start {start}+{self._pay_start_safety_blocks})"
+                        ok = False
+                        resp = inv.last_response
+                    elif end and blk2 > end:
+                        inv.last_response = f"window over (blk {blk2} > end {end})"
+                        ok = False
+                        resp = inv.last_response
+                    else:
+                        origin_hotkey = self._origin_hotkey_for_invoice(inv)
+                        try:
+                            ok = await transfer_alpha(
+                                subtensor=self._async_subtensor,
+                                wallet=self.wallet,
+                                hotkey_ss58=origin_hotkey,
+                                origin_and_dest_netuid=inv.subnet_id,
+                                dest_coldkey_ss58=inv.treasury_coldkey,
+                                amount=bt.Balance.from_rao(inv.amount_rao),
+                                wait_for_inclusion=True,
+                                wait_for_finalization=False,
+                            )
+                            resp = "ok" if ok else "rejected"
+                        except Exception as exc:
+                            ok = False
+                            resp = f"exception: {exc}"
+
+                    inv.pay_attempts += 1
+                    inv.last_response = str(resp)[:300]
+
+                    if ok:
+                        inv.paid = True
+                        pretty.kv_panel(
+                            "[green]Payment OK[/green]",
+                            [
+                                ("inv", inv.invoice_id),
+                                ("α", f"{inv.amount_rao/PLANCK:.4f}"),
+                                ("dst_treasury", inv.treasury_coldkey[:8] + "…"),
+                                ("src_hotkey", origin_hotkey[:8] + "…"),
+                                ("sid", inv.subnet_id),
+                                ("pay_e", inv.pay_epoch_index),
+                            ],
+                            style="bold green",
+                        )
+                        await self._async_save_state()
+                        self._status_tables()
+                        self._log_aggregate_summary()
+                        break
+                    else:
+                        pretty.kv_panel(
+                            "[red]Payment FAILED[/red]",
+                            [
+                                ("inv", inv.invoice_id),
+                                ("resp", inv.last_response[:80]),
+                                ("sid", inv.subnet_id),
+                                ("attempts", inv.pay_attempts),
+                            ],
+                            style="bold red",
+                        )
+                        await self._async_save_state()
+
+                # Exit conditions
+                if attempt >= int(self._retry_max_attempts or 1):
+                    pretty.kv_panel(
+                        "[yellow]PAY exit[/yellow]",
+                        [("inv", inv.invoice_id), ("reason", "max attempts"), ("attempts", attempt)],
+                        style="bold yellow",
+                    )
+                    break
+
+                # Sleep until next retry
+                await asyncio.sleep(max(0.5, float(self._retry_every_blocks) * float(BLOCKTIME)))
+
+        except asyncio.CancelledError:
+            pretty.kv_panel("[grey]PAY cancelled[/grey]", [("inv", inv.invoice_id)], style="bold magenta")
+            raise
+        except Exception as e:
+            pretty.kv_panel(
+                "[yellow]PAY worker error[/yellow]",
+                [("inv", getattr(inv, "invoice_id", "?")), ("err", str(e)[:120])],
+                style="bold yellow",
+            )
+        finally:
+            # cleanup finished/cancelled task
+            t = self._payment_tasks.get(inv.invoice_id)
+            if t and t.done():
+                self._payment_tasks.pop(inv.invoice_id, None)
+
+    def _schedule_unpaid_pending(self):
+        """Schedule tasks for all unpaid invoices (idempotent)."""
+        for w in self._wins:
+            if not w.paid:
+                self._schedule_payment(w)
+
     # ---------------------- auction handlers ----------------------
 
     async def auctionstart_forward(self, synapse: AuctionStartSynapse) -> AuctionStartSynapse:
-        await self._ensure_background_tasks()
+        await self._ensure_async_subtensor()
+        self._ensure_payment_config()
 
         uid, caller_hot = self._resolve_caller(synapse)
         vkey = self._validator_key(uid, caller_hot)
@@ -91,7 +351,7 @@ class Miner(BackgroundPaymentMiner):
         min_stake_alpha = float(getattr(synapse, "min_stake_alpha", S_MIN_ALPHA_MINER) or S_MIN_ALPHA_MINER)
 
         pretty.kv_panel(
-            "[cyan]AuctionStart received[/cyan]",
+            "[cyan]AuctionStart[/cyan]",
             [
                 ("validator", f"{caller_hot or vkey} (uid={uid if uid is not None else '?'})"),
                 ("epoch (e)", epoch),
@@ -102,9 +362,8 @@ class Miner(BackgroundPaymentMiner):
             style="bold cyan",
         )
 
-        # Retry unpaid invoices (only pays if in window)
-        pre_unpaid = len([w for w in self._wins if not w.paid])
-        await self._retry_unpaid_invoices()
+        # (Re)schedule any pending unpaid invoices we may have persisted
+        self._schedule_unpaid_pending()
 
         # Stake gate
         my_stake = float(self.metagraph.stake[self.uid])
@@ -114,16 +373,15 @@ class Miner(BackgroundPaymentMiner):
             synapse.ack = True
             synapse.bids = []
             synapse.bids_sent = 0
-            synapse.retries_attempted = pre_unpaid
             synapse.note = "stake gate"
             return synapse
 
-        # Build bids directly on received synapse
+        # Build bids on received synapse
         out_bids = []
         sent = 0
         rows_sent = []
         for ln in self.lines:
-            # Basic sanity checks only; DO NOT cap by validator budget anymore.
+            # Checks; DO NOT cap by validator budget.
             if not isfinite(ln.alpha) or ln.alpha <= 0:
                 pretty.log(f"[yellow]Invalid alpha {ln.alpha} for subnet {ln.subnet_id} – skipping line.[/yellow]")
                 continue
@@ -133,11 +391,10 @@ class Miner(BackgroundPaymentMiner):
             if self._has_bid(vkey, epoch, ln.subnet_id, ln.alpha, ln.discount_bps):
                 continue
 
-            # Soft warning if the line α exceeds the announced budget — still send the bid.
             if budget_alpha > 0 and ln.alpha > budget_alpha:
                 pretty.log(
-                    f"[grey58]Note:[/grey58] line α {ln.alpha:.4f} exceeds validator’s announced budget α {budget_alpha:.4f}; "
-                    f"it will be considered and may be partially filled by TAO-budgeted clearing."
+                    f"[grey58]Note:[/grey58] line α {ln.alpha:.4f} exceeds validator budget α {budget_alpha:.4f}; "
+                    f"may be partially filled."
                 )
 
             bid_id = self._make_bid_id(vkey, epoch, ln.subnet_id, ln.alpha, ln.discount_bps)
@@ -162,12 +419,12 @@ class Miner(BackgroundPaymentMiner):
         synapse.ack = True
         synapse.bids = out_bids
         synapse.bids_sent = sent
-        synapse.retries_attempted = pre_unpaid
         synapse.note = None
         return synapse
 
     async def win_forward(self, synapse: WinSynapse) -> WinSynapse:
-        await self._ensure_background_tasks()
+        await self._ensure_async_subtensor()
+        self._ensure_payment_config()
 
         uid, caller_hot = self._resolve_caller(synapse)
         vkey = self._validator_key(uid, caller_hot)
@@ -211,24 +468,34 @@ class Miner(BackgroundPaymentMiner):
             epoch_seen=epoch_now,
         )
 
+        # Window-stable invoice identity
         inv.invoice_id = self._make_invoice_id(
-            vkey, epoch_now, inv.subnet_id, inv.alpha, inv.discount_bps, inv.pay_epoch_index, inv.amount_rao
+            vkey,
+            inv.subnet_id,
+            inv.alpha,
+            inv.discount_bps,
+            inv.amount_rao,
+            inv.pay_window_start_block,
+            inv.pay_window_end_block,
+            inv.pay_epoch_index,
         )
 
-        # idempotent merge by identity of the allocation / pay window
+        # idempotent merge by window identity of the allocation
         for w in self._wins:
             if (
                 w.validator_key == inv.validator_key
                 and w.subnet_id == inv.subnet_id
                 and w.alpha == inv.alpha
                 and w.discount_bps == inv.discount_bps
-                and w.pay_epoch_index == inv.pay_epoch_index
                 and w.amount_rao == inv.amount_rao
+                and w.pay_window_start_block == inv.pay_window_start_block
+                and w.pay_window_end_block == inv.pay_window_end_block
             ):
                 if inv.pay_window_end_block and not w.pay_window_end_block:
                     w.pay_window_end_block = inv.pay_window_end_block
                 w.alpha_requested = inv.alpha_requested
                 w.was_partial = inv.was_partial
+                w.pay_epoch_index = inv.pay_epoch_index or w.pay_epoch_index
                 inv = w
                 break
         else:
@@ -254,11 +521,12 @@ class Miner(BackgroundPaymentMiner):
             style="bold green",
         )
 
-        # Attempt payment ONLY when inside the block window
-        await self._attempt_payment(inv)
+        # Schedule payment task (no daemon)
+        self._schedule_payment(inv)
         self._status_tables()
 
         synapse.ack = True
+        # We expose last-known status; actual payment occurs in the task.
         synapse.payment_attempted = inv.pay_attempts > 0
         synapse.payment_ok = inv.paid
         synapse.attempts = inv.pay_attempts
