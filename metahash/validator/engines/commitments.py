@@ -24,8 +24,7 @@ class CommitmentsEngine:
 
       • Store the full winners payload in IPFS.
       • Store a tiny, CID-only v4 object on-chain: {"v":4,"e":<e>,"pe":<e+1>,"c":"<cid>"}
-
-    No inline fallback. No byte-size checks. No payload trimming. No mutation of the payload.
+      • Publish ONLY a specifically requested epoch (no global catch-up).
     """
 
     def __init__(self, parent, state: StateStore):
@@ -34,7 +33,7 @@ class CommitmentsEngine:
 
     async def publish_commitment_for(self, epoch_cleared: int, *, max_retries: int = 3) -> None:
         """
-        Publish winners payload for epoch (e − 1) that was cleared.
+        Publish winners payload for a specific cleared epoch (typically e−1).
         Reads payload from state.pending_commits[str(epoch_cleared)] and does:
 
           1) IPFS: add the full payload as-is.
@@ -48,10 +47,13 @@ class CommitmentsEngine:
             return
 
         key = str(epoch_cleared)
-        payload = self.state.pending_commits.get(key)
+        payload = self.state.pending_commits.get(key) if isinstance(self.state.pending_commits, dict) else None
         if not isinstance(payload, dict):
             pretty.log(f"[grey]No pending winners to publish for epoch {epoch_cleared}.[/grey]")
             return
+
+        # diagnostics: record attempt
+        self._touch_pending_meta(epoch_cleared, status="attempt")
 
         # 1) Upload full payload to IPFS (no modifications, no size checks)
         try:
@@ -75,9 +77,11 @@ class CommitmentsEngine:
             )
         except IPFSError as ie:
             pretty.log(f"[yellow]IPFS publish failed (no fallback): {ie}[/yellow]")
+            self._touch_pending_meta(epoch_cleared, status="ipfs_error", last_error=str(ie))
             return
         except Exception as e:
             pretty.log(f"[yellow]IPFS publish failed (no fallback): {e}[/yellow]")
+            self._touch_pending_meta(epoch_cleared, status="ipfs_error", last_error=str(e))
             return
 
         # 2) Write v4, CID-only commitment on-chain — with retry on pool priority
@@ -103,10 +107,23 @@ class CommitmentsEngine:
                 style="bold green",
             )
             # Clear pending payload after successful publish
-            self.state.pending_commits.pop(key, None)
+            if isinstance(self.state.pending_commits, dict):
+                self.state.pending_commits.pop(key, None)
             self.state.save_pending_commits()
+            self._mark_committed(epoch_cleared, cid)
         else:
             pretty.log("[yellow]Commitment publish failed after retries (no fallback).[/yellow]")
+            self._touch_pending_meta(epoch_cleared, status="onchain_error")
+
+    async def publish_exact(self, epoch_cleared: int, *, max_retries: int = 3):
+        """
+        Strict publisher: only attempts to publish the pending payload for `epoch_cleared`.
+        Never publishes older epochs. Older pendings remain as diagnostics (stale),
+        and are never auto-published by this process.
+        """
+        if not self._is_master_now():
+            return
+        await self.publish_commitment_for(epoch_cleared, max_retries=max_retries)
 
     # ---------- utils ----------
     def _is_master_now(self) -> bool:
@@ -136,29 +153,6 @@ class CommitmentsEngine:
                 mapping[hk] = i
         return mapping
 
-    async def publish_catch_up(self, up_to_epoch: int, *, max_retries: int = 3):
-        """
-        Publish any staged payloads with key <= up_to_epoch.
-        This prevents gaps if a previous epoch missed publishing.
-        (Used post‑settlement in the validator to avoid overwriting e−2.)
-        """
-        if not self._is_master_now():
-            return
-
-        # Collect int keys safely
-        keys: list[int] = []
-        pcs = self.state.pending_commits if isinstance(self.state.pending_commits, dict) else {}
-        for k in list(pcs.keys()):
-            try:
-                ki = int(k)
-                keys.append(ki)
-            except Exception:
-                pretty.log(f"[yellow]Skipping non-integer pending key: {k!r}[/yellow]")
-
-        for e in sorted(ki for ki in keys if ki <= int(up_to_epoch)):
-            await self.publish_commitment_for(e, max_retries=max_retries)
-
-    # ---------- internal: write with retry ----------
     async def _write_commitment_with_retry(self, commit_str: str, *, max_retries: int = 3) -> bool:
         """
         Sends the commitment extrinsic, retrying on common pool errors (e.g., 'Priority is too low').
@@ -194,3 +188,39 @@ class CommitmentsEngine:
         if last_exc:
             pretty.log(f"[yellow]On-chain commitment write failed after {max_retries} retries: {last_exc}[/yellow]")
         return False
+
+    # ---------- diagnostics helpers ----------
+    def _touch_pending_meta(self, epoch: int, *, status: str, last_error: str | None = None):
+        """
+        Track attempts/errors without altering the payload itself.
+        pending_commits_meta structure (in StateStore) is an aux map: { "<e>": {status, tries, last_error, ts} }
+        """
+        try:
+            from time import time as _now
+            meta = getattr(self.state, "pending_commits_meta", None)
+            if meta is None:
+                self.state.pending_commits_meta = {}
+                meta = self.state.pending_commits_meta
+            entry = meta.get(str(epoch), {"tries": 0})
+            entry["tries"] = int(entry.get("tries", 0)) + (1 if status == "attempt" else 0)
+            entry["status"] = status
+            entry["last_error"] = last_error or entry.get("last_error")
+            entry["ts"] = int(_now())
+            meta[str(epoch)] = entry
+            self.state.save_pending_commits()  # reuse same persistence path
+        except Exception:
+            pass
+
+    def _mark_committed(self, epoch: int, cid: str):
+        """
+        Record a local 'committed' mark to avoid accidental re-commit attempts.
+        """
+        try:
+            committed = getattr(self.state, "committed_epochs", None)
+            if committed is None:
+                self.state.committed_epochs = {}
+                committed = self.state.committed_epochs
+            committed[str(epoch)] = {"cid": cid}
+            self.state.save_pending_commits()
+        except Exception:
+            pass
