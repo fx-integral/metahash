@@ -1,326 +1,255 @@
-# ╭──────────────────────────────────────────────────────────────────────╮
-# neurons/validator.py                                                   #
-# Patched 2025‑07‑07 – persists *all* validated epochs for easy editing  #
-#                                                                       #
-#  * Complies with new TransferEvent signature                           #
-#  * Disk‑deduplicates epochs across restarts via JSON array persistence #
-# ╰──────────────────────────────────────────────────────────────────────╯
+# neurons/validator.py – SN-73 v2.3.7 (strict e−1 publisher; no pre-settlement re-commit; no catch-up)
+# START_V3_BLOCK gates *when* the v3 pipeline starts; before that we still set weights
+# but we *burn all* (independent of FORCE_BURN). FORCE_BURN remains orthogonal and
+# may still be honored by engines in v3.
+#
+# Flow tweaks:
+#   • Keep weights-first semantics for the epoch,
+#   • After settlement & clear, publish ONLY e−1 (strict; no catch-up),
+#   • Same auction/clear logic; TESTING still suppresses on-chain set_weights.
+#   • v2.3.7: Settlement anti-double-counting by coldkey; Clearing 2-pass (caps then relaxed)
+#   • Pre‑v3 branch: settle & set weights, then burn-all (no auction/clear/publish)
+
 from __future__ import annotations
 
 import asyncio
-import json
 import time
-from dataclasses import replace
-from pathlib import Path
-from typing import Callable, List, Optional, Union
 
 import bittensor as bt
 from metahash.base.utils.logging import ColoredLogger as clog
-from metahash.config import (
-    TREASURY_COLDKEY,
-    AUCTION_DELAY_BLOCKS,
-    FORCE_BURN_WEIGHTS,
-    STARTING_BURN_AUCTIONS_BLOCK,
-    TESTING
-)
-from metahash.validator.rewards import compute_epoch_rewards, TransferEvent
-from metahash.validator.epoch_validator import EpochValidatorNeuron
-from metahash.utils.subnet_utils import average_depth, average_price
+from metahash import __version__
+from metahash.utils.pretty_logs import pretty
 
-# ────────────────────────── persistence constants ────────────────────── #
-STATE_FILE = "validated_epochs.json"
-STATE_KEY = "validated_epochs"
+# Config
+from metahash.config import (
+    STRATEGY_PATH,
+    START_V3_BLOCK,
+    EPOCH_LENGTH_OVERRIDE,
+    TESTING,
+    # FORCE_BURN is *not* used here; it stays engine-level & should work even in v3.
+    # If it does not exist in older configs, the try/except below will handle it.
+)
+try:
+    # Optional import; we don't branch on this here to keep FORCE_BURN orthogonal.
+    from metahash.config import FORCE_BURN  # noqa: F401
+except Exception:  # pragma: no cover
+    FORCE_BURN = False  # type: ignore
+
+from metahash.utils.helpers import load_weights
+
+# State & Engines
+from metahash.validator.state import StateStore
+from metahash.validator.engines.commitments import CommitmentsEngine
+from metahash.validator.engines.settlement import SettlementEngine
+from metahash.validator.engines.auction import AuctionEngine
+from metahash.validator.engines.clearing import ClearingEngine
+
+# Base neuron
+from metahash.validator.epoch_validator import EpochValidatorNeuron
 
 
 class Validator(EpochValidatorNeuron):
     """
-    Adaptive validator – guarantees **exactly one** execution per epoch head,
-    even across restarts, by persisting the set of validated epochs to disk.
+    v2.3.7 (strict publishing):
+      • DRY-RUN set_weights (TESTING=True suppresses on-chain),
+      • single-pass quotas by normalized reputation,
+      • early winner notification, window recorded (pe, as, de),
+      • v4 commitments: CID-only on-chain, full in IPFS,
+      • strict commitment publisher: publish ONLY e−1 post-settlement,
+      • settlement guarded; budget-aware burn handled in SettlementEngine.
+      • FIX: anti double-count at settlement by coldkey; 2-pass clearing (caps then relaxed).
+
+    PRE‑V3 BEHAVIOR (this file):
+      • If head_block < START_V3_BLOCK:
+          - Still apply weights-first settlement (e−2),
+          - Then *burn all* for the current epoch (unconditional),
+          - Skip auction/clear and commitment publishing in this mode.
+
+    NOTE:
+      • Clearing uses TAO budget (base subnet = this validator's netuid) and TAO-valued bids
+        = α × (1 − disc) × price_tao_per_alpha[subnet] × weight_fraction (with α-slippage).
+      • FORCE_BURN (if present) stays engine-level and remains valid even in v3.
     """
 
-    # ───────────────────────── initialization ───────────────────────── #
     def __init__(self, config=None):
         super().__init__(config=config)
+        self.hotkey_ss58: str = self.wallet.hotkey.ss58_address
 
-        # one asyncio.Lock guarding the single websocket recv() loop
+        # Single AsyncSubtensor client + a per-connection RPC lock.
+        self._async_subtensor: bt.AsyncSubtensor | None = None
         self._rpc_lock: asyncio.Lock = asyncio.Lock()
 
-        # Governable parameters
-        self.treasury_coldkey: str = TREASURY_COLDKEY
+        # State (load before strategies)
+        self.state = StateStore()
+        if getattr(self.config, "fresh", False):
+            self.state.wipe()
 
-        # Runtime state
-        self._async_subtensor: Optional[bt.AsyncSubtensor] = None
-        self._validated_epochs: set[int] = self._load_validated_epochs()
+        # Strategy (weights per subnet)
+        self.weights_bps = load_weights(STRATEGY_PATH)
 
-    # ╭─────────────────────── persistence helpers ─────────────────────╮
-    def _state_path(self) -> Path:
-        """
-        Return the JSON state‑file path (next to wallet hot‑key file).
-        Creates the parent folder if needed.
-        """
-        hotkey_file: Union[str, Path, "bt.Keyfile"] = self.wallet.hotkey_file
-        if isinstance(hotkey_file, (str, Path)):
-            hotkey_path = Path(hotkey_file)
-        else:
-            hotkey_path = Path(getattr(hotkey_file, "path", str(hotkey_file)))
+        # Engines (they reuse the single client)
+        self.commitments = CommitmentsEngine(self, self.state)
+        self.settlement = SettlementEngine(self, self.state)
+        self.clearing = ClearingEngine(self, self.state)
+        self.auction = AuctionEngine(self, self.state, self.weights_bps, clearer=self.clearing)
 
-        wallet_root = hotkey_path.expanduser().parent
-        wallet_root.mkdir(parents=True, exist_ok=True)
-        return wallet_root / STATE_FILE
-
-    def _load_validated_epochs(self) -> set[int]:
-        """
-        Returns a *set* with all epochs already validated, or an empty set.
-        Expected on‑disk schema:  {"validated_epochs": [0, 1, 2, …]}
-        """
-        try:
-            data = json.loads(self._state_path().read_text())
-            epochs = set(int(x) for x in data.get(STATE_KEY, []))
-            bt.logging.info(f"[state] loaded {len(epochs)} validated epochs")
-            return epochs
-        except Exception:
-            return set()
-
-    def _save_validated_epochs(self):
-        """
-        Atomically writes the set of validated epochs back to disk.
-        """
-        try:
-            tmp_path = self._state_path().with_suffix(".tmp")
-            tmp_path.write_text(json.dumps({STATE_KEY: sorted(self._validated_epochs)}))
-            tmp_path.replace(self._state_path())
-            bt.logging.debug(
-                f"[state] stored {len(self._validated_epochs)} validated epochs"
-            )
-        except Exception as e:
-            bt.logging.warning(f"[state] failed to persist epochs: {e}")
-
-    # ╭────────────────── async‑substrate helper ───────────────────────╮
-    async def _ensure_async_subtensor(self):
-        if self._async_subtensor is None:
-            stxn = bt.AsyncSubtensor(network=self.config.subtensor.network)
-            await stxn.initialize()
-            self._async_subtensor = stxn
-
-    # ╭──────────────────── providers & scanners ────────────────────────╮
-    def _make_scanner(self, async_subtensor: bt.AsyncSubtensor):
-        """
-        Returns an object that conforms to the TransferScanner Protocol
-        expected by compute_epoch_rewards.
-        """
-        from metahash.validator.alpha_transfers import (
-            AlphaTransfersScanner as _AlphaScanner,
-        )
-
-        alpha_scanner = _AlphaScanner(
-            async_subtensor,
-            dest_coldkey=self.treasury_coldkey,
-            rpc_lock=self._rpc_lock,
-        )
-
-        outer = self  # capture for UID→cold‑key lookup
-
-        class _Scanner:
-            async def scan(
-                self, from_block: int, to_block: int
-            ) -> List[TransferEvent]:
-                raw = await alpha_scanner.scan(from_block, to_block)
-
-                uid2ck = outer.metagraph.coldkeys
-
-                def _uid_to_ck(uid: int | None) -> Optional[str]:
-                    if uid is None or uid < 0:
-                        return None
-                    try:
-                        return uid2ck[uid]
-                    except IndexError:
-                        return None
-
-                # ── FIX: clone each event, override only missing fields ── #
-                return [
-                    replace(
-                        ev,
-                        src_coldkey=ev.src_coldkey or _uid_to_ck(ev.from_uid),
-                        dest_coldkey=ev.dest_coldkey or outer.treasury_coldkey,
-                    )
-                    for ev in raw
-                    if (ev.src_coldkey or _uid_to_ck(ev.from_uid)) is not None
-                ]
-
-        return _Scanner()
-
-    # --------------- helpers that feed price & depth oracles --------- #
-    def _make_pricing_provider(
-        self,
-        async_subtensor: bt.AsyncSubtensor,
-        start_block: int,
-        end_block: int,
-    ) -> Callable:
-        async def _pricing(subnet_id: int, *_unused):
-            return await average_price(
-                subnet_id,
-                start_block=start_block,
-                end_block=end_block,
-                st=async_subtensor,
-            )
-
-        return _pricing
-
-    def _make_pool_depth_provider(
-        self,
-        async_subtensor: bt.AsyncSubtensor,
-        start_block: int,
-        end_block: int,
-    ) -> Callable[[int], asyncio.Future]:
-        async def _depth(subnet_id: int) -> int:
-            return await average_depth(
-                subnet_id,
-                start_block=start_block,
-                end_block=end_block,
-                st=async_subtensor,
-            )
-
-        return _depth
-
-    def _make_uid_resolver(self) -> Callable[[str], asyncio.Future]:
-        """Cold‑key → UID resolver, refreshed each epoch."""
-        async def _resolver(coldkey: str) -> Optional[int]:
-            if len(self.metagraph.coldkeys) != getattr(self, "_ck_cache_size", 0):
-                self._cold_to_uid_cache = {
-                    ck: uid for uid, ck in enumerate(self.metagraph.coldkeys)
-                }
-                self._ck_cache_size = len(self.metagraph.coldkeys)
-            return self._cold_to_uid_cache.get(coldkey)
-
-        # prime cache
-        self._cold_to_uid_cache = {
-            ck: uid for uid, ck in enumerate(self.metagraph.coldkeys)
-        }
-        self._ck_cache_size = len(self.metagraph.coldkeys)
-        return _resolver
-
-    # ╭──────────────────────────── Phase 1 ────────────────────────────╮
-    async def _set_weights_for_previous_epoch(
-        self,
-        prev_epoch_index: int,
-        prev_start_block: int,
-        prev_end_block: int,
-        async_subtensor: bt.AsyncSubtensor,
-    ) -> None:
-        """
-        Reward accounting for the **previous** epoch, followed by weight update.
-        """
-        if prev_epoch_index < 0 or prev_epoch_index in self._validated_epochs:
-            bt.logging.error(
-                f"Phase 1 skipped – epoch {prev_epoch_index} already evaluated"
-            )
-            return
-
-        miner_uids: List[int] = list(self.get_miner_uids())
-
-        scan_start_block = min(
-            prev_start_block + AUCTION_DELAY_BLOCKS, prev_end_block
-        )
-
-        rewards = await compute_epoch_rewards(
-            miner_uids=miner_uids,
-            scanner=self._make_scanner(async_subtensor),
-            pricing=self._make_pricing_provider(
-                async_subtensor, prev_start_block, prev_end_block
-            ),
-            pool_depth_of=self._make_pool_depth_provider(
-                async_subtensor, prev_start_block, prev_end_block
-            ),
-            uid_of_coldkey=self._make_uid_resolver(),
-            start_block=scan_start_block,
-            end_block=prev_end_block,
-        )
-
-        self._last_epoch_rewards = rewards
-
-        burn_all = (
-            FORCE_BURN_WEIGHTS
-            or not any(rewards)
-            or self.block > STARTING_BURN_AUCTIONS_BLOCK
-        )
-
-        if not TESTING:
-            if burn_all:
-                bt.logging.warning("Burn triggered – redirecting full emission to UID 0.")
-                self.update_scores(
-                    [1.0 if uid == 0 else 0.0 for uid in miner_uids], miner_uids
+        pretty.banner(
+            f"Validator v{__version__} initialized",
+            " | ".join(
+                filter(
+                    None,
+                    [
+                        f"hotkey={self.hotkey_ss58}",
+                        f"netuid={self.config.netuid}",
+                        f"epoch(e)={getattr(self, 'epoch_index', 0)}",
+                        "fresh" if getattr(self.config, "fresh", False) else "",
+                        "Testing" if TESTING else "",
+                    ],
                 )
-            else:
-                self.update_scores(rewards, miner_uids)
-
-            # ── ✅  broadcast weights on-chain  ────────────────────────── #
-            if not self.config.no_epoch:          # honour --no-epoch flag
-                self.set_weights()
-                self._validated_epochs.add(prev_epoch_index)
-                self._save_validated_epochs()
-
-    # ╭──────────────────────────── main loop ──────────────────────────╮
-    async def forward(self) -> None:
-        """Runs once per epoch head – Phase 1 plus bookkeeping."""
-        bt.logging.success(
-            f"▶︎ forward() called at block {self.block:,} (epoch {self.epoch_index})"
+            ),
+            style="bold magenta",
         )
 
-        await self._ensure_async_subtensor()
+    async def _stxn(self) -> bt.AsyncSubtensor:
+        """Return the shared AsyncSubtensor client (create once)."""
+        if self._async_subtensor is None:
+            self._async_subtensor = await self._new_async_subtensor()
+        return self._async_subtensor
 
-        current_start = self.epoch_start_block
-        prev_start_block = current_start - self.epoch_tempo
-        prev_end_block = current_start - 1
-        prev_epoch_index = self.epoch_index - 1
+    async def _new_async_subtensor(self) -> bt.AsyncSubtensor:
+        stxn = bt.AsyncSubtensor(network=self.config.subtensor.network)
+        await stxn.initialize()
+        return stxn
 
-        if prev_epoch_index in self._validated_epochs:
-            bt.logging.info(
-                f"[forward] epoch {prev_epoch_index} already done – nothing to do."
+    def _apply_epoch_override(self):
+        """Keep the fast test cadence if EPOCH_LENGTH_OVERRIDE is set."""
+        try:
+            if EPOCH_LENGTH_OVERRIDE and EPOCH_LENGTH_OVERRIDE > 0:
+                L = int(EPOCH_LENGTH_OVERRIDE)
+                blk = int(getattr(self, "block", 0))
+                e = blk // L
+                self.epoch_index = e
+                self.epoch_start_block = e * L
+                self.epoch_end_block = self.epoch_start_block + L - 1
+                self.epoch_length = L
+        except Exception:
+            pass  # non-fatal
+
+    async def _burn_all_pre_v3(self, e: int) -> None:
+        """
+        Pre‑v3 branch:
+          1) Weights‑first: settle epoch (e−2) + set weights,
+          2) Then unconditionally burn all for epoch e (independent of FORCE_BURN),
+          3) Skip auction/clear/publish.
+        """
+        pretty.banner(
+            f"Epoch {e} (pre‑v3 burn‑all mode)",
+            f"head_block={self.block} | start={self.epoch_start_block} | end={self.epoch_end_block}\n"
+            f"• PRE‑V3: settle e−2 → {e-2} (weights‑first)\n"
+            f"• PRE‑V3: burn ALL spendable weights/budget for e={e}\n"
+            f"• PRE‑V3: skip auction/clear and commitment publish",
+            style="bold yellow",
+        )
+
+        # 1) WEIGHTS FIRST: settle older epoch (e−2) and set weights
+        await self.settlement.settle_and_set_weights_all_masters(epoch_to_settle=e - 2)
+
+        # 2) Attempt to *burn all* for epoch e using available engine methods.
+        #    We try Clearing first, then Settlement. If none exist, we log and carry on.
+        burned = False
+        for engine in (self.clearing, self.settlement):
+            for method_name in ("burn_all", "force_burn_all", "burn_epoch"):
+                fn = getattr(engine, method_name, None)
+                if callable(fn):
+                    try:
+                        # Prefer async; support sync just in case.
+                        maybe_coro = fn(epoch=e)
+                        if asyncio.iscoroutine(maybe_coro):
+                            await maybe_coro
+                        burned = True
+                        pretty.log(f"[green]Pre‑v3 burn-all via {engine.__class__.__name__}.{method_name}()[/green]")
+                        break
+                    except asyncio.CancelledError as ce:
+                        pretty.log(f"[yellow]Pre‑v3 burn-all cancelled by RPC: {ce}[/yellow]")
+                        raise
+                    except Exception as exc:
+                        pretty.log(
+                            f"[yellow]Pre‑v3 burn-all via {engine.__class__.__name__}.{method_name}() failed: {exc}[/yellow]"
+                        )
+            if burned:
+                break
+
+        if not burned:
+            pretty.log(
+                "[yellow]Pre‑v3: no engine burn method found (burn_all / force_burn_all / burn_epoch). "
+                "Weights were still set (weights‑first), but nothing was explicitly burned.[/yellow]"
             )
-            return
 
-        clog.info(
-            f"⤵︎  Entering epoch {self.epoch_index}  (block {current_start})",
-            color="cyan",
+    async def forward(self):
+        """
+        Per-epoch driver:
+          0) Ensure single AsyncSubtensor client; apply epoch override.
+          1) If pre‑v3 (head_block < START_V3_BLOCK): settle e−2, then BURN ALL, and return.
+          2) Else (v3+):
+               a) Settle epoch (e−2) and set weights (weights‑first),
+               b) Masters: auction & clear NOW (epoch e) — stage payload for (e−1),
+               c) Publish ONLY e−1 AFTER settlement (strict; no catch-up for older epochs).
+        """
+        await self._stxn()          # ensure single client exists
+        self._apply_epoch_override()
+
+        e = self.epoch_index
+
+        # --- PRE‑V3 BRANCH ---------------------------------------------------
+        if self.block < START_V3_BLOCK:
+            await self._burn_all_pre_v3(e)
+            return
+        # ---------------------------------------------------------------------
+
+        # --- V3+ STRICT PIPELINE ---------------------------------------------
+        pretty.banner(
+            f"Epoch {e} (label: e)",
+            f"head_block={self.block} | start={self.epoch_start_block} | end={self.epoch_end_block}\n"
+            f"• PHASE 1/3: settle e−2 → {e-2} (scan pe={e-1})\n"
+            f"• PHASE 2/3: auction & clear e={e} (miners pay in e+1={e+1})\n"
+            f"• PHASE 3/3: publish commitment for e−1={e-1} (strict; post-settlement)\n"
+            f"• Weights applied from e in e+2={e+2}",
+            style="bold white",
         )
+
+        # 1) WEIGHTS FIRST: settle older epoch (e−2)
+        await self.settlement.settle_and_set_weights_all_masters(epoch_to_settle=e - 2)
+
+        # 2) Masters: broadcast & clear immediately (if master)
+        if not self.auction._is_master_now() and getattr(self.auction, "_not_master_log_epoch", None) != e:
+            pretty.log("[yellow]Validator is not a master — skipping broadcast/clear for this epoch.[/yellow]")
+            self.auction._not_master_log_epoch = e
 
         try:
-            clog.info("▶︎ Phase 1 – reward accounting", color="yellow")
-            await self._set_weights_for_previous_epoch(
-                prev_epoch_index,
-                prev_start_block,
-                prev_end_block,
-                self._async_subtensor,
-            )
-        except Exception as err:
-            bt.logging.error(f"forward() – unexpected exception: {err}")
-            raise
+            await self.auction.broadcast_auction_start()
+        except asyncio.CancelledError as ce:
+            pretty.log(f"[yellow]AuctionStart cancelled by RPC: {ce}. Will retry next epoch.[/yellow]")
+            return
+        except Exception as exc:
+            pretty.log(f"[yellow]AuctionStart failed: {exc}[/yellow]")
 
-    # ╭────────────────────── clean shutdown helpers ───────────────────╮
-    async def _close_async_subtensor(self):
-        if self._async_subtensor:
-            try:
-                await self._async_subtensor.__aexit__(None, None, None)
-            except Exception as e:
-                bt.logging.warning(f"AsyncSubtensor close failed: {e}")
+        # cleanup bid books older than (e−1)
+        self.auction.cleanup_old_epoch_books(before_epoch=e - 2)
 
-    def __del__(self):
-        if self._async_subtensor:
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    loop.create_task(self._close_async_subtensor())
-                else:
-                    loop.run_until_complete(self._close_async_subtensor())
-            except RuntimeError:
-                pass  # interpreter shut down
+        # 3) POST-SETTLEMENT: publish ONLY the e−1 commitment (strict; no catch-up).
+        try:
+            # use a few more retries to avoid leaving e−1 pending due to transient pool priority errors
+            await self.commitments.publish_exact(epoch_cleared=e - 1, max_retries=6)
+        except asyncio.CancelledError as ce:
+            pretty.log(f"[yellow]Publish e−1 cancelled by RPC: {ce}[/yellow]")
+        except Exception as exc:
+            pretty.log(f"[yellow]Publish e−1 failed: {exc}[/yellow]")
+        # ---------------------------------------------------------------------
 
 
-# ╭────────────────── production keep‑alive (optional) ──────────────────╮
 if __name__ == "__main__":
     from metahash.bittensor_config import config
-
-    with Validator(config=config()) as validator:
+    with Validator(config=config(role="validator")) as v:
         while True:
-            clog.info("Validator Running…", color="gray")
+            clog.info("Validator running…", color="gray")
             time.sleep(120)
