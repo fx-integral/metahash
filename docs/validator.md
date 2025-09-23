@@ -1,9 +1,6 @@
 # 🧪 MetaHash Validator Setup Guide (Subnet 73)
 
-This guide outlines how to set up and operate a **MetaHash SN73 Validator**, which is responsible for:
-- Tracking cross-subnet alpha deposits,
-- Pricing and rewarding alpha contributions,
-- Issuing SN73 token incentives to bonded miners.
+Operate a MetaHash validator on **SN73** using the v3 pipeline: **Auction → Clearing → Commitments → Settlement**.
 
 ---
 
@@ -12,6 +9,26 @@ This guide outlines how to set up and operate a **MetaHash SN73 Validator**, whi
 2. **Python 3.10+** installed
 3. **pip/venv** for isolated environment
 4. A funded coldkey/hotkey wallet with stake registered in Subnet 73
+
+---
+
+## 🔁 Epoch lifecycle (ground truth)
+
+Epoch e — Auction & Clearing
+1. AuctionStart: broadcast start marker.
+2. Collect bids: miners submit (subnet_id, alpha_amount, discount_bps).
+3. Clearing: rank by TAO value with slippage; apply optional reputation caps; allow partial fills.
+4. Early Win invoices: notify winners immediately; each line includes payment window [as, de] in e+1.
+5. Stage commitment: persist the exact winners snapshot for e, including budget signals (bt_mu, bl_mu).
+
+Epoch e+1 — Publish commitments
+6. CID-only (v4) on-chain: publish a CID referencing the commitment for epoch e.
+7. Full JSON to IPFS: push the full payload to IPFS; no catch-up publishing (strict publisher).
+
+Epoch e+2 — Settlement & weights
+8. Scan payments: merge windows, verify α transfers within [as, de] to known treasuries; respect STRICT_PER_SUBNET.
+9. Burn underfill: deterministically burn unused budget to UID 0.
+10. Set weights: call set_weights() unless TESTING=true (preview-only).
 
 ---
 
@@ -26,7 +43,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 
 # Install MetaHash and dependencies
-pip install uv
+pip install -U pip wheel uv
 uv pip install -e .
 ```
 
@@ -41,7 +58,6 @@ Set the environment values for your validator identity and network:
 ```dotenv
 BT_WALLET_NAME=validator-wallet
 BT_HOTKEY=validator-hotkey
-BT_NETWORK=finney
 ```
 
 ---
@@ -70,56 +86,50 @@ btcli subnets register --wallet.name mywallet --wallet.hotkey myhotkey --netuid 
 ### ✅ Using PM2 (recommended)
 
 ```bash
-pm2 start python --name metahash-validator -- neurons/validator.py --netuid 73 --subtensor.network finney --wallet.name validator-wallet --wallet.hotkey validator-hotkey --logging.debug
+pm2 start python --name metahash-validator -- neurons/validator.py --netuid 73 --subtensor.network archive --wallet.name validator-wallet --wallet.hotkey validator-hotkey --neuron.axon_off --logging.debug
 ```
+Notes
+- Map validator hotkey → treasury coldkey in metahash/treasuries.py (only these treasuries will be credited).
+- Reputation controls & auction budget are configured in metahash/config.py
+- Subnet weights are set in weights.yml
 
-### 🔁 Development Mode
+## 🔍 Observability & state
 
-```bash
-python neurons/validator.py --netuid 73 --subtensor.network finney --wallet.name validator-wallet --wallet.hotkey validator-hotkey --logging.debug
-```
+- Structured logs: Auction, Clearing, Commitments, Settlement sections.
+- Local JSON state (atomic writes):
+  - validated_epochs.json — published/settled epochs
+  - pending_commits.json — staged commitments awaiting publish
+  - reputation.json — per-coldkey reputation / caps
+  - jailed_coldkeys.json — enforcement state
 
-This validator will:
-- Detect new `StakeTransferred` events (alpha deposits)
-- Apply finality lag to avoid chain reorg risk
-- Evaluate alpha using pricing oracle and slippage
-- Emit `set_weights()` to reward coldkeys with SN73 incentives
-- Record all participation via epoch-based ledger
-
----
-
-## 🧠 How It Works
-
-- Validators run `EpochValidatorNeuron`, executing once per chain tempo
-- Events are scanned from the chain using `alpha_transfers.py`
-- Prices are fetched via dynamic pricing interfaces
-- Rewards are calculated using `rewards.py`, with planck-level precision
-- Scores are normalized, and weights are set via `subtensor.set_weights(...)`
+Optional reporter:
+scripts/validator/report.sh
 
 ---
 
-## ⚖️ Reward Mechanics
+## 🧰 Configuration reference (env-driven)
 
-Validators apply:
+See metahash/config.py for defaults. Common knobs:
 
-| Mechanism        | Purpose                                             |
-|------------------|-----------------------------------------------------|
-| Slippage Curve   | Discounts alpha based on pool depth                |
-| Finality Lag     | Ensures event stability before reward distribution |
-| Price Oracle     | Retrieves TAO/alpha price for reward conversion    |
-
-> All monetary math is computed using `decimal.Decimal` with 60-digit precision.
-
----
-
-## 🛡️ Safeguards
-
-- Wallet sync is enforced on failure to avoid dehydration
-- Rewards only emitted if valid scores exist (`E-2` guard)
-- `adaptive_wait_for_head()` ensures efficient epoch pacing
-- Coldkey addresses are masked when dumping logs
+- Network / lifecycle: BITTENSOR_NETWORK, START_V3_BLOCK, TESTING, EPOCH_LENGTH_OVERRIDE
+- Auction / clearing: AUCTION_BUDGET_ALPHA, MAX_BIDS_PER_MINER
+- Reputation: REPUTATION_ENABLED, REPUTATION_BASELINE_CAP_FRAC, REPUTATION_MAX_CAP_FRAC
+- Slippage: K_SLIP, SLIP_TOLERANCE, SAMPLE_POINTS
+- Settlement: STRICT_PER_SUBNET, JAIL_EPOCHS_*
+- IPFS: IPFS_API_URL, IPFS_GATEWAYS
 
 ---
+
+## ❓ FAQ (validator-specific)
+
+Do I need IPFS to validate?
+Yes. Commitments are published as CID-only on-chain with full payloads stored in IPFS.
+
+Why are miner discounts large numbers?
+They’re basis points (bps) (1 bp = 0.01%). Example: 500 = 5%.
+
+What if a miner pays late or to the wrong subnet?
+The line is ignored in settlement; underfill is burned to UID 0.
 
 ## 📓 Logs & Debugging
 
@@ -134,26 +144,6 @@ Or run in debug mode directly:
 ```bash
 python neurons/validator.py --logging.debug
 ```
-
----
-
-## 🧩 System Components
-
-- `alpha_transfers.py`: monitors alpha inflow events
-- `rewards.py`: calculates SN73 reward weights
-- `bond_utils.py`: implements the bonding curve
-- `validator.py`: main loop, score aggregation, weight emission
-- `epoch_validator.py`: orchestrates the epoch-pacing cycle
-
----
-
-## ✅ You're Validating!
-
-Once running, your validator:
-- Accepts OTC alpha deposits from bonded coldkeys
-- Measures value and liquidity-adjusted worth of alpha
-- Incentivizes contributors with appropriately priced SN73 rewards
-- Builds the MetaHash alpha treasury to benefit all SN73 holders
 
 ## 🔗 Resources
 
