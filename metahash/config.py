@@ -88,7 +88,7 @@ PAYMENT_TICK_SLEEP_SECONDS = 5 * 12  # 5 blocks
 
 
 # ╭─────────────────────────── IPFS ─────────────────────────╮
-DEFAULT_API_URL: str = os.getenv("IPFS_API_URL", "http://10.9.0.3:5001/api/v0").rstrip("/")
+DEFAULT_API_URL: str = os.getenv("IPFS_API_URL", "http://ipfs.metahash73.com:5001/api/v0").rstrip("/")
 DEFAULT_GATEWAYS: list[str] = [
     gw.strip().rstrip("/")
     for gw in (
