@@ -27,8 +27,9 @@ This guide walks you through the **basic setup** (environment, wallet + hotkey),
    ```
 
 3. **Fund the wallet**  
+```text
    Ensure your coldkey has enough TAO to register and process transactions to operate.
-
+```
 ---
 
 ## 🧭 High-level overview (Miner ↔ Validator)
@@ -72,27 +73,39 @@ python neurons/miner.py \
 - **Raw mode** – add `--miner.bids.raw_discount` to send your bps unchanged.
 
 ---
+### Understanding `discount_bps`
 
-## 🧾 State & payments
+Each bid includes a `discount_bps` field, which sets the **maximum discount you are willing to accept** on the value of your α, after adjusting for slippage and validator-specific subnet weights.
 
-- Miner state is stored in `miner_state.json`.  
-- Transfers are attempted automatically **within** `[as, de]` and **retried** with a cooldown (`PAYMENT_RETRY_COOLDOWN_BLOCKS`).  
-- You can also pay **manually** using `btcli`; ensure the **correct window and treasury**.
+- **Basis points (bps):** 1 bp = 0.01%
+  - `0` bps = no discount (you expect full value)
+  - `500` bps = 5% max discount
+  - `2500` bps = 25% max discount
 
----
+- **How it works:**
+  - Subnet weights apply an implicit haircut. For example, a subnet weight of `0.8` means you already face a 20% baseline discount.
+  - Your `discount_bps` sets the maximum haircut you are willing to accept, including this baseline.
+  - The validator ensures your **effective discount never exceeds your configured max**.
+  - If the subnet’s baseline discount is greater than your max, the bid is not sent.
 
-## 🔒 Security best practices
+- **Example 1 (accepted):**
+  - Subnet weight = `0.8` (20% haircut)
+  - Your discount = 25% max (`2500` bps)
+  - Effective discount applied = 5% (difference between 25% and 20%)
+  - You receive 75% of your α’s value.
 
-- Do **not** pass wallet passphrases on the command line.  
-- Keep minimal balances in hotkeys used for mining.  
-- Prefer hardware/air-gapped setups for coldkeys.  
-- Review logs to confirm invoices, windows, and payments.
+- **Example 2 (tight fill):**
+  - Subnet weight = `0.95` (5% haircut)
+  - Your discount = 25% max (`2500` bps)
+  - Effective discount applied = 25% – 5% = 20%
+  - You receive 75% of your α’s value.
 
----
+- **Example 3 (rejected):**
+  - Subnet weight = `0.7` (30% haircut)
+  - Your discount = 25% max (`2500` bps)
+  - Since 30% > 25%, the bid is **not sent**.
 
-## 📝 Tips
-
-- Set `BITTENSOR_NETWORK` in `.env` or pass `--subtensor.network` explicitly.  
-- Watch logs for `AuctionStart`, **Win** (shows `[as, de]`), and payment attempts.  
-- Late/invalid payments are ignored; underfill is **burned** to UID 0.  
-- With `STRICT_PER_SUBNET=true`, **don’t cross-subsidize** — each subnet’s bid must be paid individually.
+- **Why this matters:**
+  - You can “set and forget” by specifying the maximum discount you’re comfortable with.
+  - The code guarantees you will never be forced into a worse deal.
+  - This provides certainty and safety, similar to OTC markets where miners typically offer ~10–20% discounts.
