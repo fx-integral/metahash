@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
-# neurons/miner.py — Event-driven bidder v2.8.0
-# - Effective-discount mode (default): users configure discount as subnet_weight * (1 - raw_discount)
-# - Add --miner.bids.raw_discount flag to pass configured discount as-is (no transform)
+# neurons/miner.py — Event-driven bidder v2.8.0 (hardened)
 
 import asyncio
 import time
@@ -24,6 +22,7 @@ from metahash.config import (
 )
 from metahash.utils.pretty_logs import pretty
 from metahash.utils.wallet_utils import unlock_wallet, transfer_alpha
+from metahash.treasuries import VALIDATOR_TREASURIES
 
 
 class Miner(BaseMinerNeuron, MinerMixins):
@@ -32,7 +31,13 @@ class Miner(BaseMinerNeuron, MinerMixins):
 
         # Local persistent state
         self._state_file = Path("miner_state.json")
-        self._treasuries: Dict[str, str] = {}  # validator_key -> treasury coldkey
+
+        # SECURITY: Treasuries are pinned to the local allowlist. Do *not* mutate
+        # from network input or persisted state. We overwrite any restored version
+        # right after load to avoid stale/poisoned data.
+        self._treasuries: Dict[str, str] = {}
+
+        # Remember if we have already bid to a validator in an epoch
         self._already_bid: Dict[str, List[Tuple[int, int, float, int]]] = {}  # validator_key -> list of (epoch, subnet, alpha, discount_bps)
         self._wins: List[WinInvoice] = []
 
@@ -56,7 +61,12 @@ class Miner(BaseMinerNeuron, MinerMixins):
             self._wipe_state()
             pretty.log("[magenta]Fresh start requested: cleared local miner state.[/magenta]")
 
+        # Load persisted state (wins, etc.). Immediately re-pin treasuries.
         self._load_state_file()
+        # SECURITY: pin to local allowlist after loading persisted state
+        self._treasuries = dict(VALIDATOR_TREASURIES)
+
+        # Build bid lines from CLI/config
         self.lines: List[BidLine] = self._build_lines_from_config()
 
         pretty.banner(
@@ -65,6 +75,11 @@ class Miner(BaseMinerNeuron, MinerMixins):
             style="bold magenta",
         )
         self._log_cfg_summary()
+        pretty.kv_panel(
+            "[magenta]Local treasuries loaded[/magenta]",
+            [("allowlisted_validators", len(self._treasuries))],
+            style="bold magenta",
+        )
 
         unlock_wallet(wallet=self.wallet)
 
@@ -163,6 +178,38 @@ class Miner(BaseMinerNeuron, MinerMixins):
         if isinstance(sid, int) and sid in self._pay_map:
             return self._pay_map[sid]
         return self._pick_rr_hotkey()
+
+    # ---------------------- allowlist helpers ----------------------
+
+    def _lookup_local_treasury(
+        self,
+        caller_hot: Optional[str],
+        vkey: str,
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Return (treasury_coldkey, matched_validator_key) if the validator is allowlisted,
+        else (None, None). We try the caller's hotkey first, then vkey fallback.
+
+        NOTE: `vkey` is what self._validator_key(uid, caller_hot) returns; depending on
+        upstream, it may be the hotkey or some derived key. The allowlist uses hotkeys.
+        """
+        # Prefer direct hotkey match
+        if isinstance(caller_hot, str) and caller_hot:
+            ck = self._treasuries.get(caller_hot)
+            if ck:
+                return ck, caller_hot
+
+        # Fallback to whatever `vkey` is, in case your allowlist chose that string
+        if isinstance(vkey, str) and vkey:
+            ck = self._treasuries.get(vkey)
+            if ck:
+                return ck, vkey
+
+        return None, None
+
+    def _allowed_validator_note(self, caller_hot: Optional[str], vkey: str) -> str:
+        key_preview = (caller_hot or vkey or "?")
+        return f"validator not allowlisted: {key_preview}"
 
     # ---------------------- per-invoice scheduler ----------------------
 
@@ -345,10 +392,22 @@ class Miner(BaseMinerNeuron, MinerMixins):
                 self._payment_tasks.pop(inv.invoice_id, None)
 
     def _schedule_unpaid_pending(self):
-        """Schedule tasks for all unpaid invoices (idempotent)."""
+        """Schedule tasks for all unpaid invoices (idempotent), allowlist-enforced."""
         for w in self._wins:
-            if not w.paid:
+            if w.paid:
+                continue
+            # Only schedule if validator is still allowlisted (safety on restarts)
+            treasury_ck, _matched = self._lookup_local_treasury(None, w.validator_key)
+            if treasury_ck:
+                # Update the pinned treasury on the invoice to match local file
+                w.treasury_coldkey = treasury_ck
                 self._schedule_payment(w)
+            else:
+                pretty.kv_panel(
+                    "[yellow]Skipping pending invoice[/yellow]",
+                    [("inv", getattr(w, "invoice_id", "?")), ("reason", "validator not allowlisted")],
+                    style="bold yellow",
+                )
 
     # ---------------------- discount math (effective -> raw) ----------------------
 
@@ -394,13 +453,23 @@ class Miner(BaseMinerNeuron, MinerMixins):
         vkey = self._validator_key(uid, caller_hot)
         epoch = int(synapse.epoch_index)
 
-        # Remember treasury for future invoices
-        try:
-            if getattr(synapse, "treasury_coldkey", None):
-                self._treasuries[vkey] = synapse.treasury_coldkey
-                await self._async_save_state()
-        except Exception:
-            pass
+        # SECURITY: Never trust synapse.treasury_coldkey. We only use local allowlist.
+        treasury_ck, matched_key = self._lookup_local_treasury(caller_hot, vkey)
+        if not treasury_ck:
+            # Do not bid for unknown validators
+            note = self._allowed_validator_note(caller_hot, vkey)
+            pretty.kv_panel(
+                "[red]AuctionStart ignored[/red]",
+                [("validator", f"{caller_hot or vkey} (uid={uid if uid is not None else '?'})"),
+                 ("reason", "not allowlisted"),
+                 ("note", note)],
+                style="bold red"
+            )
+            synapse.ack = True  # we answered, but with no bids
+            synapse.bids = []
+            synapse.bids_sent = 0
+            synapse.note = note
+            return synapse
 
         budget_alpha = float(getattr(synapse, "auction_budget_alpha", 0.0) or 0.0)
         min_stake_alpha = float(getattr(synapse, "min_stake_alpha", S_MIN_ALPHA_MINER) or S_MIN_ALPHA_MINER)
@@ -434,11 +503,12 @@ class Miner(BaseMinerNeuron, MinerMixins):
                 ("weights", f"{len(weights_bps)} subnet(s)"),
                 ("discount_mode", "RAW (pass-through)" if self._bids_raw_discount else "EFFECTIVE (weight-adjusted)"),
                 ("timeline", f"bid now (e) → pay in (e+1={epoch+1}) → weights from e in (e+2={epoch+2})"),
+                ("treasury_src", "LOCAL allowlist (pinned)"),
             ],
             style="bold cyan",
         )
 
-        # (Re)schedule any pending unpaid invoices we may have persisted
+        # (Re)schedule any pending unpaid invoices we may have persisted (allowlist will filter)
         self._schedule_unpaid_pending()
 
         # Stake gate
@@ -536,14 +606,22 @@ class Miner(BaseMinerNeuron, MinerMixins):
         uid, caller_hot = self._resolve_caller(synapse)
         vkey = self._validator_key(uid, caller_hot)
 
-        treasury_ck = self._treasuries.get(vkey, "")
+        # SECURITY: Use local allowlist only (ignore synapse-provided treasury).
+        treasury_ck, matched_key = self._lookup_local_treasury(caller_hot, vkey)
         if not treasury_ck:
-            pretty.log("[red]Treasury unknown for this validator – cannot pay.[/red]")
+            note = self._allowed_validator_note(caller_hot, vkey)
+            pretty.kv_panel(
+                "[red]Win ignored[/red]",
+                [("validator", f"{caller_hot or vkey} (uid={uid if uid is not None else '?'})"),
+                 ("reason", "not allowlisted"),
+                 ("note", note)],
+                style="bold red",
+            )
             synapse.ack = False
             synapse.payment_attempted = False
             synapse.payment_ok = False
             synapse.attempts = 0
-            synapse.last_response = "treasury unknown"
+            synapse.last_response = note
             return synapse
 
         # Prefer explicit accepted_alpha if provided (new), fallback to alpha (compat)
@@ -562,7 +640,7 @@ class Miner(BaseMinerNeuron, MinerMixins):
 
         inv = WinInvoice(
             validator_key=vkey,
-            treasury_coldkey=treasury_ck,
+            treasury_coldkey=treasury_ck,  # <- pinned local value
             subnet_id=int(synapse.subnet_id),
             alpha=float(accepted_alpha),
             alpha_requested=float(requested_alpha),
@@ -603,6 +681,8 @@ class Miner(BaseMinerNeuron, MinerMixins):
                 w.alpha_requested = inv.alpha_requested
                 w.was_partial = inv.was_partial
                 w.pay_epoch_index = inv.pay_epoch_index or w.pay_epoch_index
+                # SECURITY: ensure treasury is local-pinned even after merge
+                w.treasury_coldkey = treasury_ck
                 inv = w
                 break
         else:
@@ -624,6 +704,7 @@ class Miner(BaseMinerNeuron, MinerMixins):
                 ("window", f"[{inv.pay_window_start_block}, {inv.pay_window_end_block or '?'}]"),
                 ("amount_to_pay", f"{inv.amount_rao/PLANCK:.4f} α"),
                 ("invoice_id", inv.invoice_id),
+                ("treasury_src", "LOCAL allowlist (pinned)"),
             ],
             style="bold green",
         )

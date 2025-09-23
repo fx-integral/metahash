@@ -1,14 +1,4 @@
-# neurons/validator.py – SN-73 v2.3.7 (strict e−1 publisher; no pre-settlement re-commit; no catch-up)
-# START_V3_BLOCK gates *when* the v3 pipeline starts; before that we still set weights
-# but we *burn all* (independent of FORCE_BURN). FORCE_BURN remains orthogonal and
-# may still be honored by engines in v3.
-#
-# Flow tweaks:
-#   • Keep weights-first semantics for the epoch,
-#   • After settlement & clear, publish ONLY e−1 (strict; no catch-up),
-#   • Same auction/clear logic; TESTING still suppresses on-chain set_weights.
-#   • v2.3.7: Settlement anti-double-counting by coldkey; Clearing 2-pass (caps then relaxed)
-#   • Pre‑v3 branch: settle & set weights, then burn-all (no auction/clear/publish)
+# neurons/validator.py
 
 from __future__ import annotations
 
@@ -25,15 +15,8 @@ from metahash.config import (
     STRATEGY_PATH,
     START_V3_BLOCK,
     EPOCH_LENGTH_OVERRIDE,
-    TESTING,
-    # FORCE_BURN is *not* used here; it stays engine-level & should work even in v3.
-    # If it does not exist in older configs, the try/except below will handle it.
+    TESTING
 )
-try:
-    # Optional import; we don't branch on this here to keep FORCE_BURN orthogonal.
-    from metahash.config import FORCE_BURN  # noqa: F401
-except Exception:  # pragma: no cover
-    FORCE_BURN = False  # type: ignore
 
 from metahash.utils.helpers import load_weights
 
@@ -195,7 +178,7 @@ class Validator(EpochValidatorNeuron):
                b) Masters: auction & clear NOW (epoch e) — stage payload for (e−1),
                c) Publish ONLY e−1 AFTER settlement (strict; no catch-up for older epochs).
         """
-        await self._stxn()          # ensure single client exists
+        await self._stxn()          
         self._apply_epoch_override()
 
         e = self.epoch_index
