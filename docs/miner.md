@@ -62,6 +62,8 @@ python neurons/miner.py \
 --miner.bids.netuids 71 72 73 \
 --miner.bids.amounts 1.0 0.5 0.25 \
 --miner.bids.discounts 500 700 900 \
+--axon.port 8091 \
+--axon.external_port 8091 \
 --logging.debug
 ```
 
