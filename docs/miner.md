@@ -58,14 +58,19 @@ python neurons/miner.py \
 --netuid 73 \
 --wallet.name mywallet \
 --wallet.hotkey miner1 \
---subtensor.network "finney" \
+--subtensor.network "ws://x.x.x.x:9944" \
 --miner.bids.netuids 71 72 73 \
 --miner.bids.amounts 1.0 0.5 0.25 \
 --miner.bids.discounts 500 700 900 \
 --axon.port 8091 \
 --axon.external_port 8091 \
---logging.debug
+--logging.debug \
+--payment.validators $source-stake-hotkeyA $source-stake-hotkeyB $source-stake-hotkeyC
+
+--
 ```
+
+> ⚠️ `--payment.validators ` are **hotkeys where stake will be transferred from**.
 
 > ⚠️ `--miner.bids.discounts` are **basis points (bps)** — not percent.  
 > `500 = 5%`, `700 = 7%`, `900 = 9%`.
