@@ -204,6 +204,7 @@ class Validator(EpochValidatorNeuron):
         await self.settlement.settle_and_set_weights_all_masters(epoch_to_settle=e - 2)
 
         # 2) Masters: broadcast & clear immediately (if master)
+
         if not self.auction._is_master_now() and getattr(self.auction, "_not_master_log_epoch", None) != e:
             pretty.log("[yellow]Validator is not a master — skipping broadcast/clear for this epoch.[/yellow]")
             self.auction._not_master_log_epoch = e

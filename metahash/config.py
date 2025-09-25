@@ -14,7 +14,7 @@ load_dotenv()
 METAHASH_SUBNET_ID = 73
 DEFAULT_BITTENSOR_NETWORK: str = os.getenv("BITTENSOR_NETWORK", "finney")
 TESTING: bool = os.getenv("TESTING", "false").lower() == "true"
-START_V3_BLOCK: int = int(os.getenv("START_V3_BLOCK", 6506494))
+START_V3_BLOCK: int = int(os.getenv("START_V3_BLOCK", 0))
 
 # Operational flags
 FORCE_BURN_WEIGHTS: bool = os.getenv("FORCE_BURN_WEIGHTS", "false").lower() == "true"

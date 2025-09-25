@@ -26,7 +26,7 @@ class EpochValidatorNeuron(BaseValidatorNeuron):
     ⚠️ Note: With overrides you are *not* aligned to real chain epoch heads.
     If you try to call `set_weights()` outside real heads, the chain will
     reject it. When `TESTING=True`, you should also configure the validator
-    to avoid on-chain `set_weights` (e.g., via `config.no_epoch=True`).
+    to avoid on-chain `set_weights`.
     """
 
     def __init__(self, *args, log_interval_blocks: int = 2, **kwargs):
@@ -154,18 +154,12 @@ class EpochValidatorNeuron(BaseValidatorNeuron):
                             bt.logging.warning(f"wallet sync failed: {e}")
                         self.step += 1
 
-                    # After bootstrap, continue the loop to await the next head normally (unless no_epoch).
-                    if self.config.no_epoch:
-                        # When no_epoch is True, we keep looping to call forward at each detected head
-                        # (below, after the wait). Skip the wait here so we can refresh the snapshot now.
-                        pass
-                    else:
-                        await self._wait_for_next_head()
+                    # After bootstrap, continue the loop to await the next head normally.
+                    await self._wait_for_next_head()
 
                 else:
-                    # Normal path: wait for the next head unless explicitly disabled.
-                    if not self.config.no_epoch:
-                        await self._wait_for_next_head()
+                    # Normal path: always wait for the next head.
+                    await self._wait_for_next_head()
 
                 # Recompute snapshot *at* the head (or immediately after bootstrap)
                 self._epoch_len = None  # allow re-probe in case tempo/override changed
