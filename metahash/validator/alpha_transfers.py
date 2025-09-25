@@ -3,8 +3,8 @@
 # metahash/validator/alpha_transfers.py
 #
 # Scanner for α-stake transfer events with robust RPC hygiene:
-#   • _rpc(): pre-awaits any awaitable args/kwargs to prevent coroutine
-#     leakage into async_substrate_interface JSON-RPC payloads.
+#   • Always normalize block hashes to '0x…' strings (async-substrate>=1.5.4).
+#   • _rpc(): pre-awaits any awaitable args/kwargs and normalizes block_hash.
 #   • _get_block(): strict normalization of events/extrinsics.
 #   • scan(): resilient workers that skip bad blocks instead of aborting.
 #
@@ -12,12 +12,17 @@
 #   • Drops cross-subnet credits (src_subnet_id must equal dest subnet_id).
 #   • Optional whitelist for Utility.{batch,*} via allow_batch.
 #
+# Notes:
+#   • async-substrate-interface==1.5.4 rejects bytes block_hash ('Invalid params').
+#     This file converts any bytes/ScaleBytes/etc to '0x...' before calling RPCs.
+#
 # ======================================================================
 
 from __future__ import annotations
 
 import asyncio
 import inspect
+import re
 from dataclasses import dataclass, replace
 from typing import Callable, Dict, List, Optional, Sequence, Tuple, TypeVar
 
@@ -59,7 +64,8 @@ def _name(obj) -> str | None:
     if isinstance(obj, (bytes, str)):
         return obj.decode() if isinstance(obj, bytes) else obj
     if isinstance(obj, dict):
-        return obj.get("name")
+        # common shapes: {"name": "..."} or {"call_module": "..."}
+        return obj.get("name") or obj.get("call_module") or obj.get("call_function")
     return str(obj)
 
 
@@ -70,18 +76,22 @@ def _allowed_extrinsic_indices(  # noqa: PLR0911
 ) -> set[int]:
     """Whitelist extrinsic indices inside *extrinsics* that are allowed to produce α-stake events.
 
-    • Always allow SubtensorModule.transfer_stake.
-    • Allow Utility.{batch,force_batch,batch_all} only when self.allow_batch is True.
+    • Always allow Subtensor{Module}.transfer_stake.
+    • Allow Utility.{batch,force_batch,batch_all} when self.allow_batch is True.
     """
     allowed: set[int] = set()
     for idx, ex in enumerate(extrinsics):
         try:
-            pallet = _name(ex["call"]["call_module"])
-            func = _name(ex["call"]["call_function"])
+            # typical shapes: dict with "call" -> {"call_module","call_function"} OR flat
+            call_obj = ex.get("call") if isinstance(ex, dict) else None
+            pallet = _name(call_obj.get("call_module") if isinstance(call_obj, dict) else ex.get("call_module"))
+            func = _name(call_obj.get("call_function") if isinstance(call_obj, dict) else ex.get("call_function"))
+
             if self.debug_extr:
                 bt.logging.debug(f"[blk {block_num}] ex#{idx} {pallet}.{func}")
+
             # 1️⃣ direct α-stake transfer
-            if (pallet, func) == ("SubtensorModule", "transfer_stake"):
+            if (pallet, func) in (("SubtensorModule", "transfer_stake"), ("Subtensor", "transfer_stake")):
                 allowed.add(idx)
             # 2️⃣ optional Utility batches
             elif (
@@ -182,21 +192,59 @@ def _mask(ck: Optional[str]) -> str:
     return ck if ck is None or len(ck) < 10 else f"{ck[:4]}…{ck[-4:]}"
 
 
+# ── block-hash normalization (async-substrate 1.5.4 requires '0x…') ────
+HEX64 = re.compile(r"0x[0-9a-fA-F]{64}$")
+
+
+def _to_hex_hash(h) -> Optional[str]:
+    """Return a '0x…' 32-byte hex string or None if not possible."""
+    if h is None:
+        return None
+    # Already a good hex string
+    if isinstance(h, str):
+        if HEX64.match(h.strip()):
+            return h.strip()
+        # plain 64 hex digits without 0x
+        s = h.strip()
+        if len(s) == 64 and all(c in "0123456789abcdefABCDEF" for c in s):
+            return "0x" + s.lower()
+        # try to extract from repr like 'Hash(0x...)'
+        m = re.search(r"0x[0-9a-fA-F]{64}", s)
+        if m:
+            return m.group(0)
+        return None
+    # Bytes-like
+    try:
+        b = bytes(h)
+        if len(b) == 32:
+            return "0x" + b.hex()
+        # Sometimes libraries wrap hex string bytes; try decode
+        try:
+            s = b.decode()
+            return _to_hex_hash(s)
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+
 # ── parser helpers ──────────────────────────────────────────────────────
 def _parse_stake_transferred(params, fmt: int) -> TransferEvent:  # noqa: ANN001
     """Parse StakeTransferred event parameters (chain v9 & v10)."""
     from_coldkey_raw = _account_id(_f(params, 0))
     dest_coldkey_raw = _account_id(_f(params, 1))
-    subnet_id = int(_f(params, 3, -1))  # destination netuid
-    to_uid = int(_f(params, 4, -1))
+    # destination netuid (event order varies across runtimes; keep robust)
+    subnet_id = int(_f(params, 3, _f(params, 5, -1)))
+    # destination UID (same caveat)
+    to_uid = int(_f(params, 4, _f(params, 2, -1)))
     return TransferEvent(
         block=-1,
         from_uid=-1,  # origin UID not provided
         to_uid=to_uid,
         subnet_id=subnet_id,  # = dest netuid
         amount_rao=int(_f(params, 5, 0)),  # placeholder, fixed later
-        src_coldkey=_encode_ss58(from_coldkey_raw, fmt),
-        dest_coldkey=_encode_ss58(dest_coldkey_raw, fmt),
+        src_coldkey=_encode_ss58(from_coldkey_raw, fmt) if from_coldkey_raw else None,
+        dest_coldkey=_encode_ss58(dest_coldkey_raw, fmt) if dest_coldkey_raw else None,
         src_coldkey_raw=from_coldkey_raw,
         dest_coldkey_raw=dest_coldkey_raw,
     )
@@ -249,13 +297,15 @@ class AlphaTransfersScanner:
         self.dump_last = dump_last
         self.on_progress = on_progress
         self.max_conc = max_concurrency
-        self.ss58_format = subtensor.substrate.ss58_format
+        # Compatible with both sync and async substrate clients
+        self.ss58_format = getattr(subtensor.substrate, "ss58_format", 42)
         self._rpc_lock: asyncio.Lock = rpc_lock or asyncio.Lock()
 
     async def _rpc(self, fn, *a, **kw):
         """
         Call substrate functions safely by:
           • pre-awaiting any awaitable args / kwargs (prevents coroutine leakage),
+          • normalizing any 'block_hash' kwarg to a '0x…' hex string (1.5.4+),
           • serializing the call under a lock to avoid interleaved ws payloads.
         """
         async with self._rpc_lock:
@@ -266,25 +316,41 @@ class AlphaTransfersScanner:
             # Pre-await any awaitable keyword args
             kw2 = {}
             for k, v in kw.items():
-                kw2[k] = (await v) if inspect.isawaitable(v) else v
+                v2 = (await v) if inspect.isawaitable(v) else v
+                kw2[k] = v2
+            # Normalize block_hash if present (bytes → '0x…')
+            if "block_hash" in kw2:
+                bh = _to_hex_hash(kw2["block_hash"])
+                if bh is None and kw2["block_hash"] is not None:
+                    # Last resort: stringify & try to extract 0x… token
+                    bh = _to_hex_hash(str(kw2["block_hash"]))
+                kw2["block_hash"] = bh
             return await maybe_async(fn, *a2, **kw2)
 
     async def _get_block(self, bn: int):
         """Return *(events, extrinsics_list)* for block *bn* with strict normalization."""
-        bh = await self._rpc(self.st.substrate.get_block_hash, block_id=int(bn))
-        # Guard block hash type
-        if not isinstance(bh, (str, bytes)):
-            bh = str(bh)
+        # 1) Resolve and normalize block hash
+        raw_bh = await self._rpc(self.st.substrate.get_block_hash, block_id=int(bn))
+        bh = _to_hex_hash(raw_bh)
+        if bh is None:
+            # Retry via string repr extraction (defensive)
+            bh = _to_hex_hash(str(raw_bh))
+        if bh is None:
+            raise RuntimeError(f"Could not normalize block hash for block {bn}: {raw_bh!r}")
 
-        # Fetch events / block
+        # 2) Fetch events / block (strict hex hash only)
         events = await self._rpc(self.st.substrate.get_events, block_hash=bh)
         blk = await self._rpc(self.st.substrate.get_block, block_hash=bh)
 
-        # Normalize events to a list of dict-ish items
+        # 3) Normalize events to a list of dict-ish items
         if not isinstance(events, list):
-            events = []
+            # async-substrate sometimes returns {'records': [...]}
+            if isinstance(events, dict) and isinstance(events.get("records"), list):
+                events = events["records"]
+            else:
+                events = []
 
-        # Normalize extrinsics shape
+        # 4) Normalize extrinsics shape
         if isinstance(blk, dict):
             extrinsics = (
                 blk.get("block", {}).get("extrinsics")  # v1.7+ deep
@@ -334,19 +400,17 @@ class AlphaTransfersScanner:
                     for ev in raw_events or []:
                         if not isinstance(ev, dict):
                             continue
-                        idx = ev.get("extrinsic_idx")
+                        # v1.5.4 sometimes uses 'extrinsic_index'
+                        idx = ev.get("extrinsic_idx", ev.get("extrinsic_index"))
                         if idx in allowed_idx or idx is None:
                             cleaned.append(ev)
                     raw_events = cleaned
                 except websockets.exceptions.WebSocketException as err:
                     bt.logging.error(f"RPC error at block {bn}: {err}; skipping block.")
-                    # Skip this block, continue scanning
                     blk_cnt += 1
                     continue
-                except TypeError as terr:
-                    # Typical after ws task blows up and returns a bad shape;
-                    # avoid aborting the whole scan.
-                    bt.logging.error(f"Type error at block {bn}: {terr}; skipping block.")
+                except (TypeError, ValueError, RuntimeError) as terr:
+                    bt.logging.error(f"Type/Value error at block {bn}: {terr}; skipping block.")
                     blk_cnt += 1
                     continue
                 except Exception as err:
@@ -371,7 +435,7 @@ class AlphaTransfersScanner:
 
         await asyncio.gather(
             producer(),
-            *[asyncio.create_task(worker()) for _ in range(self.max_conc)],
+            *[asyncio.create_task(worker()) for _ in range(max(1, self.max_conc))],
         )
 
         bt.logging.info(f"✓ scan finished: {blk_cnt} blk, {ev_cnt} ev, {keep_cnt} kept")
@@ -395,19 +459,22 @@ class AlphaTransfersScanner:
         scratch: Dict[int, Dict] = {}  # per-extrinsic bucket
 
         for ev in raw_events:
-            idx = ev.get("extrinsic_idx")
+            idx = ev.get("extrinsic_idx", ev.get("extrinsic_index"))
             if idx is None:
-                continue  # ignore system events
-            bucket = scratch.setdefault(idx, {})
+                # ignore system events that don't tie to an extrinsic
+                continue
+            bucket = scratch.setdefault(int(idx), {})
             name = _event_name(ev)
             fields = _event_fields(ev)
 
             if name == "StakeRemoved":
                 bucket["src_amt"] = _amount_from_stake_removed(fields)
                 bucket["src_net"] = _subnet_from_stake_removed(fields)
+                seen += 1
             elif name == "StakeAdded":
                 bucket["dst_amt"] = _amount_from_stake_added(fields)
                 bucket["dst_net"] = _subnet_from_stake_added(fields)
+                seen += 1
             elif name == "StakeTransferred":
                 seen += 1
                 bucket["te"] = _parse_stake_transferred(fields, self.ss58_format)
@@ -423,7 +490,7 @@ class AlphaTransfersScanner:
 
             # SECURITY: drop cross-subnet
             if te.src_subnet_id is not None and te.src_subnet_id != te.subnet_id:
-                scratch.pop(idx, None)
+                scratch.pop(int(idx), None)
                 continue
 
             te = replace(te, block=block_hint_single)
@@ -436,6 +503,6 @@ class AlphaTransfersScanner:
                         f"net={te.subnet_id} uid={te.from_uid}->{te.to_uid} "
                         f"α={te.amount_rao} **KEPT** (to {_mask(te.dest_coldkey)})"
                     )
-            scratch.pop(idx, None)
+            scratch.pop(int(idx), None)
 
         return seen, kept
