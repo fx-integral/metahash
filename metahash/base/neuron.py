@@ -125,7 +125,7 @@ class BaseNeuron(ABC):
         """
         Wrapper for synchronizing the state of the network for the given miner or validator.
         """
-        bt.logging.info("Syncing validator..")
+        bt.logging.info("Syncing..")
         # Ensure miner or validator hotkey is still registered on the network.
         self.check_registered()
 
@@ -139,7 +139,7 @@ class BaseNeuron(ABC):
 
             # Always save state.
             self.save_state()
-        except Exception as e:
+        except Exception:
             bt.logging.error(
                 "Coundn't sync metagraph or set weights: {}".format(
                     traceback.format_exc()
@@ -169,7 +169,9 @@ class BaseNeuron(ABC):
             last_update = self.metagraph.last_update[self.uid]
         else:
             last_update = self.last_update
-
+        print(last_update)
+        print(self.block)
+        print(self.config.neuron.epoch_length)
         return (self.block - last_update) > self.config.neuron.epoch_length
 
     def should_set_weights(self) -> bool:
