@@ -768,7 +768,6 @@ class Miner(BaseMinerNeuron, MinerMixins):
 
 if __name__ == "__main__":
     from metahash.bittensor_config import config
-
     with Miner(config=config(role="miner")) as m:
         import time as _t
         while True:
