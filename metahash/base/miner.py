@@ -113,6 +113,7 @@ class BaseMinerNeuron(BaseNeuron):
         try:
             while not self.should_exit:
                 # light epoch cadence for metagraph maintenance
+                print(self.block - self.metagraph.last_update[self.uid])
                 while (
                     self.block - self.metagraph.last_update[self.uid]
                     < self.config.neuron.epoch_length
