@@ -117,7 +117,7 @@ class BaseMinerNeuron(BaseNeuron):
                     self.block - self.metagraph.last_update[self.uid]
                     < self.config.neuron.epoch_length
                 ):
-                    time.sleep(1)
+                    time.sleep(10)
                     if self.should_exit:
                         break
 
