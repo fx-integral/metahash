@@ -39,8 +39,6 @@ class Validator(EpochValidatorNeuron):
         self.settlement = SettlementEngine(self, self.state)
         self.clearing = ClearingEngine(self, self.state)
         self.auction = AuctionEngine(self, self.state, self.weights_bps, clearer=self.clearing)
-        self.metagraph = getattr(self, "metagraph", None)
-        self.block = int(getattr(self, "block", 0))
         self.uid2axon: dict[int, object] = {}
         self.active_uids: list[int] = []
         self.active_axons: list[object] = []
@@ -125,41 +123,14 @@ class Validator(EpochValidatorNeuron):
             return res
 
     async def _refresh_chain_and_population(self) -> None:
-        stxn = await self._stxn()
+        await self._stxn()
         async with self._rpc_lock:
-            block = None
-            if hasattr(stxn, "get_current_block"):
-                try:
-                    block = await stxn.get_current_block()
-                except TypeError:
-                    block = stxn.get_current_block()
-            elif hasattr(stxn, "block_number"):
-                try:
-                    block = await stxn.block_number()
-                except TypeError:
-                    block = stxn.block_number()
-            elif hasattr(stxn, "block"):
-                maybe = getattr(stxn, "block")
-                block = await maybe() if callable(maybe) else maybe
-            self.block = int(block) if block is not None else int(getattr(self, "block", 0))
-            mg = None
-            if hasattr(stxn, "metagraph"):
-                try:
-                    mg = await stxn.metagraph(self.config.netuid)
-                except TypeError:
-                    mg = stxn.metagraph(self.config.netuid)
-                except Exception:
-                    mg = None
-            if mg is None and hasattr(stxn, "get_metagraph"):
-                try:
-                    mg = await stxn.get_metagraph(self.config.netuid)
-                except TypeError:
-                    mg = stxn.get_metagraph(self.config.netuid)
-                except Exception:
-                    mg = None
-        old_mg = getattr(self, "metagraph", None)
-        if mg is not None:
-            self.metagraph = mg
+            try:
+                self.metagraph.sync(subtensor=self.subtensor)
+            except TypeError:
+                self.metagraph.sync(self.subtensor)
+            except Exception:
+                pass
         try:
             axons = getattr(self.metagraph, "axons", None)
             n = getattr(self.metagraph, "n", None)
@@ -188,7 +159,7 @@ class Validator(EpochValidatorNeuron):
                 engine.metagraph = self.metagraph
             if hasattr(engine, "weights_bps"):
                 engine.weights_bps = self.weights_bps
-            await self._maybe_call_async(engine, "on_metagraph_update", new=self.metagraph, old=old_mg)
+            await self._maybe_call_async(engine, "on_metagraph_update", new=self.metagraph, old=None)
         self._apply_epoch_override()
 
     async def forward(self):
