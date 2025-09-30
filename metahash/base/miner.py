@@ -111,6 +111,7 @@ class BaseMinerNeuron(BaseNeuron):
         bt.logging.info(f"Miner starting at block: {self.block}")
 
         try:
+            print("before while")
             while not self.should_exit:
                 # light epoch cadence for metagraph maintenance
                 print(self.block - self.metagraph.last_update[self.uid])
