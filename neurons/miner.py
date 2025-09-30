@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# neurons/miner.py — Event-driven bidder v2.8.0 (hardened)
+# neurons/miner.py — Event-driven bidder v2.8.1 (hardened + startup resume)
 
 import asyncio
 import time
@@ -91,6 +91,47 @@ class Miner(BaseMinerNeuron, MinerMixins):
         self._pay_start_safety_blocks: int = 0
         self._retry_every_blocks: int = 2
         self._retry_max_attempts: int = 12
+
+        # --- Startup resume + watchdog so we don't depend on AuctionStart ---
+        # Schedule immediate resume of any pending unpaid invoices.
+        self._safe_create_task(self._resume_pending_payments(), name="resume_pending_payments")
+        # Lightweight watchdog to re-scan every ~1 block (idempotent).
+        self._safe_create_task(self._pending_payments_watchdog(), name="payments_watchdog")
+
+    # ---------------------- small task helpers ----------------------
+
+    def _safe_create_task(self, coro, *, name: Optional[str] = None):
+        """Create an asyncio task regardless of whether we're inside a running loop."""
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(coro, name=name)
+        except RuntimeError:
+            loop = asyncio.get_event_loop()
+            loop.call_soon(lambda: loop.create_task(coro, name=name))
+
+    async def _resume_pending_payments(self):
+        """Run once at startup to (re)schedule unpaid invoices immediately."""
+        try:
+            self._ensure_payment_config()
+            self._schedule_unpaid_pending()
+            pretty.log("[green]Startup: resumed scheduling of unpaid invoices.[/green]")
+        except Exception as e:
+            pretty.log(f"[yellow]Startup resume failed:[/yellow] {e}")
+
+    async def _pending_payments_watchdog(self):
+        """
+        Very light watchdog: every ~1 block, re-run the scheduler to catch any
+        invoices that might have been added/merged after startup.
+        This is idempotent because _schedule_payment() checks for existing tasks.
+        """
+        try:
+            while True:
+                self._schedule_unpaid_pending()
+                await asyncio.sleep(max(0.5, float(BLOCKTIME)))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            pretty.log(f"[yellow]Payments watchdog error:[/yellow] {e}")
 
     # ---------------------- configuration ----------------------
 
