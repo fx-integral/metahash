@@ -169,10 +169,7 @@ class BaseNeuron(ABC):
             last_update = self.metagraph.last_update[self.uid]
         else:
             last_update = self.last_update
-        print(last_update)
-        print(self.block)
-        print(self.config.neuron.epoch_length)
-        print((self.block - last_update) > self.config.neuron.epoch_length)
+
         return (self.block - last_update) > self.config.neuron.epoch_length
 
     def should_set_weights(self) -> bool:
