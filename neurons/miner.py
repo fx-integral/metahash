@@ -732,4 +732,4 @@ if __name__ == "__main__":
         import time as _t
         while True:
             clog.info("Miner running…", color="gray")
-            _t.sleep(120)
+            _t.sleep(12)
