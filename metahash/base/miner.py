@@ -114,15 +114,14 @@ class BaseMinerNeuron(BaseNeuron):
             while not self.should_exit:
                 # light epoch cadence for metagraph maintenance
                 while (
-                    self.block - self.metagraph.last_update[self.uid]
-                    < self.config.neuron.epoch_length
+                    True
                 ):
-                    time.sleep(12)
                     if self.should_exit:
                         break
 
-                self.sync()   # may resync metagraph; miners don't set weights
-                self.step += 1
+                    self.sync()   
+                    self.step += 1
+                    time.sleep(12 * 4)
 
         except KeyboardInterrupt:
             self.axon.stop()
