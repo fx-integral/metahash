@@ -160,7 +160,6 @@ class BaseMinerNeuron(BaseNeuron):
     def resync_metagraph(self):
         """Resyncs the metagraph; miners do not set weights."""
         bt.logging.info("resync_metagraph()")
-        input()
         self.metagraph.sync(subtensor=self.subtensor)
 
     def set_weights(self):
