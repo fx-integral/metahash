@@ -161,6 +161,7 @@ class BaseValidatorNeuron(BaseNeuron):
         Re-syncs the metagraph and keeps `self.scores` aligned with the
         current miner set.
         """
+        bt.logging.info("Resync metagraph()")
         prev = copy.deepcopy(self.metagraph)
         self.metagraph.sync(subtensor=self.subtensor)
 
