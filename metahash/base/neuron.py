@@ -129,7 +129,7 @@ class BaseNeuron(ABC):
         self.check_registered()
 
         try:
-            if self.should_sync_metagraph():
+            if True:
                 self.last_update = self.block
                 self.resync_metagraph()
 
