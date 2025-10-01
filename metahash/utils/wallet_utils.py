@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+from dotenv import load_dotenv
 import os
 import sys
 from typing import Sequence, Union
@@ -169,6 +170,7 @@ def load_wallet(coldkey_name: str, hotkey_name: str, unlock: bool = True):
     w = bt.wallet(name=coldkey_name, hotkey=hotkey_name)
 
     if unlock:
+        load_dotenv()
         pwd = os.getenv("WALLET_PASSWORD")
         if not pwd:
             bt.logging.error("WALLET_PASSWORD not set in .env or env")
