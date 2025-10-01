@@ -107,7 +107,7 @@ function key(e,i){ return e SUBSEP i }
 function kck(e,ck){ return e SUBSEP ck }
 
 BEGIN{
-  # NOTE: Do NOT set PROCINFO["sorted_in"] here; mawk doesn’t support it.
+  # No PROCINFO["sorted_in"] — works on mawk/gawk
   nOrder=0
   current_e=""; auction_e=""; budget_e=""; winners_e=""; settle_e=""
   in_budget_block=0; in_winners=0; in_invoices=0
@@ -157,7 +157,8 @@ in_budget_block && ($0 ~ /^╰/ || $0 ~ /^$/ || $0 ~ /Connecting to Substrate/) 
 # ---- Bids — ordered by VALUE (TAO) ----
 /^.*Bids[[:space:]]*[—-].*VALUE.*TAO/ { in_bids=1; bids_e=(budget_e!=""?budget_e:(auction_e!=""?auction_e:current_e)); add_epoch(bids_e); next }
 in_bids {
-  if($0 ~ /^[[:space:]]*[0-9]+[[:space:]]*│/ && $0 !~ /UID[[:space:]]*│/){
+  # Only capture proper bid rows: must include VALUE ... TAO and start with numeric UID
+  if(index($0,"TAO")>0 && $0 ~ /^[[:space:]]*[0-9]+[[:space:]]*│/ && $0 !~ /UID[[:space:]]*│/){
     n=split($0,col,/│/)
     uid=trim(col[1]); ck=trim(col[2]); sid=trim(col[3]); wbps=trim(col[4]); disc=trim(col[5])
     bida=trim(col[6]); price=trim(col[7]); depth=trim(col[8]); val=trim(col[9])
@@ -178,7 +179,8 @@ in_bids {
 # ---- Reputation caps (TAO, per coldkey) ----
 /^.*Reputation caps.*\(TAO.*per coldkey\)/ { in_rep=1; rep_e=(budget_e!=""?budget_e:current_e); add_epoch(rep_e); next }
 in_rep {
-  if($0 ~ /│/ && $0 !~ /Coldkey/){
+  # Caps lines include the TAO unit
+  if(index($0,"TAO")>0 && $0 ~ /│/ && $0 !~ /Coldkey/){
     n=split($0,col,/│/)
     ck=trim(col[1]); q=trim(col[2]); cap=trim(col[3])
     gsub(/[^0-9.]/,"",q); gsub(/[^0-9.]/,"",cap)
@@ -192,7 +194,8 @@ in_rep {
 # ---- Winners — acceptances ----
 /^.*Winners.*acceptances/ { in_winners=1; winners_e=(budget_e!=""?budget_e:(auction_e!=""?auction_e:current_e)); add_epoch(winners_e); next }
 in_winners {
-  if($0 ~ /^[[:space:]]*[0-9]+[[:space:]]*│/ && $0 !~ /UID[[:space:]]*│/){
+  # Winner rows also show VALUE ... TAO
+  if(index($0,"TAO")>0 && $0 ~ /^[[:space:]]*[0-9]+[[:space:]]*│/ && $0 !~ /UID[[:space:]]*│/){
     n=split($0,col,/│/)
     uid=trim(col[1]); ck=trim(col[2]); sid=trim(col[3])
     reqa=trim(col[4]); acca=trim(col[5]); disc=trim(col[6])
@@ -254,7 +257,7 @@ $0 ~ /cid:[[:space:]]*bafk/ { if(e!="" && match($0,/cid:[[:space:]]*([a-z0-9]+)/
 
 # ---- Settlement ----
 /Settlement for epoch[[:space:]]*[0-9]+/ { if(match($0,/Settlement for epoch[[:space:]]*([0-9]+)/,m)){ settle_e=m[1]; add_epoch(settle_e) } }
-$0 ~ /Settlement Complete/ && /epoch_settled .*:[[:space:]]*[0-9]+/ {
+$0 ~ /Settlement Complete/ && /epoch_settled .*:[[:space:]]*([0-9]+)/ {
   if(match($0,/epoch_settled .*:[[:space:]]*([0-9]+)/,m)){ e=m[1]; settled[e]=1; if(match($0,/miners_scored:[[:space:]]*([0-9]+)/,mm)) miners_scored[e]=mm[1] }
 }
 
@@ -264,11 +267,11 @@ $0 ~ /max:[[:space:]]*[0-9.]+/    { if(settle_e!="" && match($0,/max:[[:space:]]
 $0 ~ /sum\(scores\):[[:space:]]*[0-9.]+/ { if(settle_e!="" && match($0,/sum\(scores\):[[:space:]]*([0-9.]+)/,m)) sum_scores[settle_e]=m[1] }
 
 /Budget Accounting .* settlement/ { }
-$0 ~ /spent_from_payload .*:[[:space:]]*[0-9.]+/    { if(settle_e!="" && match($0,/spent_from_payload .*:[[:space:]]*([0-9.]+)/,m)) spent_payload[settle_e]=m[1] }
-$0 ~ /leftover_from_payload .*:[[:space:]]*[0-9.]+/ { if(settle_e!="" && match($0,/leftover_from_payload .*:[[:space:]]*([0-9.]+)/,m)) leftover_payload[settle_e]=m[1] }
-$0 ~ /target_budget .*:[[:space:]]*[0-9.]+/         { if(settle_e!="" && match($0,/target_budget .*:[[:space:]]*([0-9.]+)/,m)) target_budget[settle_e]=m[1] }
-$0 ~ /credited_value .*:[[:space:]]*[0-9.]+/        { if(settle_e!="" && match($0,/credited_value .*:[[:space:]]*([0-9.]+)/,m)) credited_value[settle_e]=m[1] }
-$0 ~ /burn_deficit .*:[[:space:]]*[0-9.]+/          { if(settle_e!="" && match($0,/burn_deficit .*:[[:space:]]*([0-9.]+)/,m)) burn_deficit[settle_e]=m[1] }
+$0 ~ /spent_from_payload .*:[[:space:]]*([0-9.]+)/    { if(settle_e!="" && match($0,/spent_from_payload .*:[[:space:]]*([0-9.]+)/,m)) spent_payload[settle_e]=m[1] }
+$0 ~ /leftover_from_payload .*:[[:space:]]*([0-9.]+)/ { if(settle_e!="" && match($0,/leftover_from_payload .*:[[:space:]]*([0-9.]+)/,m)) leftover_payload[settle_e]=m[1] }
+$0 ~ /target_budget .*:[[:space:]]*([0-9.]+)/         { if(settle_e!="" && match($0,/target_budget .*:[[:space:]]*([0-9.]+)/,m)) target_budget[settle_e]=m[1] }
+$0 ~ /credited_value .*:[[:space:]]*([0-9.]+)/        { if(settle_e!="" && match($0,/credited_value .*:[[:space:]]*([0-9.]+)/,m)) credited_value[settle_e]=m[1] }
+$0 ~ /burn_deficit .*:[[:space:]]*([0-9.]+)/          { if(settle_e!="" && match($0,/burn_deficit .*:[[:space:]]*([0-9.]+)/,m)) burn_deficit[settle_e]=m[1] }
 
 # ---- α scan & paid pools ----
 /events\(sample\):/ {
