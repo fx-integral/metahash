@@ -28,7 +28,7 @@ class Miner(BaseMinerNeuron):
 
     def __init__(self, config=None):
         super().__init__(config=config)
-        
+          
         # Wallet unlock (best-effort)
         unlock_wallet(wallet=self.wallet)
 
