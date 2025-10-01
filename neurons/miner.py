@@ -1,11 +1,6 @@
 #!/usr/bin/env python3
 # neurons/miner.py — Event-driven bidder v2.8.3
-# - Dedicated background asyncio loop (daemon thread) for safe scheduling from __init__
-# - Eager scheduling of unpaid invoices on startup
-# - No deprecated asyncio.get_event_loop() usage
-# - Per-invoice payment workers with retry & window-safety
 
-from __future__ import annotations
 
 import asyncio
 import time
