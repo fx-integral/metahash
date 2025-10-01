@@ -4,6 +4,7 @@
 import asyncio
 import time
 import threading
+import inspect
 from math import isfinite
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any
@@ -128,7 +129,7 @@ class Miner(BaseMinerNeuron, MinerMixins):
     def _safe_create_task(self, coro, *, name: Optional[str] = None):
         self._submit(coro)
 
-    # ---------------------- AsyncSubtensor singleton + RPC helpers ----------------------
+    # ---------------------- AsyncSubtensor singleton + block helpers ----------------------
 
     async def _ensure_async_subtensor_singleton(self):
         """
@@ -147,27 +148,79 @@ class Miner(BaseMinerNeuron, MinerMixins):
             except AttributeError:
                 self._async_subtensor = bt.AsyncSubtensor(self.config)
 
-    async def _get_current_block_locked(self) -> int:
+    async def _await_maybe(self, value: Any) -> Any:
+        """Await if awaitable; otherwise return as-is."""
+        if inspect.isawaitable(value):
+            return await value
+        return value
+
+    async def _read_block_generic(self) -> Optional[int]:
         """
-        Serialized RPC 'block' call guarded by _rpc_lock. Use this when you are NOT
-        already holding _rpc_lock.
+        Robustly read the current block number from AsyncSubtensor across versions:
+        - 'block' may be an async method, a callable returning a coroutine, or an awaitable attribute.
+        - Fallback to other plausible names.
+        - Final fallback to metagraph.block (approximate) if all else fails.
         """
-        async with self._rpc_lock:
+        await self._ensure_async_subtensor_singleton()
+        st = self._async_subtensor
+        if st is None:
+            return None
+
+        candidates = []
+        # Ordered by most common names
+        for name in ("block", "block_number", "get_current_block", "get_block_number"):
+            if hasattr(st, name):
+                candidates.append((name, getattr(st, name)))
+
+        for name, attr in candidates:
             try:
-                return await super()._get_current_block()  # type: ignore[attr-defined]
-            except AttributeError:
-                if self._async_subtensor is None:
-                    await self._ensure_async_subtensor_singleton()
-                return int(await self._async_subtensor.block())  # type: ignore[union-attr]
+                # Case A: attr is callable (method/func). Call it; await if needed.
+                if callable(attr):
+                    res = attr()
+                    res = await self._await_maybe(res)
+                else:
+                    # Case B: attr itself is an awaitable (coroutine object / future). Await it.
+                    res = await self._await_maybe(attr)
+                val = int(res)
+                if val > 0:
+                    return val
+            except TypeError as e:
+                # Some envs expose 'block' as a coroutine object; calling it raises "'coroutine' object is not callable"
+                if "coroutine" in str(e) and "not callable" in str(e):
+                    try:
+                        res = await self._await_maybe(attr)
+                        val = int(res)
+                        if val > 0:
+                            return val
+                    except Exception:
+                        pass
+                # Try next candidate
+                continue
+            except Exception:
+                continue
+
+        # Last resort: use metagraph (approximate but good enough to gate sleeps)
+        try:
+            mg_block = int(getattr(self.metagraph, "block", 0) or 0)
+            if mg_block > 0:
+                return mg_block
+        except Exception:
+            pass
+        return None
+
+    async def _get_current_block_locked(self) -> int:
+        """Fetch block number under _rpc_lock (no re-entrancy)."""
+        async with self._rpc_lock:
+            val = await self._read_block_generic()
+            return int(val or 0)
 
     async def _get_current_block_nolock(self) -> int:
         """
-        Direct RPC call with NO _rpc_lock. Use ONLY when _rpc_lock is already held
-        to avoid deadlocks.  # FIX: added to avoid re-entrant locking deadlock.
+        Fetch block number WITHOUT taking _rpc_lock.
+        Use ONLY when you already hold _rpc_lock. This avoids the re-entrant deadlock.
         """
-        if self._async_subtensor is None:
-            await self._ensure_async_subtensor_singleton()
-        return int(await self._async_subtensor.block())  # type: ignore[union-attr]
+        val = await self._read_block_generic()
+        return int(val or 0)
 
     # ---------------------- startup tasks ----------------------
 
@@ -182,7 +235,7 @@ class Miner(BaseMinerNeuron, MinerMixins):
     async def _pending_payments_watchdog(self):
         try:
             while True:
-                # Re-schedule is cheap & idempotent; also kicks tasks that were left unscheduled.
+                # Idempotent re-schedule (cheap); if a task died with error it will be re-created.
                 self._schedule_unpaid_pending()
                 await asyncio.sleep(max(0.5, float(BLOCKTIME)))
         except asyncio.CancelledError:
@@ -320,6 +373,20 @@ class Miner(BaseMinerNeuron, MinerMixins):
             style="bold cyan",
         )
 
+    async def _maybe_transfer_alpha(self, **kwargs) -> Any:
+        """
+        Call transfer_alpha whether it's sync or async depending on environment.
+        Returns whatever transfer_alpha returns (bool or receipt-like object).
+        """
+        try:
+            result = transfer_alpha(**kwargs)
+            if inspect.isawaitable(result):
+                return await result
+            return result
+        except TypeError:
+            # Some builds expose it as an async-only function; try direct await
+            return await transfer_alpha(**kwargs)  # type: ignore[misc]
+
     async def _payment_worker(self, inv: WinInvoice):
         """
         Attempts payment inside its own loop with:
@@ -336,8 +403,7 @@ class Miner(BaseMinerNeuron, MinerMixins):
 
             attempt = 0
             while True:
-                # Query chain height WITHOUT holding _rpc_lock to avoid re-entrant deadlock.
-                # FIX: was deadlocking because _get_current_block_locked() was used under _rpc_lock.
+                # Query chain height OUTSIDE _rpc_lock (no re-entrant deadlock).
                 blk = await self._get_current_block_locked()
 
                 # Too early
@@ -382,9 +448,9 @@ class Miner(BaseMinerNeuron, MinerMixins):
                 origin_hotkey = self._origin_hotkey_for_invoice(inv)
 
                 async with self._pay_lock:
-                    # Only the on-chain interaction (and its immediate checks) is serialized under _rpc_lock
+                    # Serialize chain ops; while holding _rpc_lock, use NOLOCK block getter.
                     async with self._rpc_lock:
-                        # Re-check window while holding the lock, using NOLOCK helper to avoid deadlock.
+                        # Re-check window while holding the lock
                         blk2 = await self._get_current_block_nolock()
                         if start and (blk2 <= 0 or blk2 < allowed_start):
                             inv.last_response = f"not yet in window (blk {blk2} < start {start}+{self._pay_start_safety_blocks})"
@@ -399,8 +465,7 @@ class Miner(BaseMinerNeuron, MinerMixins):
                             resp = "already paid"
                         else:
                             try:
-                                # NOTE: return type from transfer_alpha may be bool or a richer object.
-                                result = await transfer_alpha(
+                                result = await self._maybe_transfer_alpha(
                                     subtensor=self._async_subtensor,
                                     wallet=self.wallet,
                                     hotkey_ss58=origin_hotkey,
@@ -410,12 +475,10 @@ class Miner(BaseMinerNeuron, MinerMixins):
                                     wait_for_inclusion=True,
                                     wait_for_finalization=False,
                                 )
-                                # Interpret result
                                 if isinstance(result, bool):
                                     ok = result
                                 else:
-                                    ok = True  # assume truthy rich receipt
-                                    # Best-effort receipt extraction
+                                    ok = True  # treat any receipt-like truthy as success
                                     tx_hash = getattr(result, "extrinsic_hash", None) or getattr(result, "tx_hash", None) or getattr(result, "hash", None)
                                     paid_block = getattr(result, "in_block", None) or getattr(result, "included_block", None)
                                 resp = "ok" if ok else "rejected"
@@ -427,8 +490,7 @@ class Miner(BaseMinerNeuron, MinerMixins):
                 inv.last_response = str(resp)[:300]
 
                 if ok and inv.paid:
-                    # Was set paid elsewhere; just exit.
-                    break
+                    break  # someone else already marked it paid
 
                 if ok:
                     inv.paid = True
@@ -437,7 +499,7 @@ class Miner(BaseMinerNeuron, MinerMixins):
                     if paid_block:
                         inv.paid_at_block = int(paid_block)
                     await self._async_save_state()
-                    # FIX: explicit green confirmation log (you asked for this)
+
                     kvs = [
                         ("inv", inv.invoice_id),
                         ("α", f"{inv.amount_rao/PLANCK:.4f}"),
@@ -604,7 +666,7 @@ class Miner(BaseMinerNeuron, MinerMixins):
             style="bold cyan",
         )
 
-        # Proactively (re)kick any pending invoices (your request)
+        # Proactively re-kick any pending invoices (idempotent)
         self._schedule_unpaid_pending()
 
         my_stake = float(self.metagraph.stake[self.uid])
