@@ -52,6 +52,41 @@ def parse_discount_token(tok: str) -> int:
     return max(0, min(10_000, int(round(val * 100))))
 
 
+class BidDictShim(dict):
+    """
+    A dict that *also* behaves like a 4-tuple in the order:
+      (subnet_id, alpha, discount_bps, bid_id)
+
+    This lets validators that do `bid[:4]` or `bid[2]` work,
+    while we still serialize to JSON as a dict to respect the protocol.
+    """
+    __slots__ = ("_order", "_vals_cache")
+
+    def __init__(self, subnet_id: int, alpha: float, discount_bps: int, bid_id: str):
+        super().__init__(
+            subnet_id=int(subnet_id),
+            alpha=float(alpha),
+            discount_bps=int(discount_bps),
+            bid_id=str(bid_id),
+        )
+        self._order = ("subnet_id", "alpha", "discount_bps", "bid_id")
+        self._vals_cache: Optional[List[Any]] = None
+
+    def _vals(self) -> List[Any]:
+        # Build once for cheap integer/slice indexing
+        if self._vals_cache is None:
+            self._vals_cache = [self[k] for k in self._order]
+        return self._vals_cache
+
+    def __getitem__(self, key):
+        # Allow bid[0], bid[1], ..., and bid[:4]
+        if isinstance(key, int):
+            return self._vals()[key]
+        if isinstance(key, slice):
+            return self._vals()[key]
+        return super().__getitem__(key)
+
+
 class Runtime:
     """
     Combines:
@@ -124,7 +159,6 @@ class Runtime:
     async def _ensure_async_subtensor(self):
         if self._async_subtensor is None:
             stxn = bt.AsyncSubtensor(self.config)
-            # Some versions require explicit initialize()
             init = getattr(stxn, "initialize", None)
             if callable(init):
                 await init()
@@ -232,10 +266,7 @@ class Runtime:
         return out
 
     async def get_alpha_balance(self, subnet_id: int, hotkey_ss58: str) -> Optional[float]:
-        """
-        Try to read α balance for a hotkey on a given subnet. Returns α (float) or None if unknown.
-        NOTE: Only call α-specific methods to avoid confusing TAO balance with α.
-        """
+        """Read α balance for a hotkey on a given subnet. Returns α (float) or None."""
         await self._ensure_async_subtensor()
         st = self._async_subtensor
         for name in ("get_alpha_balance", "alpha_balance", "get_balance_alpha"):
@@ -247,7 +278,6 @@ class Runtime:
                 res = attr(hotkey_ss58, netuid=int(subnet_id)) if callable(attr) else attr
                 if inspect.isawaitable(res):
                     res = await res
-                # Normalize to float α
                 if hasattr(res, "rao"):
                     return float(getattr(res, "rao")) / float(PLANCK)
                 if hasattr(res, "value"):
@@ -283,10 +313,7 @@ class Runtime:
 
     @staticmethod
     def _normalize_weights_bps(raw: Any) -> Dict[int, int]:
-        """
-        Accept dict-like {sid: bps} or list-like [(sid, bps), ...],
-        coerce to {int(sid): clamp_bps(int(bps))}.
-        """
+        """Accept dict-like {sid: bps} or list-like [(sid, bps), ...], coerce to {int(sid): clamp_bps(int(bps))}."""
         out: Dict[int, int] = {}
         if isinstance(raw, dict):
             items: Iterable[Tuple[Any, Any]] = raw.items()
@@ -312,9 +339,19 @@ class Runtime:
 
         uid, caller_hot = self._resolve_caller(synapse)
         vkey = self._validator_key(uid, caller_hot)
-        epoch = int(getattr(synapse, "epoch_index", 0) or 0)
 
-        # Allowlist
+        # Coerce request-side numerics immediately (local vars only)
+        epoch = int(getattr(synapse, "epoch_index", 0) or 0)
+        budget_alpha = float(getattr(synapse, "auction_budget_alpha", 0.0) or 0.0)
+        min_stake_alpha = float(getattr(synapse, "min_stake_alpha", S_MIN_ALPHA_MINER) or S_MIN_ALPHA_MINER)
+        auction_start_block = int(getattr(synapse, "auction_start_block", 0) or 0)
+        treasury_ck_req = str(getattr(synapse, "treasury_coldkey", "") or "")
+
+        # Normalize weights map (handles dict or list-of-pairs, str->int coercion)
+        weights_bps_in = getattr(synapse, "weights_bps", {}) or {}
+        weights_bps: Dict[int, int] = self._normalize_weights_bps(weights_bps_in)
+
+        # ---------------- Allowlist ----------------
         treasury_ck = self.state.treasuries.get(caller_hot) or self.state.treasuries.get(vkey)
         if not treasury_ck:
             note = f"validator not allowlisted: {caller_hot or vkey or '?'}"
@@ -325,24 +362,22 @@ class Runtime:
                  ("note", note)],
                 style="bold red",
             )
-            synapse.ack = True
-            synapse.bids = []
-            synapse.bids_sent = 0
-            synapse.note = note
-            # best-effort type hygiene for anything we echo back
-            return synapse
-
-        budget_alpha = float(getattr(synapse, "auction_budget_alpha", 0.0) or 0.0)
-        min_stake_alpha = float(getattr(synapse, "min_stake_alpha", S_MIN_ALPHA_MINER) or S_MIN_ALPHA_MINER)
-
-        # Normalize weights map (handles dict or list-of-pairs, str->int coercion)
-        weights_bps_in = getattr(synapse, "weights_bps", {}) or {}
-        weights_bps: Dict[int, int] = self._normalize_weights_bps(weights_bps_in)
-        try:
-            # write normalized copy back so pydantic doesn't warn on outbound serialize
-            synapse.weights_bps = dict(weights_bps)
-        except Exception:
-            pass
+            # Respond minimally & cleanly typed
+            return AuctionStartSynapse(
+                epoch_index=epoch,
+                auction_start_block=auction_start_block,
+                min_stake_alpha=min_stake_alpha,
+                auction_budget_alpha=budget_alpha,
+                weights_bps=dict(weights_bps),
+                treasury_coldkey=treasury_ck_req,
+                validator_uid=uid,
+                validator_hotkey=caller_hot or None,
+                ack=True,
+                retries_attempted=0,
+                bids=[],
+                bids_sent=0,
+                note=note,
+            )
 
         pretty.kv_panel(
             "[cyan]AuctionStart[/cyan]",
@@ -376,7 +411,6 @@ class Runtime:
         if min_stake_alpha > 0:
             has_any = any(amt >= min_stake_alpha for amt in stake_by_subnet.values())
             if not has_any:
-                # Show top 3 availability for clarity
                 top3 = sorted(stake_by_subnet.items(), key=lambda kv: kv[1], reverse=True)[:3]
                 pretty.kv_panel(
                     "[yellow]Stake gate (per-subnet)[/yellow]",
@@ -389,16 +423,26 @@ class Runtime:
                     style="bold yellow",
                 )
                 self.state.status_tables()
-                synapse.ack = True
-                synapse.bids = []
-                synapse.bids_sent = 0
-                synapse.note = "stake gate (per-subnet)"
-                return synapse
+                return AuctionStartSynapse(
+                    epoch_index=epoch,
+                    auction_start_block=auction_start_block,
+                    min_stake_alpha=min_stake_alpha,
+                    auction_budget_alpha=budget_alpha,
+                    weights_bps=dict(weights_bps),
+                    treasury_coldkey=treasury_ck_req,
+                    validator_uid=uid,
+                    validator_hotkey=caller_hot or None,
+                    ack=True,
+                    retries_attempted=0,
+                    bids=[],
+                    bids_sent=0,
+                    note="stake gate (per-subnet)",
+                )
 
         # Track remaining stake per subnet to avoid oversubscription across lines
         remaining_by_subnet: Dict[int, float] = dict(stake_by_subnet)
 
-        out_bids: List[List[Any]] = []
+        out_bids: List[Dict[str, Any]] = []
         rows_sent = []
 
         for ln in lines:
@@ -443,8 +487,11 @@ class Runtime:
 
             bid_id = hashlib.sha1(f"{vkey}|{epoch}|{subnet_id}|{send_alpha:.12f}|{send_disc_bps}".encode("utf-8")).hexdigest()[:10]
 
-            # >>> IMPORTANT: send bid as 4-positional list (sid, alpha, disc_bps, bid_id)
-            out_bids.append([int(subnet_id), float(send_alpha), int(send_disc_bps), str(bid_id)])
+            # IMPORTANT:
+            #   - Externally, this is a dict (protocol unchanged).
+            #   - Internally, BidDictShim also supports bid[:4] and bid[i] like a tuple.
+            bid_item = BidDictShim(int(subnet_id), float(send_alpha), int(send_disc_bps), str(bid_id))
+            out_bids.append(bid_item)
 
             self.state.remember_bid(vkey, epoch, subnet_id, send_alpha, send_disc_bps)
 
@@ -472,17 +519,20 @@ class Runtime:
         await self.state.save_async()
         self.state.status_tables()
 
-        synapse.ack = True
-        synapse.bids = out_bids
-        synapse.bids_sent = int(len(out_bids))
-        # leave note unset/empty for success to avoid type noise
-        try:
-            if getattr(synapse, "note", None) is not None and not synapse.bids:
-                synapse.note = str(getattr(synapse, "note"))
-            elif getattr(synapse, "note", None) is not None:
-                # clear any stale incoming 'note' that might be non-str
-                synapse.note = None
-        except Exception:
-            pass
-
-        return synapse
+        # Return a FRESH synapse with sanitized numeric types and dict(+tuple-like) bids
+        resp = AuctionStartSynapse(
+            epoch_index=epoch,
+            auction_start_block=auction_start_block,
+            min_stake_alpha=min_stake_alpha,
+            auction_budget_alpha=budget_alpha,
+            weights_bps=dict(weights_bps),
+            treasury_coldkey=treasury_ck_req,
+            validator_uid=uid,
+            validator_hotkey=caller_hot or None,
+            ack=True,
+            retries_attempted=0,
+            bids=out_bids,
+            bids_sent=int(len(out_bids)),
+            note=None,
+        )
+        return resp
