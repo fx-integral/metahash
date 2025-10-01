@@ -190,6 +190,7 @@ def load_wallet(coldkey_name: str, hotkey_name: str, unlock: bool = True):
 
 
 def unlock_wallet(wallet:bt.Wallet, password_env_variable="WALLET_PASSWORD"):
+    load_dotenv()
     pwd = os.getenv(password_env_variable)
     if not pwd:
         bt.logging.error(f"{password_env_variable} not set in .env or env")
