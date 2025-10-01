@@ -11,11 +11,10 @@ RUN --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
       ca-certificates && \
     update-ca-certificates
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
-    /root/.local/bin/uv venv /venv
+    /root/.local/bin/uv venv --seed /venv
 ENV PATH="/root/.local/bin:${PATH}"
 COPY requirements.txt .
 RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
-    uv pip install --link-mode=copy --python /venv/bin/python --upgrade pip setuptools wheel && \
     uv pip install --link-mode=copy --python /venv/bin/python -r requirements.txt
 
 FROM gcr.io/distroless/python3-debian12
