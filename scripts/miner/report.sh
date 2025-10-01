@@ -34,6 +34,12 @@ PM2_NAME=""
 LINES=5000
 TMP_INPUT=""
 
+# Choose awk: prefer gawk if present, else awk (mawk on Debian)
+AWK_BIN="awk"
+if command -v gawk >/dev/null 2>&1; then
+  AWK_BIN="gawk"
+fi
+
 # Parse args
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -96,7 +102,7 @@ fi
 
 export LC_ALL=C
 
-awk -v wantN="$N" -v detailed="$DETAIL" '
+"$AWK_BIN" -v wantN="$N" -v detailed="$DETAIL" '
 function trim(s){ gsub(/^[[:space:]]+|[[:space:]]+$/,"",s); return s }
 function toAlpha(rao){ return rao/1000000000.0 }
 function nz(v, d){ return (v == "" ? d : v) + 0 }
@@ -288,7 +294,7 @@ in_invoices && $0 ~ /[0-9][[:space:]]*│/ && $0 !~ /UID[[:space:]]*│/ {
 /Staged commit payload/ { }
 /^[[:space:]]*e:[[:space:]]*[0-9]+/ { if(match($0,/e:[[:space:]]*([0-9]+)/,m)){ staged_e=m[1]; add_epoch(staged_e) } }
 $0 ~ /#miners:[[:space:]]*[0-9]+/ { if(staged_e!="" && match($0,/#miners:[[:space:]]*([0-9]+)/,m)) staged_miners[staged_e]=m[1] }
-$0 ~ /#lines_total:[[:space:]]*[0-9]+/ { if(staged_e!="" && match($0,/#[^:]*:[[:space:]]*([0-9]+)/,m)) staged_lines[staged_e]=m[1] }
+$0 ~ /#lines_total:[[:space:]]*([0-9]+)/ { if(staged_e!="" && match($0,/#[^:]*:[[:space:]]*([0-9]+)/,m)) staged_lines[staged_e]=m[1] }
 
 /Commit Payload \(preview\)/ { }
 $0 ~ /epoch:[[:space:]]*[0-9]+/ && $0 ~ /has_inv:/ {
@@ -318,7 +324,7 @@ $0 ~ /target_budget .*:[[:space:]]*([0-9.]+)/         { if(settle_e!="" && match
 $0 ~ /credited_value .*:[[:space:]]*([0-9.]+)/        { if(settle_e!="" && match($0,/credited_value .*:[[:space:]]*([0-9.]+)/,m)) credited_value[settle_e]=m[1] }
 $0 ~ /burn_deficit .*:[[:space:]]*([0-9.]+)/          { if(settle_e!="" && match($0,/burn_deficit .*:[[:space:]]*([0-9.]+)/,m)) burn_deficit[settle_e]=m[1] }
 
-# ---- α scan & paid pools (multi-line JSON) ----
+# ---- Start JSON capture (feed first line) ----
 /events\(sample\):/ {
   if(settle_e!=""){
     begin_json("", settle_e, "events")
@@ -331,9 +337,11 @@ $0 ~ /burn_deficit .*:[[:space:]]*([0-9.]+)/          { if(settle_e!="" && match
     feed_json_line($0); next
   }
 }
-json_accum { feed_json_line($0); next }
 
-# ---- Errors ----
+# ---- While in JSON capture, swallow any further lines
+{ if (json_accum) { feed_json_line($0); next } }
+
+# ---- Connectivity errors ----
 /Cannot connect to host/ { e=(auction_e!=""?auction_e:(budget_e!=""?budget_e:current_e)); conn_err[e]++ }
 /TimeoutError#/          { e=(auction_e!=""?auction_e:(budget_e!=""?budget_e:current_e)); timeouts[e]++ }
 
