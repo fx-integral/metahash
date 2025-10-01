@@ -100,7 +100,7 @@ def add_miner_args(parser: argparse.ArgumentParser) -> None:
                         help="Trials go in neuron.root/(wallet_cold-wallet_hot)/neuron.name.")
 
     # IMPORTANT: default False so AuctionStart/WinSynapse work without vpermit
-    parser.add_argument("--blacklist.force_validator_permit", action="store_true", default=False,
+    parser.add_argument("--blacklist.force_validator_permit", action="store_true", default=True,
                         help="Force incoming requests to have a validator permit.")
     parser.add_argument("--no-blacklist.force_validator_permit", action="store_false",
                         dest="blacklist.force_validator_permit",
