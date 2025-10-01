@@ -101,13 +101,12 @@ class Miner(BaseMinerNeuron, MinerMixins):
     # ---------------------- small task helpers ----------------------
 
     def _safe_create_task(self, coro, *, name: Optional[str] = None):
-        """Create an asyncio task regardless of whether we're inside a running loop."""
         try:
             loop = asyncio.get_running_loop()
-            loop.create_task(coro, name=name)
         except RuntimeError:
-            loop = asyncio.get_event_loop()
-            loop.call_soon(lambda: loop.create_task(coro, name=name))
+            # Avoid deprecated get_event_loop() path
+            loop = asyncio.get_event_loop_policy().get_event_loop()
+        loop.call_soon(lambda: loop.create_task(coro, name=name))
 
     async def _resume_pending_payments(self):
         """Run once at startup to (re)schedule unpaid invoices immediately."""
