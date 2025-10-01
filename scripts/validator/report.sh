@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# btv-health.sh — Validator health + bids/winners/reputation report
+# btv-health.sh — Validator health + bids/winners/reputation/settlement report
 # Works on mawk (Debian /usr/bin/awk) and gawk.
 # Usage:
 #   ./scripts/validator/report.sh --pm2-index 4 --lines 8000 -n 5 --detailed
@@ -12,7 +12,7 @@ btv-health.sh — Summarize Bittensor validator logs by epoch (health + payments
 Usage:
   btv-health.sh [-n N] [--detailed] [-f FILE]
   btv-health.sh --pm2-index N [--lines K] [-n N] [--detailed]
-  btv-health.sh --pm2-name NAME [--lines K] [-n N] [--detailed]
+  btv-health.sh --pm2-name  NAME [--lines K] [-n N] [--detailed]
 
 Options:
   -n, --epochs N       Number of last epochs to summarize (default: 5)
@@ -104,24 +104,59 @@ function nzs(v, d){ return (v == "" ? d : v) }
 function key(e,i){ return e SUBSEP i }
 function kck(e,ck){ return e SUBSEP ck }
 function is_num(x){ return x ~ /^-?[0-9]+(\.[0-9]+)?$/ }
-
-BEGIN{
-  # No PROCINFO["sorted_in"] — mawk/gawk compatible
-  nOrder=0
-  current_e=""; auction_e=""; budget_e=""; winners_e=""; settle_e=""
-  in_budget_block=0; in_winners=0; in_invoices=0
-  in_bids=0; in_rep=0
+function sanitize_num(s){ gsub(/[^0-9.\-]/,"",s); return s }
+function add_epoch(e){ if(e==""||e in seen_e) return; seen_e[e]=1; order[++nOrder]=e; current_e=e }
+function begin_json(buf, epoch_var, kind){ json_accum=1; json_kind=kind; json_epoch=epoch_var; json_buf=""; }
+function feed_json_line(line){
+  # drop ANSI and keep a light footprint
+  gsub(/\x1B\[[0-9;]*[A-Za-z]/, "", line)
+  # append raw (we ll normalize when closing)
+  json_buf = json_buf line "\n"
+  if(index(line,"]")>0){ close_json() }
+}
+function close_json(   s,n,i,p,parts,ck,amt,pr,ek){
+  json_accum=0
+  s=json_buf
+  # Keep only JSON-ish part after the colon
+  sub(/.*\[[[:space:]]*/,"[",s)
+  # Flatten and split on object boundaries
+  gsub(/\r/,"",s); gsub(/\n/,"",s)
+  gsub(/\}\s*,\s*\{/, "}\n{", s)
+  n=split(s, parts, /\n/)
+  for(i=1;i<=n;i++){
+    p=parts[i]
+    # source ck (truncate ellipsis to keep prefix)
+    ck=""; amt=0; pr=0
+    if(match(p,/"src_ck":"([^"]+)/,m)) ck=m[1]
+    gsub(/…/,"",ck)
+    if(json_kind=="events"){
+      if(match(p,/"amt\(rao\)":[[:space:]]*([0-9]+)/,mm)) amt=mm[1]+0
+      if(amt>0){ alpha_paid_rao[json_epoch]+=amt; if(ck!="") alpha_paid_by_ck[json_epoch,ck]+=amt }
+    } else if(json_kind=="paid_pools"){
+      if(match(p,/"ck":"([^"]+)/,mc)) ck=mc[1]
+      gsub(/…/,"",ck)
+      if(match(p,/"paid_rao":[[:space:]]*([0-9]+)/,mp)) pr=mp[1]+0
+      if(pr>0){ alpha_paid_rao[json_epoch]+=pr; if(ck!="") alpha_paid_by_ck[json_epoch,ck]+=pr }
+    }
+  }
+  json_kind=""; json_epoch=""
 }
 
-function add_epoch(e){
-  if(e=="") return
-  if(!(e in seen_e)){ seen_e[e]=1; order[++nOrder]=e }
-  current_e=e
+BEGIN{
+  nOrder=0
+  current_e=""; auction_e=""; budget_e=""; winners_e=""; settle_e=""
+  in_budget_block=0; in_winners=0; in_invoices=0; in_bids=0; in_rep=0
+  json_accum=0; json_kind=""; json_epoch=""
+  commit_epoch_cur=""
 }
 
 # ---- Epoch detection ----
-/\[epoch[[:space:]]+[0-9]+/ { if(match($0,/\[epoch[[:space:]]+([0-9]+)/,m)) add_epoch(m[1]) }
-$0 ~ /Epoch[[:space:]]+[0-9]+[[:space:]]+\(label: e\)/ { if(match($0,/Epoch[[:space:]]+([0-9]+)/,m)) add_epoch(m[1]) }
+/\[epoch[[:space:]]+[0-9]+/ {
+  if(match($0,/\[epoch[[:space:]]+([0-9]+)/,m)) add_epoch(m[1])
+}
+$0 ~ /Epoch[[:space:]]+[0-9]+[[:space:]]+\(label: e\)/ {
+  if(match($0,/Epoch[[:space:]]+([0-9]+)/,m)) add_epoch(m[1])
+}
 
 # ---- Status (head/start/end) ----
 $0 ~ /head_block=[0-9]+.*start=[0-9]+.*end=[0-9]+/ {
@@ -131,9 +166,10 @@ $0 ~ /head_block=[0-9]+.*start=[0-9]+.*end=[0-9]+/ {
 }
 
 # ---- Axon filter ----
-/Axon filter/ { }
+/^ *Axon filter/ { }
 /^[[:space:]]*received:[[:space:]]*[0-9]+/ { if(current_e!="" && match($0,/received:[[:space:]]*([0-9]+)/,m)) ax_rcv[current_e]=m[1] }
 /^[[:space:]]*usable:[[:space:]]*[0-9]+/   { if(current_e!="" && match($0,/usable:[[:space:]]*([0-9]+)/,m))  ax_usable[current_e]=m[1] }
+/^[[:space:]]*filtered_out:[[:space:]]*[0-9]+/ { if(current_e!="" && match($0,/filtered_out:[[:space:]]*([0-9]+)/,m)) ax_filtered[current_e]=m[1] }
 
 # ---- AuctionStart ACKs ----
 /AuctionStart Broadcast/ { }
@@ -148,22 +184,23 @@ $0 ~ /acks_received:[[:space:]]*[0-9]+\/[0-9]+/ {
 /Budget \(VALUE.*base subnet/ { in_budget_block=1 }
 in_budget_block && $0 ~ /epoch:[[:space:]]*[0-9]+/ { if(match($0,/epoch:[[:space:]]*([0-9]+)/,m)){ budget_e=m[1]; add_epoch(budget_e) } }
 in_budget_block && match($0,/base_price_tao[[:space:]]*\/[[:space:]]*α:[[:space:]]*([0-9.]+)/,m) { if(budget_e!="") base_price[budget_e]=m[1] }
+in_budget_block && match($0,/AUCTION_BUDGET_ALPHA.*:[[:space:]]*([0-9.]+)/,m) { if(budget_e!="") auction_budget_alpha[budget_e]=m[1] }
 in_budget_block && match($0,/my_budget_tao[[:space:]]*\(VALUE\):[[:space:]]*([0-9.]+)/,m) { if(budget_e!="") my_budget[budget_e]=m[1] }
 in_budget_block && ($0 ~ /^╰/ || $0 ~ /^$/ || $0 ~ /Connecting to Substrate/) { in_budget_block=0 }
 
-/Budget leftover .* after allocation:/ { if(match($0,/Budget leftover .*: ([0-9.]+)/,m)){ e=(budget_e!=""?budget_e:current_e); budget_leftover[e]=m[1] } }
+# Budget leftover after allocation
+/Budget leftover .* after allocation:/ {
+  if(match($0,/Budget leftover .*: ([0-9.]+)/,m)){ e=(budget_e!=""?budget_e:current_e); budget_leftover[e]=m[1] }
+}
 
 # ---- Bids — ordered by VALUE (TAO) ----
 /^.*Bids[[:space:]]*[—-].*VALUE.*TAO/ { in_bids=1; bids_e=(budget_e!=""?budget_e:(auction_e!=""?auction_e:current_e)); add_epoch(bids_e); next }
 in_bids {
-  # Parse row; then sanity-filter out junk (wrapped lines etc)
   if($0 ~ /^[[:space:]]*[0-9]+[[:space:]]*│/ && $0 !~ /UID[[:space:]]*│/){
     n=split($0,col,/│/)
     if(n<9) next
     uid=trim(col[1]); ck=trim(col[2]); sid=trim(col[3]); wbps=trim(col[4]); disc=trim(col[5])
-    bida=trim(col[6]); price=trim(col[7]); depth=trim(col[8]); val=trim(col[9])
-    gsub(/[^0-9.\-]/,"",bida); gsub(/[^0-9.\-]/,"",price); gsub(/[^0-9.\-]/,"",val)
-    # Sanity: numeric uid/sid; price <= 1; value <= 10; bid α > 0
+    bida=sanitize_num(trim(col[6])); price=sanitize_num(trim(col[7])); val=sanitize_num(trim(col[9]))
     if(!(uid ~ /^[0-9]+$/)) next
     if(!(sid ~ /^[0-9]+$/)) next
     if(!is_num(bida) || !is_num(price) || !is_num(val)) next
@@ -186,13 +223,12 @@ in_bids {
 # ---- Reputation caps (TAO, per coldkey) ----
 /^.*Reputation caps.*\(TAO.*per coldkey\)/ { in_rep=1; rep_e=(budget_e!=""?budget_e:current_e); add_epoch(rep_e); next }
 in_rep {
-  # Keep only plausible coldkeys (start with 5 or contain ellipsis) AND have TAO unit
   if(index($0,"TAO")>0 && $0 ~ /│/ && $0 !~ /Coldkey/){
     n=split($0,col,/│/)
     ck=trim(col[1]); q=trim(col[2]); cap=trim(col[3])
     if(!(ck ~ /^5/ || index(ck,"…")>0)) next
     if(ck=="UID") next
-    gsub(/[^0-9.\-]/,"",q); gsub(/[^0-9.\-]/,"",cap)
+    q=sanitize_num(q); cap=sanitize_num(cap)
     if(!is_num(q) || !is_num(cap)) next
     rep_q[kck(rep_e,ck)]=q+0
     rep_cap[kck(rep_e,ck)]=cap+0
@@ -204,19 +240,15 @@ in_rep {
 # ---- Winners — acceptances ----
 /^.*Winners.*acceptances/ { in_winners=1; winners_e=(budget_e!=""?budget_e:(auction_e!=""?auction_e:current_e)); add_epoch(winners_e); next }
 in_winners {
-  # Parse row; sanity-filter out junk
   if($0 ~ /^[[:space:]]*[0-9]+[[:space:]]*│/ && $0 !~ /UID[[:space:]]*│/){
     n=split($0,col,/│/)
     if(n<9) next
     uid=trim(col[1]); ck=trim(col[2]); sid=trim(col[3])
-    reqa=trim(col[4]); acca=trim(col[5]); disc=trim(col[6])
-    wbps=trim(col[7]); val=trim(col[8]); fill=trim(col[9])
-    gsub(/[^0-9.\-]/,"",reqa); gsub(/[^0-9.\-]/,"",acca); gsub(/[^0-9.\-]/,"",val)
-    if(!(uid ~ /^[0-9]+$/)) next
-    if(!(sid ~ /^[0-9]+$/)) next
+    reqa=sanitize_num(trim(col[4])); acca=sanitize_num(trim(col[5])); val=sanitize_num(trim(col[8]))
+    disc=trim(col[6]); wbps=trim(col[7]); fill=trim(col[9])
+    if(!(uid ~ /^[0-9]+$/) || !(sid ~ /^[0-9]+$/)) next
     if(!is_num(reqa) || !is_num(acca) || !is_num(val)) next
-    if((reqa+0) <= 0) next
-    if((val+0) > 10.0) next
+    if((reqa+0) <= 0 || (val+0)>10.0) next
     wcount[winners_e]++; i=wcount[winners_e]
     win_uid[key(winners_e,i)]=uid
     win_ck[key(winners_e,i)]=ck
@@ -258,7 +290,7 @@ in_invoices && $0 ~ /[0-9][[:space:]]*│/ && $0 !~ /UID[[:space:]]*│/ {
 
 # ---- Commit preview/publish ----
 /Staged commit payload/ { }
-$0 ~ /^[[:space:]]*e:[[:space:]]*[0-9]+/ { if(match($0,/e:[[:space:]]*([0-9]+)/,m)){ staged_e=m[1]; add_epoch(staged_e) } }
+/^[[:space:]]*e:[[:space:]]*[0-9]+/ { if(match($0,/e:[[:space:]]*([0-9]+)/,m)){ staged_e=m[1]; add_epoch(staged_e) } }
 $0 ~ /#miners:[[:space:]]*[0-9]+/ { if(staged_e!="" && match($0,/#miners:[[:space:]]*([0-9]+)/,m)) staged_miners[staged_e]=m[1] }
 $0 ~ /#lines_total:[[:space:]]*[0-9]+/ { if(staged_e!="" && match($0,/#[^:]*:[[:space:]]*([0-9]+)/,m)) staged_lines[staged_e]=m[1] }
 
@@ -268,8 +300,9 @@ $0 ~ /epoch:[[:space:]]*[0-9]+/ && $0 ~ /has_inv:/ {
 }
 
 /Commitment Published/ { }
-$0 ~ /epoch_cleared:[[:space:]]*[0-9]+/ { if(match($0,/epoch_cleared:[[:space:]]*([0-9]+)/,m)){ e=m[1]; commit_published[e]=1 } }
-$0 ~ /cid:[[:space:]]*bafk/ { if(e!="" && match($0,/cid:[[:space:]]*([a-z0-9]+)/,m)) commit_cid[e]=m[1] }
+/epoch_cleared:[[:space:]]*([0-9]+)/ { if(match($0,/epoch_cleared:[[:space:]]*([0-9]+)/,m)){ commit_epoch_cur=m[1]; commit_published[commit_epoch_cur]=1 } }
+$0 ~ /cid:[[:space:]]*bafk/ { if(commit_epoch_cur!=""){ if(match($0,/cid:[[:space:]]*([a-z0-9]+)/,m)) commit_cid[commit_epoch_cur]=m[1] } }
+$0 ~ /payment_epoch .*:[[:space:]]*([0-9]+)/ { if(commit_epoch_cur!=""){ if(match($0,/payment_epoch .*:[[:space:]]*([0-9]+)/,m)) commit_pay_epoch[commit_epoch_cur]=m[1] } }
 
 # ---- Settlement ----
 /Settlement for epoch[[:space:]]*[0-9]+/ { if(match($0,/Settlement for epoch[[:space:]]*([0-9]+)/,m)){ settle_e=m[1]; add_epoch(settle_e) } }
@@ -280,7 +313,7 @@ $0 ~ /Settlement Complete/ && /epoch_settled .*:[[:space:]]*([0-9]+)/ {
 /mode=[a-zA-Z-]+/ { if(settle_e!="" && match($0,/mode=([a-zA-Z-]+)/,m)) weights_mode[settle_e]=m[1] }
 $0 ~ /nonzero:[[:space:]]*[0-9]+/ { if(settle_e!="" && match($0,/nonzero:[[:space:]]*([0-9]+)/,m)) weights_nonzero[settle_e]=m[1] }
 $0 ~ /max:[[:space:]]*[0-9.]+/    { if(settle_e!="" && match($0,/max:[[:space:]]*([0-9.]+)/,m)) weights_max[settle_e]=m[1] }
-$0 ~ /sum\(scores\):[[:space:]]*[0-9.]+/ { if(settle_e!="" && match($0,/sum\(scores\):[[:space:]]*([0-9.]+)/,m)) sum_scores[settle_e]=m[1] }
+$0 ~ /sum\(weights\):[[:space:]]*([0-9.]+)/ { if(settle_e!="" && match($0,/sum\(weights\):[[:space:]]*([0-9.]+)/,m)) sum_weights[settle_e]=m[1] }
 
 /Budget Accounting .* settlement/ { }
 $0 ~ /spent_from_payload .*:[[:space:]]*([0-9.]+)/    { if(settle_e!="" && match($0,/spent_from_payload .*:[[:space:]]*([0-9.]+)/,m)) spent_payload[settle_e]=m[1] }
@@ -289,29 +322,10 @@ $0 ~ /target_budget .*:[[:space:]]*([0-9.]+)/         { if(settle_e!="" && match
 $0 ~ /credited_value .*:[[:space:]]*([0-9.]+)/        { if(settle_e!="" && match($0,/credited_value .*:[[:space:]]*([0-9.]+)/,m)) credited_value[settle_e]=m[1] }
 $0 ~ /burn_deficit .*:[[:space:]]*([0-9.]+)/          { if(settle_e!="" && match($0,/burn_deficit .*:[[:space:]]*([0-9.]+)/,m)) burn_deficit[settle_e]=m[1] }
 
-# ---- α scan & paid pools ----
-/events\(sample\):/ {
-  if(settle_e=="") next
-  s=$0; gsub(/\},[[:space:]]*\{/,"}\n{",s)
-  n=split(s, parts, /\n/)
-  for(i=1;i<=n;i++){
-    p=parts[i]; ck=""; amt=0
-    if(match(p,/"src_ck":"([A-Za-z0-9]+)/,mck)) ck=mck[1]
-    if(match(p,/amt\(rao\)":([0-9]+)/,mp)) amt=mp[1]+0
-    if(amt>0){ alpha_paid_rao[settle_e]+=amt; if(ck!="") alpha_paid_by_ck[settle_e,ck]+=amt }
-  }
-}
-/paid_pools\(sample\):/ {
-  if(settle_e=="") next
-  s=$0; gsub(/\},[[:space:]]*\{/,"}\n{",s)
-  n=split(s, parts, /\n/)
-  for(i=1;i<=n;i++){
-    p=parts[i]; ck=""; pr=0
-    if(match(p,/"ck":"([A-Za-z0-9]+)/,mck)) ck=mck[1]
-    if(match(p,/paid_rao":([0-9]+)/,mp)) pr=mp[1]+0
-    if(pr>0){ alpha_paid_rao[settle_e]+=pr; if(ck!="") alpha_paid_by_ck[settle_e,ck]+=pr }
-  }
-}
+# ---- α scan & paid pools (multi-line JSON) ----
+/events\(sample\):/ { if(settle_e!=""){ begin_json(settle_e, settle_e, "events") } }
+/paid_pools\(sample\):/ { if(settle_e!=""){ begin_json(settle_e, settle_e, "paid_pools") } }
+json_accum && { feed_json_line($0); next }
 
 # ---- Errors ----
 /Cannot connect to host/ { e=(auction_e!=""?auction_e:(budget_e!=""?budget_e:current_e)); conn_err[e]++ }
@@ -327,7 +341,7 @@ END{
   agg_value=agg_budget=agg_leftover=0
   agg_ack_recv=agg_ack_total=0
   agg_winack_recv=agg_winack_total=0
-  agg_reach_sum=agg_reach_den=0
+  agg_reach_sum=agg_reach_den=agg_reach_filtered=0
   w_normal=w_burn=w_other=0
   agg_conn=agg_timeo=0
 
@@ -356,6 +370,7 @@ END{
     agg_winack_total += nz(winacks_total[e],0)
 
     if(nz(ax_rcv[e],0) > 0){ agg_reach_sum += nz(ax_usable[e],0); agg_reach_den += nz(ax_rcv[e],0) }
+    agg_reach_filtered += nz(ax_filtered[e],0)
 
     if(weights_mode[e]=="normal") w_normal++
     else if(weights_mode[e]=="burn-all") w_burn++
@@ -409,7 +424,7 @@ END{
 
   printf(fmt, "Auction ACK rate:", sprintf("%.2f%% (%d/%d)", ack_rate, agg_ack_recv, agg_ack_total))
   if(agg_winack_total>0) printf(fmt, "Win ACK rate:", sprintf("%.2f%% (%d/%d)", winack_rate, agg_winack_recv, agg_winack_total))
-  if(agg_reach_den>0)    printf(fmt, "Axon reachability:", sprintf("%.2f%% (%d/%d usable)", reach_rate, agg_reach_sum, agg_reach_den))
+  if(agg_reach_den>0)    printf(fmt, "Axon reachability:", sprintf("%.2f%% (%d/%d usable; filtered=%d)", reach_rate, agg_reach_sum, agg_reach_den, agg_reach_filtered))
 
   printf(fmt, "Weights preview modes:", sprintf("normal=%d burn-all=%d other=%d", w_normal, w_burn, w_other))
   printf("%s\n", line)
@@ -443,9 +458,10 @@ END{
     }
     if(nz(ax_rcv[e],0)>0){
       rr = 100.0*nz(ax_usable[e],0)/nz(ax_rcv[e],1)
-      printf("    axons usable:      %d/%d (%.2f%%)\n", nz(ax_usable[e],0), nz(ax_rcv[e],0), rr)
+      printf("    axons usable:      %d/%d (%.2f%%), filtered_out=%d\n", nz(ax_usable[e],0), nz(ax_rcv[e],0), rr, nz(ax_filtered[e],0))
     }
     if(my_budget[e]!="")       printf("    budget (my):       %.6f TAO  @price≈%s TAO/α\n", nz(my_budget[e],0), nzs(base_price[e],"?"))
+    if(auction_budget_alpha[e]!="") printf("    budget (α):        %s α (base subnet)\n", nzs(auction_budget_alpha[e],"?"))
     if(budget_leftover[e]!="") printf("    leftover:          %.6f TAO\n", nz(budget_leftover[e],0))
     if(nz(winners_count[e],0)>0) printf("    winners:           %d rows, total VALUE=%.6f TAO\n", nz(winners_count[e],0), nz(winners_value[e],0))
     else                         printf("    winners:           none\n")
@@ -455,7 +471,7 @@ END{
       printf("    win acks:          %d/%d (%.2f%%)\n", nz(winacks_recv[e],0), nz(winacks_total[e],0), wr)
     }
 
-    # Reputation caps only if captured
+    # Reputation caps
     if(rep_seen[e]){
       print "  Reputation caps (per coldkey)"
       printf("      %-14s  %-10s  %-10s\n", "Coldkey", "Quota", "Cap(TAO)")
@@ -508,6 +524,7 @@ END{
       printf("    published:         %s (cid=%s…)\n", was_pub, substr(commit_cid[e],1,20))
     else
       printf("    published:         %s\n", was_pub)
+    if(commit_pay_epoch[e]!="") printf("    payment_epoch:     %s\n", commit_pay_epoch[e])
 
     print "  Settlement"
     if(settled[e]){
@@ -516,8 +533,8 @@ END{
       if(weights_mode[e]!=""){
         wn = nzs(weights_nonzero[e],"?")
         wmax = nz(weights_max[e],0)
-        ssum = nz(sum_scores[e],0)
-        printf("    weights:           mode=%s nonzero=%s max=%.6f sum(scores)=%.6f\n", weights_mode[e], wn, wmax, ssum)
+        wsum = nz(sum_weights[e],0)
+        printf("    weights:           mode=%s nonzero=%s max=%.6f sum(weights)=%.6f\n", weights_mode[e], wn, wmax, wsum)
       }
       if(spent_payload[e]!="" || credited_value[e]!="" || burn_deficit[e]!=""){
         sp = nz(spent_payload[e],0)
@@ -531,7 +548,8 @@ END{
       paid_rao = nz(alpha_paid_rao[e],0)
       printf("  Payments\n")
       printf("    invoices:          %s VALUE=%.6f TAO, α=%.4f\n", (invoices_value_tao[e]!=""?"present":"missing"), nz(invoices_value_tao[e],0), toAlpha(exp_rao))
-      printf("    paid α:            %.4f α (shortfall=%.4f α)\n", toAlpha(paid_rao), toAlpha(exp_rao-paid_rao))
+      shorta = exp_rao - paid_rao; if(shorta<0) shorta=0
+      printf("    paid α:            %.4f α (shortfall=%.4f α)\n", toAlpha(paid_rao), toAlpha(shorta))
 
       unpaid_listed=0
       for(k in inv_by_ck){
