@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-# neurons/miner.py — Event-driven bidder v2.8.1 (hardened + startup resume)
+# neurons/miner.py — Event-driven bidder v2.8.2
+# - Startup: eagerly schedules unpaid invoices immediately (no waiting for call_soon)
+# - No deprecated asyncio.get_event_loop() usage
+# - Per-invoice payment workers with retry & window-safety
+
+from __future__ import annotations
 
 import asyncio
 import time
@@ -38,7 +43,8 @@ class Miner(BaseMinerNeuron, MinerMixins):
         self._treasuries: Dict[str, str] = {}
 
         # Remember if we have already bid to a validator in an epoch
-        self._already_bid: Dict[str, List[Tuple[int, int, float, int]]] = {}  # validator_key -> list of (epoch, subnet, alpha, discount_bps)
+        # validator_key -> list of (epoch, subnet, alpha, discount_bps)
+        self._already_bid: Dict[str, List[Tuple[int, int, float, int]]] = {}
         self._wins: List[WinInvoice] = []
 
         # Guards
@@ -47,7 +53,6 @@ class Miner(BaseMinerNeuron, MinerMixins):
 
         # Async subtensor bound to axon loop
         self._async_subtensor: Optional[bt.AsyncSubtensor] = None
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
         # Per-invoice tasks (no global daemon)
         self._payment_tasks: Dict[str, asyncio.Task] = {}
@@ -63,7 +68,6 @@ class Miner(BaseMinerNeuron, MinerMixins):
 
         # Load persisted state (wins, etc.). Immediately re-pin treasuries.
         self._load_state_file()
-        # SECURITY: pin to local allowlist after loading persisted state
         self._treasuries = dict(VALIDATOR_TREASURIES)
 
         # Build bid lines from CLI/config
@@ -92,24 +96,35 @@ class Miner(BaseMinerNeuron, MinerMixins):
         self._retry_every_blocks: int = 2
         self._retry_max_attempts: int = 12
 
-        # --- Startup resume + watchdog so we don't depend on AuctionStart ---
-        # Schedule immediate resume of any pending unpaid invoices.
+        # === EAGER scheduling of unpaid invoices (immediate, sync path) ===
+        try:
+            self._ensure_payment_config()
+            # Ensure we can pay as soon as possible (async subtensor will be made by workers)
+            self._schedule_unpaid_pending()
+            pretty.log("[green]Startup: eagerly scheduled unpaid invoices (no waiting).[/green]")
+        except Exception as _e:
+            pretty.log(f"[yellow]Eager scheduling skipped:[/yellow] {_e}")
+
+        # --- Also schedule the background resume + watchdog (idempotent) ---
         self._safe_create_task(self._resume_pending_payments(), name="resume_pending_payments")
-        # Lightweight watchdog to re-scan every ~1 block (idempotent).
         self._safe_create_task(self._pending_payments_watchdog(), name="payments_watchdog")
 
     # ---------------------- small task helpers ----------------------
 
     def _safe_create_task(self, coro, *, name: Optional[str] = None):
+        """
+        Schedule `coro` even if we're still starting up and no event loop exists yet.
+        Avoids deprecated get_event_loop() warning and guarantees task creation.
+        """
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            # Avoid deprecated get_event_loop() path
-            loop = asyncio.get_event_loop_policy().get_event_loop()
-        loop.call_soon(lambda: loop.create_task(coro, name=name))
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        loop.call_soon(loop.create_task, coro, name=name)
 
     async def _resume_pending_payments(self):
-        """Run once at startup to (re)schedule unpaid invoices immediately."""
+        """Run once at startup to (re)schedule unpaid invoices again (harmless if already scheduled)."""
         try:
             self._ensure_payment_config()
             self._schedule_unpaid_pending()
@@ -516,7 +531,6 @@ class Miner(BaseMinerNeuron, MinerMixins):
 
         # Weights (bps) sent by validator for this auction
         weights_bps_raw = getattr(synapse, "weights_bps", {}) or {}
-        # Be defensive about key types
         weights_bps: Dict[int, int] = {}
         try:
             for k, v in list(weights_bps_raw.items()):
@@ -530,7 +544,6 @@ class Miner(BaseMinerNeuron, MinerMixins):
                     vv = 0
                 weights_bps[int(kk)] = self._clamp_bps(vv)
         except Exception:
-            # fallback: no weights known
             weights_bps = {}
 
         pretty.kv_panel(
