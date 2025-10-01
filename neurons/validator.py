@@ -1,203 +1,116 @@
+# metahash/validator/strategy.py
 from __future__ import annotations
 
-import asyncio
-import time
+from pathlib import Path
+from collections import defaultdict
+from typing import Dict, Optional
 
 import bittensor as bt
-from metahash.base.utils.logging import ColoredLogger as clog
-from metahash import __version__
-from metahash.utils.pretty_logs import pretty
 
-from metahash.config import (
-    STRATEGY_PATH,
-    EPOCH_LENGTH_OVERRIDE,
-    TESTING,
-)
-
-from metahash.utils.helpers import load_weights
-
-from metahash.validator.state import StateStore
-from metahash.validator.engines.commitments import CommitmentsEngine
-from metahash.validator.engines.settlement import SettlementEngine
-from metahash.validator.engines.auction import AuctionEngine
-from metahash.validator.engines.clearing import ClearingEngine
-
-from metahash.validator.epoch_validator import EpochValidatorNeuron
+try:
+    import yaml  # type: ignore
+except ImportError:
+    yaml = None
 
 
-class Validator(EpochValidatorNeuron):
-    def __init__(self, config=None):
-        super().__init__(config=config)
-        self.hotkey_ss58: str = self.wallet.hotkey.ss58_address
-        self._async_subtensor: bt.AsyncSubtensor | None = None
-        self._rpc_lock: asyncio.Lock = asyncio.Lock()
-        self.state = StateStore()
-        if getattr(self.config, "fresh", False):
-            self.state.wipe()
-        self.weights_bps = load_weights(STRATEGY_PATH)
-        self.commitments = CommitmentsEngine(self, self.state)
-        self.settlement = SettlementEngine(self, self.state)
-        self.clearing = ClearingEngine(self, self.state)
-        self.auction = AuctionEngine(self, self.state, self.weights_bps, clearer=self.clearing)
-        self.uid2axon: dict[int, object] = {}
-        self.active_uids: list[int] = []
-        self.active_axons: list[object] = []
-        pretty.banner(
-            f"Validator v{__version__} initialized",
-            " | ".join(
-                filter(
-                    None,
-                    [
-                        f"hotkey={self.hotkey_ss58}",
-                        f"netuid={self.config.netuid}",
-                        f"epoch(e)={getattr(self, 'epoch_index', 0)}",
-                        "fresh" if getattr(self.config, "fresh", False) else "",
-                        "Testing" if TESTING else "",
-                    ],
-                )
-            ),
-            style="bold magenta",
-        )
+def load_subnet_weights(path: str | Path = "weights.yml") -> tuple[defaultdict[int, float], float]:
+    """
+    Load subnet weights from a YAML file with shape:
 
-    async def _stxn(self) -> bt.AsyncSubtensor:
-        if self._async_subtensor is None:
-            self._async_subtensor = await self._new_async_subtensor()
-        return self._async_subtensor
+        default: 1.0
+        36: 1.0
+        62: 0.0
+        73: 1.0
 
-    async def _new_async_subtensor(self) -> bt.AsyncSubtensor:
-        stxn = bt.AsyncSubtensor(network=self.config.subtensor.network)
-        await stxn.initialize()
-        return stxn
+    Rules:
+      - Keys are subnet IDs (ints).
+      - Values are floats (0.0 = off, 1.0 = on, or any positive float).
+      - 'default' (optional): sets the fallback value for subnets not listed.
+      - If 'default' is not provided, fallback is 1.0.
 
-    def _apply_epoch_override(self):
-        try:
-            if EPOCH_LENGTH_OVERRIDE and EPOCH_LENGTH_OVERRIDE > 0:
-                L = int(EPOCH_LENGTH_OVERRIDE)
-                blk = int(getattr(self, "block", 0))
-                e = blk // L
-                self.epoch_index = e
-                self.epoch_start_block = e * L
-                self.epoch_end_block = self.epoch_start_block + L - 1
-                self.epoch_length = L
-        except Exception:
-            pass
+    Returns:
+      (weights mapping, default_value)
+    """
+    p = Path(path)
+    if not p.exists():
+        bt.logging.warning(f"[strategy] file not found at {p}; using all=1.0 default.")
+        return defaultdict(lambda: 1.0), 1.0
 
-    def _align_strategy_for_metagraph(self):
-        try:
-            mg = getattr(self, "metagraph", None)
-            if mg is None:
-                return
-            n = getattr(mg, "n", None)
-            if n is None:
-                ax = getattr(mg, "axons", None)
-                n = len(ax) if isinstance(ax, (list, tuple)) else None
-            if not n:
-                return
-            if isinstance(self.weights_bps, dict):
-                keys_to_try = [self.config.netuid, str(self.config.netuid)]
-                for key in keys_to_try:
-                    if key in self.weights_bps and isinstance(self.weights_bps[key], (list, tuple)):
-                        w = list(self.weights_bps[key])
-                        if len(w) < n:
-                            w.extend([0] * (n - len(w)))
-                        elif len(w) > n:
-                            w = w[:n]
-                        self.weights_bps[key] = w
-                        break
-            elif isinstance(self.weights_bps, (list, tuple)):
-                w = list(self.weights_bps)
-                if len(w) < n:
-                    w.extend([0] * (n - len(w)))
-                elif len(w) > n:
-                    w = w[:n]
-                self.weights_bps = w
-        except Exception:
-            pass
+    if yaml is None:
+        bt.logging.error("[strategy] pyyaml not installed; using all=1.0 default.")
+        return defaultdict(lambda: 1.0), 1.0
 
-    async def _maybe_call_async(self, obj, method_name: str, *args, **kwargs):
-        fn = getattr(obj, method_name, None)
-        if callable(fn):
-            res = fn(*args, **kwargs)
-            if asyncio.iscoroutine(res):
-                return await res
-            return res
+    try:
+        raw = yaml.safe_load(p.read_text()) or {}
+        if not isinstance(raw, dict):
+            bt.logging.error(f"[strategy] {p} must be a mapping; using all=1.0.")
+            return defaultdict(lambda: 1.0), 1.0
 
-    async def _refresh_chain_and_population(self) -> None:
-        await self._stxn()
-        async with self._rpc_lock:
+        # Extract default value
+        default_val = 1.0
+        if "default" in raw:
             try:
-                self.metagraph.sync(subtensor=self.subtensor)
-            except TypeError:
-                self.metagraph.sync(self.subtensor)
+                default_val = max(0.0, float(raw.pop("default")))
             except Exception:
-                pass
+                default_val = 1.0
+
+        table: Dict[int, float] = {}
+        for k, v in raw.items():
+            try:
+                sid = int(k)
+                val = float(v)
+                if val < 0.0:
+                    val = 0.0
+                table[sid] = val
+            except Exception:
+                continue
+
+        bt.logging.info(f"[strategy] loaded from {p} • entries={len(table)} • default={default_val}")
+        return defaultdict(lambda: default_val, table), default_val
+
+    except Exception as e:
+        bt.logging.error(f"[strategy] load failed from {p}: {e} – using all=1.0.")
+        return defaultdict(lambda: 1.0), 1.0
+
+
+class Strategy:
+    """
+    Strategy wrapper that auto-reloads YAML on change.
+    Allows a 'default' key in the YAML to override the fallback value.
+    """
+
+    def __init__(self, path: str | Path = "weights.yml"):
+        self.path = Path(path)
+        self._weights, self._default_val = load_subnet_weights(self.path)
+        self._mtime: Optional[float] = self._get_mtime()
+
+    def _get_mtime(self) -> Optional[float]:
         try:
-            axons = getattr(self.metagraph, "axons", None)
-            n = getattr(self.metagraph, "n", None)
-            if n is None:
-                n = len(axons) if isinstance(axons, (list, tuple)) else 0
-            if isinstance(axons, (list, tuple)) and n:
-                def _is_active(ax):
-                    if ax is None:
-                        return False
-                    flags = []
-                    for flag in ("is_serving", "is_active", "active", "serving"):
-                        v = getattr(ax, flag, None)
-                        if isinstance(v, bool):
-                            flags.append(v)
-                    return all(flags) if flags else True
-                self.uid2axon = {uid: axons[uid] for uid in range(min(n, len(axons))) if axons[uid] is not None}
-                self.active_uids = [uid for uid, ax in self.uid2axon.items() if _is_active(ax)]
-                self.active_axons = [self.uid2axon[uid] for uid in self.active_uids]
-            else:
-                self.uid2axon, self.active_uids, self.active_axons = {}, [], []
+            return self.path.stat().st_mtime
         except Exception:
-            self.uid2axon, self.active_uids, self.active_axons = {}, [], []
-        self._align_strategy_for_metagraph()
-        for engine in (self.auction, self.clearing, self.settlement, self.commitments):
-            if hasattr(engine, "metagraph"):
-                engine.metagraph = self.metagraph
-            if hasattr(engine, "weights_bps"):
-                engine.weights_bps = self.weights_bps
-            await self._maybe_call_async(engine, "on_metagraph_update", new=self.metagraph, old=None)
-        self._apply_epoch_override()
+            return None
 
-    async def forward(self):
-        await self._stxn()
-        await self._refresh_chain_and_population()
-        e = int(getattr(self, "epoch_index", 0))
-        pretty.banner(
-            f"Epoch {e} (label: e)",
-            f"head_block={self.block} | start={self.epoch_start_block} | end={self.epoch_end_block}\n"
-            f"• PHASE 1/3: settle e−2 → {e-2} (scan pe={e-1})\n"
-            f"• PHASE 2/3: auction & clear e={e} (miners pay in e+1={e+1})\n"
-            f"• PHASE 3/3: publish commitment for e−1={e-1} (strict; post-settlement)\n"
-            f"• Weights applied from e in e+2={e+2}",
-            style="bold white",
-        )
-        await self.settlement.settle_and_set_weights_all_masters(epoch_to_settle=e - 2)
-        if not self.auction._is_master_now() and getattr(self.auction, "_not_master_log_epoch", None) != e:
-            pretty.log("[yellow]Validator is not a master — skipping broadcast/clear for this epoch.[/yellow]")
-            self.auction._not_master_log_epoch = e
+    def _reload_if_changed(self) -> None:
+        mtime = self._get_mtime()
+        if mtime is not None and mtime != self._mtime:
+            self._weights, self._default_val = load_subnet_weights(self.path)
+            self._mtime = mtime
+            bt.logging.info(f"[strategy] reloaded: {self.path} (mtime={mtime})")
+
+    def weight_for(self, netuid: int) -> float:
+        """
+        Returns the weight (float) for a given subnet.
+        Defaults to the 'default' in YAML, or 1.0 if none is provided.
+        """
+        self._reload_if_changed()
         try:
-            await self.auction.broadcast_auction_start()
-        except asyncio.CancelledError as ce:
-            pretty.log(f"[yellow]AuctionStart cancelled by RPC: {ce}. Will retry next epoch.[/yellow]")
-            return
-        except Exception as exc:
-            pretty.log(f"[yellow]AuctionStart failed: {exc}[/yellow]")
-        self.auction.cleanup_old_epoch_books(before_epoch=e - 2)
-        try:
-            await self.commitments.publish_exact(epoch_cleared=e - 1, max_retries=6)
-        except asyncio.CancelledError as ce:
-            pretty.log(f"[yellow]Publish e−1 cancelled by RPC: {ce}[/yellow]")
-        except Exception as exc:
-            pretty.log(f"[yellow]Publish e−1 failed: {exc}[/yellow]")
+            nid = int(netuid)
+        except Exception:
+            nid = netuid
+        return float(self._weights[nid])
 
-
-if __name__ == "__main__":
-    from metahash.bittensor_config import config
-    with Validator(config=config(role="validator")) as v:
-        while True:
-            clog.info("Validator running…", color="gray")
-            time.sleep(120)
+    @property
+    def default_value(self) -> float:
+        """Return the current default value from YAML (or 1.0 if not set)."""
+        self._reload_if_changed()
+        return self._default_val

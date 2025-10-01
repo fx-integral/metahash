@@ -1,0 +1,201 @@
+# metahash/validator/strategy.py
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any, List, Optional, Union
+import bittensor as bt
+
+try:
+    import yaml  # type: ignore
+except Exception:
+    yaml = None
+
+
+def _read_yaml(path: Path) -> dict:
+    if yaml is None:
+        bt.logging.error("[strategy] pyyaml not installed; using empty {}.")
+        return {}
+    try:
+        raw = yaml.safe_load(path.read_text()) or {}
+        if not isinstance(raw, dict):
+            bt.logging.error(f"[strategy] {path} must be a mapping; got {type(raw)}. Using empty {{}}.")
+            return {}
+        return raw
+    except Exception as e:
+        bt.logging.error(f"[strategy] failed to read YAML at {path}: {e}")
+        return {}
+
+
+def _normalize_to_bps(weights: List[float]) -> List[int]:
+    total = float(sum(max(0.0, float(w)) for w in weights))
+    if total <= 0.0:
+        return [0 for _ in weights]
+    bps = [int(round((max(0.0, float(w)) / total) * 10000.0)) for w in weights]
+    drift = 10000 - sum(bps)
+    if drift and bps:
+        idx = max(range(len(bps)), key=lambda i: bps[i])
+        bps[idx] = max(0, min(10000, bps[idx] + drift))
+    return bps
+
+
+class Strategy:
+    """
+    Minimal strategy loader (no per-UID boosts):
+
+    YAML supports:
+      1) Global default fallback:
+         ---
+         default: 1.0
+         73: 0
+         36: 1.0
+
+      2) Per-subnet gate block (only 'enable'):
+         ---
+         73:
+           enable: 1  # >0 = on, 0 = off
+
+    Behavior:
+      • weight_for(netuid) -> scalar gate (>=0.0). If 0, subnet is off.
+      • compute_weights_bps(...) -> uniform across active UIDs, normalized to 10_000 bps.
+    """
+
+    def __init__(self, path: Union[str, Path] = "weights.yml"):
+        self.path = Path(path)
+        self._raw: dict = {}
+        self._default_val: float = 1.0
+        self._mtime: Optional[float] = None
+        self._reload(force=True)
+
+    # -----------------------
+    # Loading / hot-reload
+    # -----------------------
+    def _stat_mtime(self) -> Optional[float]:
+        try:
+            return self.path.stat().st_mtime
+        except Exception:
+            return None
+
+    def _reload(self, force: bool = False) -> None:
+        mtime = self._stat_mtime()
+        if not force and (mtime is None or mtime == self._mtime):
+            return
+
+        if not self.path.exists():
+            bt.logging.warning(f"[strategy] file not found at {self.path}; using default=1.0, empty table.")
+            self._raw = {}
+            self._default_val = 1.0
+            self._mtime = mtime
+            return
+
+        raw = _read_yaml(self.path)
+
+        default_val = 1.0
+        if "default" in raw:
+            try:
+                default_val = max(0.0, float(raw.get("default", 1.0)))
+            except Exception:
+                default_val = 1.0
+
+        self._raw = raw
+        self._default_val = default_val
+        self._mtime = mtime
+        bt.logging.info(f"[strategy] loaded {self.path} • default={self._default_val} • keys={len(self._raw)}")
+
+    def _reload_if_changed(self) -> None:
+        self._reload(force=False)
+
+    # -----------------------
+    # Simple gate API
+    # -----------------------
+    def weight_for(self, netuid: int) -> float:
+        """
+        Scalar subnet weight/gate:
+          • If an advanced block exists and has `enable`, that overrides.
+          • Else if a simple numeric value exists, use that (clamped >=0).
+          • Else fall back to global default (default: 1.0).
+        """
+        self._reload_if_changed()
+        nid_key_int = int(netuid)
+        nid_key_str = str(netuid)
+
+        # Prefer block if dict
+        block = None
+        if isinstance(self._raw.get(nid_key_int), dict):
+            block = self._raw[nid_key_int]
+        elif isinstance(self._raw.get(nid_key_str), dict):
+            block = self._raw[nid_key_str]
+
+        if isinstance(block, dict) and "enable" in block:
+            try:
+                return max(0.0, float(block["enable"]))
+            except Exception:
+                return 0.0
+
+        # Else: simple scalar entry?
+        val = None
+        if nid_key_int in self._raw and not isinstance(self._raw[nid_key_int], dict):
+            val = self._raw[nid_key_int]
+        elif nid_key_str in self._raw and not isinstance(self._raw[nid_key_str], dict):
+            val = self._raw[nid_key_str]
+
+        if val is not None:
+            try:
+                return max(0.0, float(val))
+            except Exception:
+                return 0.0
+
+        # Fallback
+        return self._default_val
+
+    @property
+    def default_value(self) -> float:
+        self._reload_if_changed()
+        return self._default_val
+
+    # -----------------------
+    # Per-UID vector API (uniform only)
+    # -----------------------
+    def compute_weights_bps(
+        self,
+        netuid: int,
+        metagraph: Any,
+        active_uids: Optional[List[int]] = None
+    ) -> List[int]:
+        """
+        Returns a per-UID vector (len==metagraph.n) that sums to 10000 bps,
+        uniformly allocated across the active set. If gated off → all zeros.
+        """
+        self._reload_if_changed()
+
+        n = int(getattr(metagraph, "n", 0) or 0)
+        if n <= 0:
+            return []
+
+        # Gate
+        if self.weight_for(netuid) <= 0.0:
+            return [0] * n
+
+        # Active set
+        if not active_uids:
+            active_uids = list(range(n))
+
+        shares = [0.0] * n
+        if not active_uids:
+            return shares
+
+        # Uniform share across active UIDs
+        for uid in active_uids:
+            shares[uid] = 1.0
+
+        return _normalize_to_bps(shares)
+
+
+# ------------- convenience async -------------
+async def compute_dynamic_weights_bps(
+    strategy_path: Union[str, Path],
+    netuid: int,
+    metagraph: Any,
+    active_uids: Optional[List[int]] = None
+) -> List[int]:
+    strat = Strategy(strategy_path)
+    return strat.compute_weights_bps(netuid=netuid, metagraph=metagraph, active_uids=active_uids)
