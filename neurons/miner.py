@@ -27,10 +27,10 @@ class Miner(BaseMinerNeuron):
     """
 
     def __init__(self, config=None):
+        super().__init__(config=config)
+        
         # Wallet unlock (best-effort)
         unlock_wallet(wallet=self.wallet)
-
-        super().__init__(config=config)
 
         # ---------------------- Per-coldkey state directory ----------------------
         self._coldkey_ss58: str = getattr(getattr(self.wallet, "coldkey", None), "ss58_address", "") or "unknown_coldkey"

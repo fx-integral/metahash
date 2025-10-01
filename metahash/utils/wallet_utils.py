@@ -193,7 +193,7 @@ def unlock_wallet(wallet:bt.Wallet, password_env_variable="WALLET_PASSWORD"):
     load_dotenv()
     pwd = os.getenv(password_env_variable)
     print(pwd)
-    input()
+    input() 
     if not pwd:
         bt.logging.error(f"{password_env_variable} not set in .env or env")
         return None
