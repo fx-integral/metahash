@@ -5,7 +5,7 @@ import asyncio
 import inspect
 import hashlib
 from math import isfinite
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Iterable, Tuple, Any
 
 import bittensor as bt
 from metahash.config import PLANCK, S_MIN_ALPHA_MINER
@@ -281,12 +281,38 @@ class Runtime:
     def _validator_key(self, uid: Optional[int], hotkey: str) -> str:
         return hotkey if hotkey else (f"uid:{uid}" if uid is not None else "<unknown>")
 
+    @staticmethod
+    def _normalize_weights_bps(raw: Any) -> Dict[int, int]:
+        """
+        Accept dict-like {sid: bps} or list-like [(sid, bps), ...],
+        coerce to {int(sid): clamp_bps(int(bps))}.
+        """
+        out: Dict[int, int] = {}
+        if isinstance(raw, dict):
+            items: Iterable[Tuple[Any, Any]] = raw.items()
+        elif isinstance(raw, (list, tuple)):
+            items = (tuple(x) if isinstance(x, (list, tuple)) else (None, None) for x in raw)
+        else:
+            return out
+
+        for k, v in items:
+            try:
+                sid = int(k)
+            except Exception:
+                continue
+            try:
+                bps = clamp_bps(int(float(v)))
+            except Exception:
+                bps = 0
+            out[int(sid)] = int(bps)
+        return out
+
     async def handle_auction_start(self, synapse: AuctionStartSynapse, lines: List[BidLine]) -> AuctionStartSynapse:
         await self._ensure_async_subtensor()
 
         uid, caller_hot = self._resolve_caller(synapse)
         vkey = self._validator_key(uid, caller_hot)
-        epoch = int(synapse.epoch_index)
+        epoch = int(getattr(synapse, "epoch_index", 0) or 0)
 
         # Allowlist
         treasury_ck = self.state.treasuries.get(caller_hot) or self.state.treasuries.get(vkey)
@@ -303,26 +329,20 @@ class Runtime:
             synapse.bids = []
             synapse.bids_sent = 0
             synapse.note = note
+            # best-effort type hygiene for anything we echo back
             return synapse
 
         budget_alpha = float(getattr(synapse, "auction_budget_alpha", 0.0) or 0.0)
         min_stake_alpha = float(getattr(synapse, "min_stake_alpha", S_MIN_ALPHA_MINER) or S_MIN_ALPHA_MINER)
 
-        weights_bps_raw = getattr(synapse, "weights_bps", {}) or {}
-        weights_bps: Dict[int, int] = {}
+        # Normalize weights map (handles dict or list-of-pairs, str->int coercion)
+        weights_bps_in = getattr(synapse, "weights_bps", {}) or {}
+        weights_bps: Dict[int, int] = self._normalize_weights_bps(weights_bps_in)
         try:
-            for k, v in list(weights_bps_raw.items()):
-                try:
-                    kk = int(k)
-                except Exception:
-                    kk = k
-                try:
-                    vv = int(v)
-                except Exception:
-                    vv = 0
-                weights_bps[int(kk)] = clamp_bps(vv)
+            # write normalized copy back so pydantic doesn't warn on outbound serialize
+            synapse.weights_bps = dict(weights_bps)
         except Exception:
-            weights_bps = {}
+            pass
 
         pretty.kv_panel(
             "[cyan]AuctionStart[/cyan]",
@@ -378,8 +398,7 @@ class Runtime:
         # Track remaining stake per subnet to avoid oversubscription across lines
         remaining_by_subnet: Dict[int, float] = dict(stake_by_subnet)
 
-        out_bids = []
-        sent = 0
+        out_bids: List[List[Any]] = []
         rows_sent = []
 
         for ln in lines:
@@ -423,9 +442,11 @@ class Runtime:
                 continue
 
             bid_id = hashlib.sha1(f"{vkey}|{epoch}|{subnet_id}|{send_alpha:.12f}|{send_disc_bps}".encode("utf-8")).hexdigest()[:10]
-            out_bids.append({"subnet_id": subnet_id, "alpha": float(send_alpha), "discount_bps": int(send_disc_bps), "bid_id": bid_id})
+
+            # >>> IMPORTANT: send bid as 4-positional list (sid, alpha, disc_bps, bid_id)
+            out_bids.append([int(subnet_id), float(send_alpha), int(send_disc_bps), str(bid_id)])
+
             self.state.remember_bid(vkey, epoch, subnet_id, send_alpha, send_disc_bps)
-            sent += 1
 
             rows_sent.append([
                 subnet_id,
@@ -439,7 +460,7 @@ class Runtime:
                 mode_note
             ])
 
-        if sent == 0:
+        if not out_bids:
             pretty.log("[grey]No bids were added (invalid/duplicate/insufficient stake).[/grey]")
         else:
             pretty.table(
@@ -453,6 +474,15 @@ class Runtime:
 
         synapse.ack = True
         synapse.bids = out_bids
-        synapse.bids_sent = sent
-        synapse.note = None
+        synapse.bids_sent = int(len(out_bids))
+        # leave note unset/empty for success to avoid type noise
+        try:
+            if getattr(synapse, "note", None) is not None and not synapse.bids:
+                synapse.note = str(getattr(synapse, "note"))
+            elif getattr(synapse, "note", None) is not None:
+                # clear any stale incoming 'note' that might be non-str
+                synapse.note = None
+        except Exception:
+            pass
+
         return synapse
