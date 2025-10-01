@@ -41,6 +41,9 @@ class Miner(BaseMinerNeuron):
             self._state_dir = Path(".")
             state_path = Path(f"miner_state_{self._coldkey_ss58}.json")
 
+        # Wallet unlock (best-effort)
+        unlock_wallet(wallet=self.wallet)
+
         # ---------------------- StateStore ----------------------
         self.state = StateStore(state_path)
 
@@ -91,8 +94,7 @@ class Miner(BaseMinerNeuron):
             style="bold magenta",
         )
 
-        # Wallet unlock (best-effort)
-        unlock_wallet(wallet=self.wallet)
+      
 
         # Eager schedule unpaid invoices + watchdog
         try:
