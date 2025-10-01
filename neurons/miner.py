@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
 # neurons/miner.py — Event-driven bidder v2.8.2
-# - Startup: eagerly schedules unpaid invoices immediately (no waiting for call_soon)
-# - No deprecated asyncio.get_event_loop() usage
-# - Per-invoice payment workers with retry & window-safety
 
-from __future__ import annotations
 
 import asyncio
 import time
