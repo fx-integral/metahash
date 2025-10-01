@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-# neurons/miner.py — Event-driven bidder v2.8.3
-
 
 import asyncio
 import time
@@ -31,8 +29,7 @@ class Miner(BaseMinerNeuron, MinerMixins):
     def __init__(self, config=None):
         super().__init__(config=config)
 
-        # --- Background asyncio loop (always running) -------------------------
-        # Allows scheduling coroutines immediately from __init__ or any thread.
+        # Background asyncio loop (daemon thread) so we can schedule from __init__
         self._bg_loop: asyncio.AbstractEventLoop = asyncio.new_event_loop()
         self._bg_thread = threading.Thread(
             target=self._run_bg_loop,
@@ -58,10 +55,12 @@ class Miner(BaseMinerNeuron, MinerMixins):
         self._pay_lock: asyncio.Lock = asyncio.Lock()    # prevent concurrent tx on-chain
         self._state_lock: asyncio.Lock = asyncio.Lock()  # serialize state writes
 
-        # Async subtensor bound to axon loop (created lazily by workers)
+        # Single AsyncSubtensor client + locks to avoid websocket concurrency
         self._async_subtensor: Optional[bt.AsyncSubtensor] = None
+        self._subtensor_lock: asyncio.Lock = asyncio.Lock()  # create/connect once
+        self._rpc_lock: asyncio.Lock = asyncio.Lock()        # serialize RPC calls
 
-        # Per-invoice tasks (stored as concurrent.futures.Futures from run_coroutine_threadsafe)
+        # Per-invoice tasks (stored as concurrent.futures.Futures)
         self._payment_tasks: Dict[str, "concurrent.futures.Future"] = {}
 
         # Discount mode: default False (use effective-discount transformation)
@@ -103,45 +102,73 @@ class Miner(BaseMinerNeuron, MinerMixins):
         self._retry_every_blocks: int = 2
         self._retry_max_attempts: int = 12
 
-        # === EAGER scheduling of unpaid invoices (immediate, now safe) ===
+        # EAGER scheduling of unpaid invoices (immediate, safe now)
         try:
             self._ensure_payment_config()
-            # Ensure we can pay as soon as possible (async subtensor will be made by workers)
             self._schedule_unpaid_pending()
             pretty.log("[green]Startup: eagerly scheduled unpaid invoices (no waiting).[/green]")
         except Exception as _e:
             pretty.log(f"[yellow]Eager scheduling skipped:[/yellow] {_e}")
 
-        # --- Also schedule the background resume + watchdog (idempotent) ---
+        # Also schedule the background resume + watchdog (idempotent)
         self._safe_create_task(self._resume_pending_payments(), name="resume_pending_payments")
         self._safe_create_task(self._pending_payments_watchdog(), name="payments_watchdog")
 
     # ---------------------- background loop helpers ----------------------
 
     def _run_bg_loop(self):
-        """Target for the daemon thread: run a dedicated asyncio loop forever."""
         asyncio.set_event_loop(self._bg_loop)
         self._bg_loop.run_forever()
 
     def _submit(self, coro) -> "concurrent.futures.Future":
-        """
-        Thread-safe submission of a coroutine to our background loop.
-        Returns a concurrent.futures.Future (not an asyncio.Task).
-        """
         import concurrent.futures
         if not asyncio.iscoroutine(coro):
             raise TypeError("Expected coroutine in _submit()")
         return asyncio.run_coroutine_threadsafe(coro, self._bg_loop)
 
     def _safe_create_task(self, coro, *, name: Optional[str] = None):
-        """Schedule `coro` onto the dedicated background loop."""
-        # `name` is ignored here; could be used with a small wrapper if desired.
         self._submit(coro)
+
+    # ---------------------- AsyncSubtensor singleton + RPC wrappers ----------------------
+
+    async def _ensure_async_subtensor_singleton(self):
+        """
+        Ensure a single self._async_subtensor is created once.
+        Using a lock prevents multiple concurrent connects and races that
+        lead to overlapping websocket recv loops.
+        """
+        if self._async_subtensor is not None:
+            return
+        async with self._subtensor_lock:
+            if self._async_subtensor is not None:
+                return
+            # Delegate to existing mixin/parent ensure if available; otherwise create
+            try:
+                # If MinerMixins or BaseMinerNeuron already expose an ensure method, call it
+                await super()._ensure_async_subtensor()  # type: ignore[attr-defined]
+                self._async_subtensor = getattr(self, "_async_subtensor", None)
+            except AttributeError:
+                # Fallback: construct from config (library resolves network/endpoint)
+                self._async_subtensor = bt.AsyncSubtensor(self.config)
+
+    async def _get_current_block_locked(self) -> int:
+        """
+        Call the existing _get_current_block (from mixin) but serialize with _rpc_lock
+        to avoid concurrent websocket recv on the shared AsyncSubtensor client.
+        """
+        async with self._rpc_lock:
+            # Prefer mixin version if present:
+            try:
+                return await super()._get_current_block()  # type: ignore[attr-defined]
+            except AttributeError:
+                # Fallback: basic query through async_subtensor
+                if self._async_subtensor is None:
+                    await self._ensure_async_subtensor_singleton()
+                return int(await self._async_subtensor.block())  # type: ignore[union-attr]
 
     # ---------------------- startup tasks ----------------------
 
     async def _resume_pending_payments(self):
-        """Run once at startup to (re)schedule unpaid invoices again (harmless if already scheduled)."""
         try:
             self._ensure_payment_config()
             self._schedule_unpaid_pending()
@@ -150,11 +177,6 @@ class Miner(BaseMinerNeuron, MinerMixins):
             pretty.log(f"[yellow]Startup resume failed:[/yellow] {e}")
 
     async def _pending_payments_watchdog(self):
-        """
-        Very light watchdog: every ~1 block, re-run the scheduler to catch any
-        invoices that might have been added/merged after startup.
-        This is idempotent because _schedule_payment() checks for existing tasks.
-        """
         try:
             while True:
                 self._schedule_unpaid_pending()
@@ -167,7 +189,6 @@ class Miner(BaseMinerNeuron, MinerMixins):
     # ---------------------- configuration ----------------------
 
     def _ensure_payment_config(self):
-        """Load CLI-provided payment sources + retry knobs exactly once."""
         if self._pay_cfg_initialized:
             return
 
@@ -232,7 +253,6 @@ class Miner(BaseMinerNeuron, MinerMixins):
         self._pay_cfg_initialized = True
 
     def _pick_rr_hotkey(self) -> str:
-        """Round-robin from the pool; if empty, fall back to local wallet hotkey."""
         if not self._pay_pool:
             return self.wallet.hotkey.ss58_address
         hk = self._pay_pool[self._pay_rr_index % len(self._pay_pool)]
@@ -240,12 +260,6 @@ class Miner(BaseMinerNeuron, MinerMixins):
         return hk
 
     def _origin_hotkey_for_invoice(self, inv: WinInvoice) -> str:
-        """
-        Decide which origin hotkey to use for this invoice:
-          1) If subnet-specific mapping exists → use mapped hotkey.
-          2) Else use round-robin pool (if any).
-          3) Else use local wallet hotkey (default / legacy).
-        """
         sid = getattr(inv, "subnet_id", None)
         if isinstance(sid, int) and sid in self._pay_map:
             return self._pay_map[sid]
@@ -258,25 +272,14 @@ class Miner(BaseMinerNeuron, MinerMixins):
         caller_hot: Optional[str],
         vkey: str,
     ) -> Tuple[Optional[str], Optional[str]]:
-        """
-        Return (treasury_coldkey, matched_validator_key) if the validator is allowlisted,
-        else (None, None). We try the caller's hotkey first, then vkey fallback.
-
-        NOTE: `vkey` is what self._validator_key(uid, caller_hot) returns; depending on
-        upstream, it may be the hotkey or some derived key. The allowlist uses hotkeys.
-        """
-        # Prefer direct hotkey match
         if isinstance(caller_hot, str) and caller_hot:
             ck = self._treasuries.get(caller_hot)
             if ck:
                 return ck, caller_hot
-
-        # Fallback to whatever `vkey` is, in case your allowlist chose that string
         if isinstance(vkey, str) and vkey:
             ck = self._treasuries.get(vkey)
             if ck:
                 return ck, vkey
-
         return None, None
 
     def _allowed_validator_note(self, caller_hot: Optional[str], vkey: str) -> str:
@@ -286,15 +289,12 @@ class Miner(BaseMinerNeuron, MinerMixins):
     # ---------------------- per-invoice scheduler ----------------------
 
     def _schedule_payment(self, inv: WinInvoice):
-        """Create a single async task to handle paying this invoice; idempotent."""
         if inv.paid:
             return
         t = self._payment_tasks.get(inv.invoice_id)
-        # t is a concurrent.futures.Future
         if t and not t.done():
             return  # already scheduled
 
-        # Update UX immediately
         inv.last_response = f"scheduled (wait ≥{self._pay_start_safety_blocks} blk)"
         self._submit(self._async_save_state())
 
@@ -315,9 +315,8 @@ class Miner(BaseMinerNeuron, MinerMixins):
         )
 
     async def _payment_worker(self, inv: WinInvoice):
-        """Try to pay inside the window with retries; exits when paid/expired/attempts exceeded."""
         try:
-            await self._ensure_async_subtensor()
+            await self._ensure_async_subtensor_singleton()
 
             start = int(inv.pay_window_start_block or 0)
             end = int(inv.pay_window_end_block or 0)
@@ -325,7 +324,7 @@ class Miner(BaseMinerNeuron, MinerMixins):
 
             attempt = 0
             while True:
-                blk = await self._get_current_block()
+                blk = await self._get_current_block_locked()
 
                 # Too early
                 if start and (blk <= 0 or blk < allowed_start):
@@ -352,7 +351,7 @@ class Miner(BaseMinerNeuron, MinerMixins):
                     )
                     break
 
-                # Attempt payment (under lock)
+                # Attempt payment (under locks)
                 attempt += 1
                 inv.last_attempt_ts = time.time()
                 await self._async_save_state()
@@ -363,72 +362,77 @@ class Miner(BaseMinerNeuron, MinerMixins):
                 )
 
                 async with self._pay_lock:
-                    if inv.paid:
-                        inv.last_response = "already paid"
-                        await self._async_save_state()
-                        break
+                    # fresh height under RPC lock too
+                    async with self._rpc_lock:
+                        if inv.paid:
+                            inv.last_response = "already paid"
+                            await self._async_save_state()
+                            ok = True
+                            resp = "already paid"
+                        else:
+                            blk2 = await self._get_current_block_locked()
+                            if start and (blk2 <= 0 or blk2 < allowed_start):
+                                inv.last_response = f"not yet in window (blk {blk2} < start {start}+{self._pay_start_safety_blocks})"
+                                ok = False
+                                resp = inv.last_response
+                            elif end and blk2 > end:
+                                inv.last_response = f"window over (blk {blk2} > end {end})"
+                                ok = False
+                                resp = inv.last_response
+                            else:
+                                origin_hotkey = self._origin_hotkey_for_invoice(inv)
+                                try:
+                                    ok = await transfer_alpha(
+                                        subtensor=self._async_subtensor,
+                                        wallet=self.wallet,
+                                        hotkey_ss58=origin_hotkey,
+                                        origin_and_dest_netuid=inv.subnet_id,
+                                        dest_coldkey_ss58=inv.treasury_coldkey,
+                                        amount=bt.Balance.from_rao(inv.amount_rao),
+                                        wait_for_inclusion=True,
+                                        wait_for_finalization=False,
+                                    )
+                                    resp = "ok" if ok else "rejected"
+                                except Exception as exc:
+                                    ok = False
+                                    resp = f"exception: {exc}"
 
-                    # Fresh height under the lock too
-                    blk2 = await self._get_current_block()
-                    if start and (blk2 <= 0 or blk2 < allowed_start):
-                        inv.last_response = f"not yet in window (blk {blk2} < start {start}+{self._pay_start_safety_blocks})"
-                        ok = False
-                        resp = inv.last_response
-                    elif end and blk2 > end:
-                        inv.last_response = f"window over (blk {blk2} > end {end})"
-                        ok = False
-                        resp = inv.last_response
-                    else:
-                        origin_hotkey = self._origin_hotkey_for_invoice(inv)
-                        try:
-                            ok = await transfer_alpha(
-                                subtensor=self._async_subtensor,
-                                wallet=self.wallet,
-                                hotkey_ss58=origin_hotkey,
-                                origin_and_dest_netuid=inv.subnet_id,
-                                dest_coldkey_ss58=inv.treasury_coldkey,
-                                amount=bt.Balance.from_rao(inv.amount_rao),
-                                wait_for_inclusion=True,
-                                wait_for_finalization=False,
-                            )
-                            resp = "ok" if ok else "rejected"
-                        except Exception as exc:
-                            ok = False
-                            resp = f"exception: {exc}"
+                inv.pay_attempts += 1
+                inv.last_response = str(resp)[:300]
 
-                    inv.pay_attempts += 1
-                    inv.last_response = str(resp)[:300]
-
-                    if ok:
-                        inv.paid = True
-                        await self._async_save_state()
-                        pretty.kv_panel(
-                            "[green]Payment OK[/green]",
-                            [
-                                ("inv", inv.invoice_id),
-                                ("α", f"{inv.amount_rao/PLANCK:.4f}"),
-                                ("dst_treasury", inv.treasury_coldkey[:8] + "…"),
-                                ("src_hotkey", origin_hotkey[:8] + "…"),
-                                ("sid", inv.subnet_id),
-                                ("pay_e", inv.pay_epoch_index),
-                            ],
-                            style="bold green",
-                        )
-                        self._status_tables()
-                        self._log_aggregate_summary()
-                        break
-                    else:
-                        await self._async_save_state()
-                        pretty.kv_panel(
-                            "[red]Payment FAILED[/red]",
-                            [
-                                ("inv", inv.invoice_id),
-                                ("resp", inv.last_response[:80]),
-                                ("sid", inv.subnet_id),
-                                ("attempts", inv.pay_attempts),
-                            ],
-                            style="bold red",
-                        )
+                if ok and inv.paid:
+                    # was already paid path
+                    break
+                if ok:
+                    inv.paid = True
+                    await self._async_save_state()
+                    pretty.kv_panel(
+                        "[green]Payment OK[/green]",
+                        [
+                            ("inv", inv.invoice_id),
+                            ("α", f"{inv.amount_rao/PLANCK:.4f}"),
+                            ("dst_treasury", inv.treasury_coldkey[:8] + "…"),
+                            ("src_hotkey", origin_hotkey[:8] + "…"),
+                            ("sid", inv.subnet_id),
+                            ("pay_e", inv.pay_epoch_index),
+                        ],
+                        style="bold green",
+                    )
+                    self._status_tables()
+                    self._log_aggregate_summary()
+                    break
+                else:
+                    await self._async_save_state()
+                    pretty.kv_panel(
+                        "[red]Payment FAILED[/red]",
+                        [
+                            ("inv", inv.invoice_id),
+                            ("resp", inv.last_response[:80]),
+                            ("sid", inv.subnet_id),
+                            ("attempts", inv.pay_attempts),
+                        ],
+                        style="bold red",
+                    )
 
                 # Exit conditions
                 if attempt >= int(self._retry_max_attempts or 1):
@@ -468,14 +472,11 @@ class Miner(BaseMinerNeuron, MinerMixins):
                 self._payment_tasks.pop(inv.invoice_id, None)
 
     def _schedule_unpaid_pending(self):
-        """Schedule tasks for all unpaid invoices (idempotent), allowlist-enforced."""
         for w in self._wins:
             if w.paid:
                 continue
-            # Only schedule if validator is still allowlisted (safety on restarts)
             treasury_ck, _matched = self._lookup_local_treasury(None, w.validator_key)
             if treasury_ck:
-                # Update the pinned treasury on the invoice to match local file
                 w.treasury_coldkey = treasury_ck
                 self._schedule_payment(w)
             else:
@@ -493,25 +494,12 @@ class Miner(BaseMinerNeuron, MinerMixins):
 
     @staticmethod
     def _compute_raw_discount_bps(effective_factor_bps: int, weight_bps: int) -> int:
-        """
-        Given:
-          - effective_factor_bps in [0..10_000], representing:  effective_factor = weight * (1 - raw_discount)
-          - weight_bps in [0..10_000], representing the validator's subnet weight
-
-        Solve for raw_discount (bps) to send to the validator.
-
-        raw_discount = 1 - (effective_factor / weight)   [clamped to 0..1]
-        """
         w_bps = Miner._clamp_bps(int(weight_bps or 0))
         ef_bps = Miner._clamp_bps(int(effective_factor_bps or 0))
-
         if w_bps <= 0:
-            # No weight → product will be 0 regardless. Best we can do is not self-penalize.
             return 0
-
         w = w_bps / 10_000.0
         ef = ef_bps / 10_000.0
-
         raw = 1.0 - (ef / w)
         if raw < 0.0:
             raw = 0.0
@@ -522,17 +510,15 @@ class Miner(BaseMinerNeuron, MinerMixins):
     # ---------------------- auction handlers ----------------------
 
     async def auctionstart_forward(self, synapse: AuctionStartSynapse) -> AuctionStartSynapse:
-        await self._ensure_async_subtensor()
+        await self._ensure_async_subtensor_singleton()
         self._ensure_payment_config()
 
         uid, caller_hot = self._resolve_caller(synapse)
         vkey = self._validator_key(uid, caller_hot)
         epoch = int(synapse.epoch_index)
 
-        # SECURITY: Never trust synapse.treasury_coldkey. We only use local allowlist.
         treasury_ck, _matched_key = self._lookup_local_treasury(caller_hot, vkey)
         if not treasury_ck:
-            # Do not bid for unknown validators
             note = self._allowed_validator_note(caller_hot, vkey)
             pretty.kv_panel(
                 "[red]AuctionStart ignored[/red]",
@@ -541,7 +527,7 @@ class Miner(BaseMinerNeuron, MinerMixins):
                  ("note", note)],
                 style="bold red"
             )
-            synapse.ack = True  # we answered, but with no bids
+            synapse.ack = True
             synapse.bids = []
             synapse.bids_sent = 0
             synapse.note = note
@@ -582,10 +568,8 @@ class Miner(BaseMinerNeuron, MinerMixins):
             style="bold cyan",
         )
 
-        # (Re)schedule any pending unpaid invoices we may have persisted (allowlist will filter)
         self._schedule_unpaid_pending()
 
-        # Stake gate
         my_stake = float(self.metagraph.stake[self.uid])
         if my_stake < min_stake_alpha:
             pretty.log(f"[yellow]Stake below S_MIN_ALPHA_MINER – not bidding to this validator (epoch {epoch}).[/yellow]")
@@ -596,12 +580,10 @@ class Miner(BaseMinerNeuron, MinerMixins):
             synapse.note = "stake gate"
             return synapse
 
-        # Build bids on received synapse
         out_bids = []
         sent = 0
         rows_sent = []
         for ln in self.lines:
-            # Checks; DO NOT cap by validator budget.
             if not isfinite(ln.alpha) or ln.alpha <= 0:
                 pretty.log(f"[yellow]Invalid alpha {ln.alpha} for subnet {ln.subnet_id} – skipping line.[/yellow]")
                 continue
@@ -609,21 +591,18 @@ class Miner(BaseMinerNeuron, MinerMixins):
                 pretty.log(f"[yellow]Invalid discount {ln.discount_bps} bps – skipping line.[/yellow]")
                 continue
 
-            # Determine the "raw" discount to send (possibly transformed)
             subnet_id = int(ln.subnet_id)
-            weight_bps = weights_bps.get(subnet_id, 10_000)  # default to 1.0 if absent
+            weight_bps = weights_bps.get(subnet_id, 10_000)
 
             if self._bids_raw_discount:
                 send_disc_bps = int(ln.discount_bps)
                 eff_factor_bps = int(round(weight_bps * (1.0 - (send_disc_bps / 10_000.0))))
                 mode_note = "raw"
             else:
-                # ln.discount_bps is interpreted as the EFFECTIVE multiplier (weight * (1 - raw_discount))
                 send_disc_bps = self._compute_raw_discount_bps(ln.discount_bps, weight_bps)
                 eff_factor_bps = int(round(weight_bps * (1.0 - (send_disc_bps / 10_000.0))))
                 mode_note = "effective→raw"
 
-            # Skip duplicates for this validator in this epoch with the *actual* discount we will send
             if self._has_bid(vkey, epoch, subnet_id, ln.alpha, send_disc_bps):
                 continue
 
@@ -642,7 +621,6 @@ class Miner(BaseMinerNeuron, MinerMixins):
             self._remember_bid(vkey, epoch, subnet_id, ln.alpha, send_disc_bps)
             sent += 1
 
-            # Log: show cfg discount, sent (raw) discount, weight, and implied effective factor
             rows_sent.append([
                 subnet_id,
                 f"{ln.alpha:.4f} α",
@@ -674,13 +652,12 @@ class Miner(BaseMinerNeuron, MinerMixins):
         return synapse
 
     async def win_forward(self, synapse: WinSynapse) -> WinSynapse:
-        await self._ensure_async_subtensor()
+        await self._ensure_async_subtensor_singleton()
         self._ensure_payment_config()
 
         uid, caller_hot = self._resolve_caller(synapse)
         vkey = self._validator_key(uid, caller_hot)
 
-        # SECURITY: Use local allowlist only (ignore synapse-provided treasury).
         treasury_ck, _matched_key = self._lookup_local_treasury(caller_hot, vkey)
         if not treasury_ck:
             note = self._allowed_validator_note(caller_hot, vkey)
@@ -698,12 +675,10 @@ class Miner(BaseMinerNeuron, MinerMixins):
             synapse.last_response = note
             return synapse
 
-        # Prefer explicit accepted_alpha if provided (new), fallback to alpha (compat)
         accepted_alpha = float(getattr(synapse, "accepted_alpha", None) or synapse.alpha)
         requested_alpha = float(getattr(synapse, "requested_alpha", None) or accepted_alpha)
         was_partial = bool(getattr(synapse, "was_partially_accepted", accepted_alpha < requested_alpha - 1e-12))
 
-        # IMPORTANT: discount does NOT reduce payment.
         amount_rao = int(round(accepted_alpha * PLANCK))
         epoch_now = int(getattr(self, "epoch_index", 0))
 
@@ -714,7 +689,7 @@ class Miner(BaseMinerNeuron, MinerMixins):
 
         inv = WinInvoice(
             validator_key=vkey,
-            treasury_coldkey=treasury_ck,  # <- pinned local value
+            treasury_coldkey=treasury_ck,
             subnet_id=int(synapse.subnet_id),
             alpha=float(accepted_alpha),
             alpha_requested=float(requested_alpha),
@@ -727,7 +702,6 @@ class Miner(BaseMinerNeuron, MinerMixins):
             epoch_seen=epoch_now,
         )
 
-        # Window-stable invoice identity
         inv.invoice_id = self._make_invoice_id(
             vkey,
             inv.subnet_id,
@@ -739,7 +713,6 @@ class Miner(BaseMinerNeuron, MinerMixins):
             inv.pay_epoch_index,
         )
 
-        # idempotent merge by window identity of the allocation
         for w in self._wins:
             if (
                 w.validator_key == inv.validator_key
@@ -755,7 +728,6 @@ class Miner(BaseMinerNeuron, MinerMixins):
                 w.alpha_requested = inv.alpha_requested
                 w.was_partial = inv.was_partial
                 w.pay_epoch_index = inv.pay_epoch_index or w.pay_epoch_index
-                # SECURITY: ensure treasury is local-pinned even after merge
                 w.treasury_coldkey = treasury_ck
                 inv = w
                 break
@@ -783,12 +755,10 @@ class Miner(BaseMinerNeuron, MinerMixins):
             style="bold green",
         )
 
-        # Schedule payment task (runs on bg loop)
         self._schedule_payment(inv)
         self._status_tables()
 
         synapse.ack = True
-        # Latest known status; actual payment occurs in the task.
         synapse.payment_attempted = inv.pay_attempts > 0
         synapse.payment_ok = inv.paid
         synapse.attempts = inv.pay_attempts
