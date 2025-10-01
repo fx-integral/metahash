@@ -3,48 +3,124 @@ set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-btv-health.sh  —  Summarize Bittensor validator logs by epoch (health + payments)
-
+btv-health.sh — Summarize Bittensor validator logs by epoch (health + payments)
 Usage:
-  report.sh [-n N] [--detailed] [-f LOGFILE]
-  tail -n 5000 validator.log | ./report.sh -n 5 --detailed
+  btv-health.sh [-n N] [--detailed] [-f LOGFILE]
+  btv-health.sh --pm2-index N [--lines K] [-n N] [--detailed]
+  btv-health.sh --pm2-name NAME [--lines K] [-n N] [--detailed]
 
 Options:
-  -n, --epochs N     Number of last epochs to summarize (default: 5)
-  -f, --file FILE    Read logs from FILE (default: STDIN)
-  --detailed         Add a per-epoch detailed report after the summary
-  -h, --help         Show this help
+  -n, --epochs N       Number of last epochs to summarize (default: 5)
+  -f, --file FILE      Read logs from FILE (default: STDIN)
+  --pm2-index N        Resolve PM2 process by index (like "4") and read its logs
+  --pm2-name  NAME     Resolve PM2 process by name and read its logs
+  --lines K            Tail K lines from each PM2 log file (default: 5000)
+  --detailed           Add per-epoch detailed report
+  -h, --help           Show this help
+
+Notes:
+  • Requires 'pm2'. If available, 'jq' improves log path discovery via 'pm2 jlist'.
+  • If both --file and --pm2-* are omitted, reads from STDIN.
 USAGE
 }
 
-# --- args ---
+# --- defaults ---
 N=5
 DETAIL=0
 INPUT="/dev/stdin"
+PM2_IDX=""
+PM2_NAME=""
+LINES=5000
+
+# --- args ---
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -n|--epochs) N="${2:?}"; shift 2 ;;
-    -f|--file) INPUT="${2:?}"; shift 2 ;;
-    --detailed) DETAIL=1; shift ;;
-    -h|--help) usage; exit 0 ;;
+    -f|--file)   INPUT="${2:?}"; shift 2 ;;
+    --pm2-index) PM2_IDX="${2:?}"; shift 2 ;;
+    --pm2-name)  PM2_NAME="${2:?}"; shift 2 ;;
+    --lines)     LINES="${2:?}"; shift 2 ;;
+    --detailed)  DETAIL=1; shift ;;
+    -h|--help)   usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
   esac
 done
 
+# If PM2 mode requested, resolve out/err log paths and create a process substitution for INPUT
+resolve_pm2_logs() {
+  local idx="$1" name="$2" lines="$3"
+  local out="" err=""
+
+  if command -v pm2 >/dev/null 2>&1; then
+    if command -v jq >/dev/null 2>&1; then
+      # Use pm2 jlist (JSON) for robust path discovery
+      if [[ -n "$idx" ]]; then
+        out=$(pm2 jlist | jq -r --argjson i "$idx" '.[] | select(.pm_id == $i) | .pm2_env.pm_out_log_path' | head -n1)
+        err=$(pm2 jlist | jq -r --argjson i "$idx" '.[] | select(.pm_id == $i) | .pm2_env.pm_err_log_path' | head -n1)
+      elif [[ -n "$name" ]]; then
+        out=$(pm2 jlist | jq -r --arg n "$name" '.[] | select(.name == $n) | .pm2_env.pm_out_log_path' | head -n1)
+        err=$(pm2 jlist | jq -r --arg n "$name" '.[] | select(.name == $n) | .pm2_env.pm_err_log_path' | head -n1)
+      fi
+    else
+      # Fallback to common PM2 naming convention
+      local base="${HOME}/.pm2/logs"
+      if [[ -n "$idx" && -n "$name" ]]; then
+        out="${base}/${name}-out-${idx}.log"
+        err="${base}/${name}-error-${idx}.log"
+      elif [[ -n "$idx" ]]; then
+        echo "jq not found; with --pm2-index you should also pass --pm2-name for fallback path pattern." >&2
+        exit 1
+      elif [[ -n "$name" ]]; then
+        # try index 0 as a best-effort default
+        out="${base}/${name}-out-0.log"
+        err="${base}/${name}-error-0.log"
+      fi
+    fi
+  else
+    echo "pm2 is not installed or not in PATH." >&2
+    exit 1
+  fi
+
+  if [[ -z "${out}" || -z "${err}" ]]; then
+    echo "Failed to resolve PM2 log paths (out/err). Check your --pm2-* arguments." >&2
+    exit 1
+  fi
+  if [[ ! -f "$out" && ! -f "$err" ]]; then
+    echo "Neither PM2 out nor err log file exists:
+  out: $out
+  err: $err" >&2
+    exit 1
+  fi
+
+  # Create a FIFO stream merging tails of out+err (order not guaranteed but parser is epoch-robust)
+  # shellcheck disable=SC2031
+  INPUT=$(mktemp)
+  {
+    [[ -f "$out" ]] && tail -n "$lines" -- "$out"
+    [[ -f "$err" ]] && tail -n "$lines" -- "$err"
+  } > "$INPUT"
+}
+
+if [[ -n "$PM2_IDX" || -n "$PM2_NAME" ]]; then
+  resolve_pm2_logs "$PM2_IDX" "$PM2_NAME" "$LINES"
+fi
+
 # Force a stable numeric locale
 export LC_ALL=C
 
+# ---- AWK ANALYZER ----
 awk -v wantN="$N" -v detailed="$DETAIL" '
 function trim(s){ gsub(/^[[:space:]]+|[[:space:]]+$/,"",s); return s }
 function toAlpha(rao){ return rao/1000000000.0 }
-function nz(v, d){ return (v == "" ? d : v) + 0 }  # numeric default
-function nzs(v, d){ return (v == "" ? d : v) }     # string default
+function nz(v, d){ return (v == "" ? d : v) + 0 }
+function nzs(v, d){ return (v == "" ? d : v) }
 
 BEGIN{
   PROCINFO["sorted_in"] = "cmp_num_asc"
   nOrder = 0; set_weights_testing = 0
   current_e = ""; auction_e = ""; budget_e = ""; winners_e = ""; settle_e = ""
-  in_winners = 0; in_budget_block = 0; in_invoices = 0
+  in_winners = in_budget_block = in_invoices = 0
+  warn_low_reach=warn_low_ack=warn_unpaid=warn_burn=warn_incons=0
 }
 
 function add_epoch(e){
@@ -52,6 +128,8 @@ function add_epoch(e){
   if(!(e in seen_e)){ seen_e[e]=1; order[++nOrder]=e }
   current_e=e
 }
+
+# --- (all your existing regex sections unchanged; paste your analyzer here) ---
 
 # ---- EPOCH DETECTION ----
 /\[epoch[[:space:]]+[0-9]+/ { if(match($0,/\[epoch[[:space:]]+([0-9]+)/,m)) add_epoch(m[1]) }
@@ -83,7 +161,7 @@ $0 ~ /acks_received:[[:space:]]*[0-9]+\/[0-9]+/ {
 /Budget \(VALUE.*base subnet/ { in_budget_block=1 }
 in_budget_block && $0 ~ /epoch:[[:space:]]*[0-9]+/ { if(match($0,/epoch:[[:space:]]*([0-9]+)/,m)){ budget_e=m[1]; add_epoch(budget_e) } }
 in_budget_block && $0 ~ /base_price_tao\/α:[[:space:]]*[0-9.]+/ { if(budget_e!="" && match($0,/base_price_tao\/α:[[:space:]]*([0-9.]+)/,m)) base_price[budget_e]=m[1] }
-in_budget_block && $0 ~ /my_budget_tao \(VALUE\):[[:space:]]*[0-9.]+/ { if(budget_e!="" && match($0,/my_budget_tao \(VALUE\):[[:space:]]*([0-9.]+)/,m)) my_budget[budget_e]=m[1] }
+in_budget_block && $0 ~ /my_budget_tao \(VALUE\):[[:space:]]*[0-9.]+/ { if(budget_e!="" && match($0,/my_budget_tao \(VALUE\):[[:space:]]*([0-9]+)/,m)) my_budget[budget_e]=m[1] }
 in_budget_block && ($0 ~ /^╰/ || $0 ~ /^$/ || $0 ~ /Connecting to Substrate/) { in_budget_block=0 }
 
 /Budget leftover .* after allocation:/ { if(match($0,/Budget leftover .*: ([0-9.]+)/,m)){ e=(budget_e!=""?budget_e:current_e); budget_leftover[e]=m[1] } }
@@ -98,7 +176,7 @@ in_winners {
 # ---- EARLY CLEAR ----
 /Early Clear & Notify .*epoch e/ { }
 $0 ~ /winners:[[:space:]]*[0-9]+/ { if(match($0,/winners:[[:space:]]*([0-9]+)/,m)){ e=(budget_e!=""?budget_e:(auction_e!=""?auction_e:current_e)); early_winners[e]=m[1] } }
-$0 ~ /win_acks:[[:space:]]*[0-9]+\/[0-9]+/ {
+$0 ~ /win_acks:[[:space:]]*([0-9]+)\/([0-9]+)/ {
   if(match($0,/win_acks:[[:space:]]*([0-9]+)\/([0-9]+)/,m)){ e=(budget_e!=""?budget_e:(auction_e!=""?auction_e:current_e)); winacks_recv[e]+=m[1]; winacks_total[e]+=m[2] }
 }
 
@@ -178,7 +256,7 @@ $0 ~ /burn_deficit .*:[[:space:]]*[0-9.]+/          { if(settle_e!="" && match($
 
 # ---- ERRORS ----
 /Cannot connect to host/ { e=(auction_e!=""?auction_e:(budget_e!=""?budget_e:current_e)); conn_err_total++; if(e!="") conn_err[e]++ }
-/TimeoutError#/ { e=(auction_e!=""?auction_e:(budget_e!=""?budget_e:current_e)); timeout_total++; if(e!="") timeouts[e]++ }
+/TimeoutError#/          { e=(auction_e!=""?auction_e:(budget_e!=""?budget_e:current_e)); timeout_total++; if(e!="") timeouts[e]++ }
 
 END{
   if(nOrder==0){ print "No epochs found in input."; exit 1 }
@@ -254,10 +332,8 @@ END{
   reach_rate  = (agg_reach_den>0    ? 100.0*agg_reach_sum/agg_reach_den : 0)
   budget_used = (agg_budget>0       ? 100.0*(agg_budget-agg_leftover)/agg_budget : 0)
 
-  value_shortfall = mat_value_expected - mat_value_credited
-  if(value_shortfall<0) value_shortfall=0
-  alpha_shortfall_rao = mat_alpha_expected_rao - mat_alpha_paid_rao
-  if(alpha_shortfall_rao<0) alpha_shortfall_rao=0
+  value_shortfall = mat_value_expected - mat_value_credited; if(value_shortfall<0) value_shortfall=0
+  alpha_shortfall_rao = mat_alpha_expected_rao - mat_alpha_paid_rao; if(alpha_shortfall_rao<0) alpha_shortfall_rao=0
 
   fmt="%-34s %s\n"
   line="--------------------------------------------------------------------"
@@ -270,9 +346,7 @@ END{
   printf(fmt, "Settlements completed:", sprintf("%d (%.1f%%)", agg_settled, (agg_epochs>0?100.0*agg_settled/agg_epochs:0)))
 
   printf(fmt, "Epochs with winners:", sprintf("%d / %d", agg_winner_epochs, agg_epochs))
-  printf(fmt, "Accepted winners (rows):", agg_winners)
   printf(fmt, "TAO spent (winners VALUE):", sprintf("%.6f", agg_value))
-
   printf(fmt, "Budget (my total TAO):", sprintf("%.6f", agg_budget))
   printf(fmt, "Budget leftover (TAO):", sprintf("%.6f", agg_leftover))
   printf(fmt, "Budget usage (est.):", sprintf("%.2f%%", budget_used))
@@ -292,11 +366,31 @@ END{
   printf(fmt, "Unpaid/partial invoices:", sprintf("%d epochs with unpaid: %d", mat_unpaid_invoices, epochs_with_unpaid))
   printf("%s\n", line)
 
+  # --- Sanity warnings ---
+  if(agg_reach_den>0 && reach_rate < 20.0){ print "WARN: Low axon reachability (<20%). Network supply likely constrained."; warn_low_reach=1 }
+  if(agg_ack_total>0 && ack_rate < 20.0){ print "WARN: Low auction ACK rate (<20%). Miners may be unresponsive."; warn_low_ack=1 }
+  if(alpha_shortfall_rao > 0){ print "WARN: Unpaid α detected in settled epochs. Some winners likely failed strict payment gate."; warn_unpaid=1 }
+  # If burn_deficit exists and large vs target
+  total_burn=0; total_target=0
+  for(j=1;j<=lastCnt;j++){ e=last[j]; total_burn += nz(burn_deficit[e],0); total_target += nz(target_budget[e],0) }
+  if(total_burn>0 && total_target>0 && (100.0*total_burn/total_target)>50.0){ print "WARN: Large burn deficit (>50% of target). Weights will skew to UID0."; warn_burn=1 }
+
+  # Optional: print unpaid list (per epoch) if detailed not requested but unpaid occurred
+  if(!detailed && alpha_shortfall_rao>0){
+    print "Unpaid miners by epoch (short list):"
+    for(k in unpaid_ck){
+      split(k,K,SUBSEP); ek=K[1]; ck=K[2]
+      printf("  e=%s  %s  short=%.4f α\n", ek, ck, toAlpha(unpaid_ck[k]))
+    }
+    print line
+  }
+
   if(!detailed) exit 0
 
   print "DETAILED EPOCH REPORT"
   print line
 
+  # --- (your existing detailed epoch block unchanged) ---
   for(jj=lastCnt; jj>=1; jj--){
     e=last[jj]
     printf("Epoch %s\n", e)
