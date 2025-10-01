@@ -22,7 +22,7 @@ class CommitmentsEngine:
     """
     Publish commitments with a single, strict behavior:
 
-      • Store the full winners payload in IPFS.
+      • Store the full winners payload in IPFS (now includes bids/reputation/jails/weights snapshots).
       • Store a tiny, CID-only v4 object on-chain: {"v":4,"e":<e>,"pe":<e+1>,"c":"<cid>"}
       • Publish ONLY a specifically requested epoch (no global catch-up).
     """
@@ -64,6 +64,11 @@ class CommitmentsEngine:
                 sort_keys=True,  # deterministic canonicalization for hash stability
             )
             preview_inv = payload.get("inv") or payload.get("i")
+            has_bids = bool(payload.get("b") or payload.get("bids"))
+            has_rej = bool(payload.get("rj"))
+            has_rep = bool(payload.get("rep"))
+            has_jail = bool(payload.get("jail"))
+            has_wbps = bool(payload.get("wbps") or payload.get("weights_bps"))
             pretty.kv_panel(
                 "Commit Payload (preview)",
                 [
@@ -72,6 +77,11 @@ class CommitmentsEngine:
                     ("as", payload.get("as")),
                     ("de", payload.get("de")),
                     ("has_inv", str(bool(preview_inv)).lower()),
+                    ("has_bids", str(has_bids).lower()),
+                    ("has_rejected", str(has_rej).lower()),
+                    ("has_rep", str(has_rep).lower()),
+                    ("has_jail", str(has_jail).lower()),
+                    ("has_weights", str(has_wbps).lower()),
                 ],
                 style="bold cyan",
             )
