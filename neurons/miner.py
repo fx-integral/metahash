@@ -94,8 +94,6 @@ class Miner(BaseMinerNeuron):
             style="bold magenta",
         )
 
-      
-
         # Eager schedule unpaid invoices + watchdog
         try:
             self.payments.ensure_payment_config()
