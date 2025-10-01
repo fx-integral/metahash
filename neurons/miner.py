@@ -35,8 +35,19 @@ class Miner(BaseMinerNeuron, MinerMixins):
         )
         self._bg_thread.start()
 
-        # Persistent state
-        self._state_file = Path("miner_state.json")
+        # ---------------------- PER-COLDKEY STATE SCOPING ----------------------
+        # Persist all miner state in a coldkey-specific folder so multiple coldkeys
+        # can run safely on the same server/workdir.
+        self._coldkey_ss58: str = getattr(getattr(self.wallet, "coldkey", None), "ss58_address", "") or "unknown_coldkey"
+        self._state_dir: Path = Path("miner_state") / self._coldkey_ss58
+        try:
+            self._state_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            # Fall back to current directory on failure (still per-coldkey filename).
+            self._state_dir = Path(".")
+        self._state_file = self._state_dir / "miner_state.json"
+
+        # Persistent state (in-memory; will be loaded/saved via _state_file)
         self._treasuries: Dict[str, str] = {}  # pinned allowlist
         self._already_bid: Dict[str, List[Tuple[int, int, float, int]]] = {}
         self._wins: List[WinInvoice] = []
@@ -55,7 +66,9 @@ class Miner(BaseMinerNeuron, MinerMixins):
         # Optional fresh start
         if getattr(self.config, "fresh", False):
             self._wipe_state()
-            pretty.log("[magenta]Fresh start requested: cleared local miner state.[/magenta]")
+            pretty.log(
+                f"[magenta]Fresh start requested: cleared local miner state for coldkey {self._coldkey_ss58}.[/magenta]"
+            )
 
         # Load persisted state and re-pin treasuries
         self._load_state_file()
@@ -66,7 +79,16 @@ class Miner(BaseMinerNeuron, MinerMixins):
 
         pretty.banner(
             "Miner started",
-            f"uid={self.uid} | hotkey={self.wallet.hotkey.ss58_address} | lines={len(self.lines)} | epoch(e)={getattr(self, 'epoch_index', 0)}",
+            (
+                f"uid={self.uid} | coldkey={self._coldkey_ss58} | "
+                f"hotkey={self.wallet.hotkey.ss58_address} | lines={len(self.lines)} | "
+                f"epoch(e)={getattr(self, 'epoch_index', 0)}"
+            ),
+            style="bold magenta",
+        )
+        pretty.kv_panel(
+            "[magenta]State scope[/magenta]",
+            [("state_dir", str(self._state_dir)), ("state_file", str(self._state_file.name))],
             style="bold magenta",
         )
         self._log_cfg_summary()
@@ -154,14 +176,12 @@ class Miner(BaseMinerNeuron, MinerMixins):
 
             try:
                 attr = getattr(st, name)  # may be callable, awaitable, or concrete
-                # If callable (method), call it; otherwise await the attribute itself if awaitable.
                 res = attr() if callable(attr) else attr
                 res = await self._await_maybe(res)
                 val = int(res)
                 if val > 0:
                     return val
             except Exception:
-                # Try next name
                 continue
 
         # Fallback (approximate)
@@ -538,6 +558,66 @@ class Miner(BaseMinerNeuron, MinerMixins):
             raw = 1.0
         return int(round(raw * 10_000))
 
+    # ---------------------- stake helpers (validator pair) ----------------------
+
+    @staticmethod
+    def _balance_to_alpha(bal: Optional[bt.Balance]) -> float:
+        """Convert a bt.Balance to α (float). Robust to differing Balance APIs."""
+        try:
+            if bal is None:
+                return 0.0
+            rao = getattr(bal, "rao", None)
+            if isinstance(rao, int):
+                return float(rao) / float(PLANCK)
+            val = getattr(bal, "value", None)
+            if isinstance(val, int):
+                return float(val) / float(PLANCK)
+            v = float(bal)
+            return v if isfinite(v) else 0.0
+        except Exception:
+            return 0.0
+
+    async def _get_validator_stakes_map(
+        self,
+        validator_hotkey_ss58: Optional[str],
+        subnet_ids: List[int],
+    ) -> Dict[int, float]:
+        """
+        Returns per-subnet α that THIS miner's coldkey has delegated to the given validator hotkey.
+        Missing/failed lookups resolve to 0.0 for safety.
+        """
+        await self._ensure_async_subtensor_singleton()
+        st = self._async_subtensor
+        if st is None or not validator_hotkey_ss58:
+            return {int(s): 0.0 for s in subnet_ids}
+
+        try:
+            cold_ss58 = self.wallet.coldkey.ss58_address
+        except Exception:
+            cold_ss58 = None
+        if not cold_ss58:
+            return {int(s): 0.0 for s in subnet_ids}
+
+        unique_ids = list(dict.fromkeys(int(s) for s in subnet_ids))
+        coros = [
+            st.get_stake(
+                coldkey_ss58=cold_ss58,
+                hotkey_ss58=validator_hotkey_ss58,
+                netuid=int(sid),
+                reuse_block=True,
+            )
+            for sid in unique_ids
+        ]
+        results = await asyncio.gather(*coros, return_exceptions=True)
+
+        out: Dict[int, float] = {}
+        for sid, res in zip(unique_ids, results):
+            if isinstance(res, Exception):
+                out[int(sid)] = 0.0
+            else:
+                out[int(sid)] = self._balance_to_alpha(res)
+        return out
+
     # ---------------------- auction handlers ----------------------
 
     async def auctionstart_forward(self, synapse: AuctionStartSynapse) -> AuctionStartSynapse:
@@ -611,6 +691,30 @@ class Miner(BaseMinerNeuron, MinerMixins):
             synapse.note = "stake gate"
             return synapse
 
+        # ---------- Fetch available stake with this validator per subnet ----------
+        validator_hot_ss58 = caller_hot or vkey
+        candidate_subnets: List[int] = []
+        for ln in self.lines:
+            try:
+                if isfinite(ln.alpha) and ln.alpha > 0 and 0 <= int(ln.discount_bps) <= 10_000:
+                    candidate_subnets.append(int(ln.subnet_id))
+            except Exception:
+                continue
+
+        stake_by_subnet: Dict[int, float] = {}
+        if candidate_subnets and validator_hot_ss58:
+            try:
+                stake_by_subnet = await self._get_validator_stakes_map(validator_hot_ss58, candidate_subnets)
+                rows = [[sid, f"{amt:.4f} α"] for sid, amt in sorted(stake_by_subnet.items())]
+                if rows:
+                    pretty.table("[blue]Available stake with validator (per subnet)[/blue]", ["Subnet", "α available"], rows)
+            except Exception as _e:
+                stake_by_subnet = {int(s): 0.0 for s in candidate_subnets}
+                pretty.log(f"[yellow]Stake check failed; defaulting to 0 availability.[/yellow] {_e}")
+
+        # Track remaining stake per subnet across multiple lines to prevent oversubscription
+        remaining_by_subnet: Dict[int, float] = dict(stake_by_subnet)
+
         out_bids = []
         sent = 0
         rows_sent = []
@@ -625,6 +729,32 @@ class Miner(BaseMinerNeuron, MinerMixins):
             subnet_id = int(ln.subnet_id)
             weight_bps = weights_bps.get(subnet_id, 10_000)
 
+            available = float(remaining_by_subnet.get(subnet_id, 0.0))
+            if available <= 0.0:
+                pretty.kv_panel(
+                    "[red]Bid skipped – insufficient delegated stake with validator[/red]",
+                    [("subnet", subnet_id), ("cfg α", f"{ln.alpha:.4f}"), ("available α", f"{available:.4f}")],
+                    style="bold red",
+                )
+                continue
+
+            send_alpha = float(ln.alpha)
+            if send_alpha > available:
+                send_alpha = available
+                pretty.kv_panel(
+                    "[yellow]Partial bid (limited by available stake)[/yellow]",
+                    [("subnet", subnet_id), ("cfg α", f"{ln.alpha:.4f}"), ("send α", f"{send_alpha:.4f}"), ("remaining before", f"{available:.4f}")],
+                    style="bold yellow",
+                )
+
+            # Decrement remaining to avoid double-allocating across lines for the same subnet
+            remaining_by_subnet[subnet_id] = max(0.0, available - send_alpha)
+
+            # Budget notice (uses the amount to be sent)
+            if budget_alpha > 0 and send_alpha > budget_alpha:
+                pretty.log(f"[grey58]Note:[/grey58] line α {send_alpha:.4f} exceeds validator budget α {budget_alpha:.4f}; may be partially filled.")
+
+            # Compute discount to send
             if self._bids_raw_discount:
                 send_disc_bps = int(ln.discount_bps)
                 eff_factor_bps = int(round(weight_bps * (1.0 - (send_disc_bps / 10_000.0))))
@@ -634,24 +764,29 @@ class Miner(BaseMinerNeuron, MinerMixins):
                 eff_factor_bps = int(round(weight_bps * (1.0 - (send_disc_bps / 10_000.0))))
                 mode_note = "effective→raw"
 
-            if self._has_bid(vkey, epoch, subnet_id, ln.alpha, send_disc_bps):
+            # Skip if identical bid already recorded
+            if self._has_bid(vkey, epoch, subnet_id, send_alpha, send_disc_bps):
                 continue
 
-            if budget_alpha > 0 and ln.alpha > budget_alpha:
-                pretty.log(f"[grey58]Note:[/grey58] line α {ln.alpha:.4f} exceeds validator budget α {budget_alpha:.4f}; may be partially filled.")
-
-            bid_id = self._make_bid_id(vkey, epoch, subnet_id, ln.alpha, send_disc_bps)
-            out_bids.append({"subnet_id": subnet_id, "alpha": float(ln.alpha), "discount_bps": int(send_disc_bps), "bid_id": bid_id})
-            self._remember_bid(vkey, epoch, subnet_id, ln.alpha, send_disc_bps)
+            bid_id = self._make_bid_id(vkey, epoch, subnet_id, send_alpha, send_disc_bps)
+            out_bids.append({"subnet_id": subnet_id, "alpha": float(send_alpha), "discount_bps": int(send_disc_bps), "bid_id": bid_id})
+            self._remember_bid(vkey, epoch, subnet_id, send_alpha, send_disc_bps)
             sent += 1
 
             rows_sent.append([
-                subnet_id, f"{ln.alpha:.4f} α", f"{ln.discount_bps} bps" + (" (cfg)" if not self._bids_raw_discount else ""),
-                f"{send_disc_bps} bps", f"{weight_bps} w_bps", f"{eff_factor_bps} eff_bps", bid_id, epoch, mode_note
+                subnet_id,
+                f"{send_alpha:.4f} α",
+                f"{ln.discount_bps} bps" + (" (cfg)" if not self._bids_raw_discount else ""),
+                f"{send_disc_bps} bps",
+                f"{weight_bps} w_bps",
+                f"{eff_factor_bps} eff_bps",
+                bid_id,
+                epoch,
+                mode_note
             ])
 
         if sent == 0:
-            pretty.log("[grey]No bids were added (all lines either invalid or already added).[/grey]")
+            pretty.log("[grey]No bids were added (invalid/duplicate/insufficient stake).[/grey]")
         else:
             pretty.table(
                 "[yellow]Bids Sent[/yellow]",
