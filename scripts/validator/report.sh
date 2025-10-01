@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
 # btv-health.sh — Validator health + bids/winners/reputation report
 # Works on mawk (Debian /usr/bin/awk) and gawk.
-# Usage examples:
+# Usage:
 #   ./scripts/validator/report.sh --pm2-index 4 --lines 8000 -n 5 --detailed
-#   ./scripts/validator/report.sh --pm2-name validator-v3 --lines 12000 -n 10
-#   tail -n 5000 validator.log | ./scripts/validator/report.sh -n 5 --detailed
 set -euo pipefail
 
 usage() {
@@ -105,9 +103,10 @@ function nz(v, d){ return (v == "" ? d : v) + 0 }
 function nzs(v, d){ return (v == "" ? d : v) }
 function key(e,i){ return e SUBSEP i }
 function kck(e,ck){ return e SUBSEP ck }
+function is_num(x){ return x ~ /^-?[0-9]+(\.[0-9]+)?$/ }
 
 BEGIN{
-  # No PROCINFO["sorted_in"] — works on mawk/gawk
+  # No PROCINFO["sorted_in"] — mawk/gawk compatible
   nOrder=0
   current_e=""; auction_e=""; budget_e=""; winners_e=""; settle_e=""
   in_budget_block=0; in_winners=0; in_invoices=0
@@ -157,12 +156,20 @@ in_budget_block && ($0 ~ /^╰/ || $0 ~ /^$/ || $0 ~ /Connecting to Substrate/) 
 # ---- Bids — ordered by VALUE (TAO) ----
 /^.*Bids[[:space:]]*[—-].*VALUE.*TAO/ { in_bids=1; bids_e=(budget_e!=""?budget_e:(auction_e!=""?auction_e:current_e)); add_epoch(bids_e); next }
 in_bids {
-  # Only capture proper bid rows: must include VALUE ... TAO and start with numeric UID
-  if(index($0,"TAO")>0 && $0 ~ /^[[:space:]]*[0-9]+[[:space:]]*│/ && $0 !~ /UID[[:space:]]*│/){
+  # Parse row; then sanity-filter out junk (wrapped lines etc)
+  if($0 ~ /^[[:space:]]*[0-9]+[[:space:]]*│/ && $0 !~ /UID[[:space:]]*│/){
     n=split($0,col,/│/)
+    if(n<9) next
     uid=trim(col[1]); ck=trim(col[2]); sid=trim(col[3]); wbps=trim(col[4]); disc=trim(col[5])
     bida=trim(col[6]); price=trim(col[7]); depth=trim(col[8]); val=trim(col[9])
-    gsub(/[^0-9.]/,"",bida); gsub(/[^0-9.]/,"",price); gsub(/[^0-9.]/,"",val)
+    gsub(/[^0-9.\-]/,"",bida); gsub(/[^0-9.\-]/,"",price); gsub(/[^0-9.\-]/,"",val)
+    # Sanity: numeric uid/sid; price <= 1; value <= 10; bid α > 0
+    if(!(uid ~ /^[0-9]+$/)) next
+    if(!(sid ~ /^[0-9]+$/)) next
+    if(!is_num(bida) || !is_num(price) || !is_num(val)) next
+    if((bida+0) <= 0) next
+    if((price+0) > 1.0) next
+    if((val+0) > 10.0) next
     bcount[bids_e]++; i=bcount[bids_e]
     bids_uid[key(bids_e,i)]=uid
     bids_ck[key(bids_e,i)]=ck
@@ -179,11 +186,14 @@ in_bids {
 # ---- Reputation caps (TAO, per coldkey) ----
 /^.*Reputation caps.*\(TAO.*per coldkey\)/ { in_rep=1; rep_e=(budget_e!=""?budget_e:current_e); add_epoch(rep_e); next }
 in_rep {
-  # Caps lines include the TAO unit
+  # Keep only plausible coldkeys (start with 5 or contain ellipsis) AND have TAO unit
   if(index($0,"TAO")>0 && $0 ~ /│/ && $0 !~ /Coldkey/){
     n=split($0,col,/│/)
     ck=trim(col[1]); q=trim(col[2]); cap=trim(col[3])
-    gsub(/[^0-9.]/,"",q); gsub(/[^0-9.]/,"",cap)
+    if(!(ck ~ /^5/ || index(ck,"…")>0)) next
+    if(ck=="UID") next
+    gsub(/[^0-9.\-]/,"",q); gsub(/[^0-9.\-]/,"",cap)
+    if(!is_num(q) || !is_num(cap)) next
     rep_q[kck(rep_e,ck)]=q+0
     rep_cap[kck(rep_e,ck)]=cap+0
     rep_seen[rep_e]=1
@@ -194,13 +204,19 @@ in_rep {
 # ---- Winners — acceptances ----
 /^.*Winners.*acceptances/ { in_winners=1; winners_e=(budget_e!=""?budget_e:(auction_e!=""?auction_e:current_e)); add_epoch(winners_e); next }
 in_winners {
-  # Winner rows also show VALUE ... TAO
-  if(index($0,"TAO")>0 && $0 ~ /^[[:space:]]*[0-9]+[[:space:]]*│/ && $0 !~ /UID[[:space:]]*│/){
+  # Parse row; sanity-filter out junk
+  if($0 ~ /^[[:space:]]*[0-9]+[[:space:]]*│/ && $0 !~ /UID[[:space:]]*│/){
     n=split($0,col,/│/)
+    if(n<9) next
     uid=trim(col[1]); ck=trim(col[2]); sid=trim(col[3])
     reqa=trim(col[4]); acca=trim(col[5]); disc=trim(col[6])
     wbps=trim(col[7]); val=trim(col[8]); fill=trim(col[9])
-    gsub(/[^0-9.]/,"",reqa); gsub(/[^0-9.]/,"",acca); gsub(/[^0-9.]/,"",val)
+    gsub(/[^0-9.\-]/,"",reqa); gsub(/[^0-9.\-]/,"",acca); gsub(/[^0-9.\-]/,"",val)
+    if(!(uid ~ /^[0-9]+$/)) next
+    if(!(sid ~ /^[0-9]+$/)) next
+    if(!is_num(reqa) || !is_num(acca) || !is_num(val)) next
+    if((reqa+0) <= 0) next
+    if((val+0) > 10.0) next
     wcount[winners_e]++; i=wcount[winners_e]
     win_uid[key(winners_e,i)]=uid
     win_ck[key(winners_e,i)]=ck
