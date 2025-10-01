@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
-# neurons/miner.py — Event-driven bidder v2.8.2
+# neurons/miner.py — Event-driven bidder v2.8.3
+# - Dedicated background asyncio loop (daemon thread) for safe scheduling from __init__
+# - Eager scheduling of unpaid invoices on startup
+# - No deprecated asyncio.get_event_loop() usage
+# - Per-invoice payment workers with retry & window-safety
 
+from __future__ import annotations
 
 import asyncio
 import time
+import threading
 from math import isfinite
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
@@ -30,6 +36,16 @@ class Miner(BaseMinerNeuron, MinerMixins):
     def __init__(self, config=None):
         super().__init__(config=config)
 
+        # --- Background asyncio loop (always running) -------------------------
+        # Allows scheduling coroutines immediately from __init__ or any thread.
+        self._bg_loop: asyncio.AbstractEventLoop = asyncio.new_event_loop()
+        self._bg_thread = threading.Thread(
+            target=self._run_bg_loop,
+            name="miner-bg-loop",
+            daemon=True,
+        )
+        self._bg_thread.start()
+
         # Local persistent state
         self._state_file = Path("miner_state.json")
 
@@ -47,11 +63,11 @@ class Miner(BaseMinerNeuron, MinerMixins):
         self._pay_lock: asyncio.Lock = asyncio.Lock()    # prevent concurrent tx on-chain
         self._state_lock: asyncio.Lock = asyncio.Lock()  # serialize state writes
 
-        # Async subtensor bound to axon loop
+        # Async subtensor bound to axon loop (created lazily by workers)
         self._async_subtensor: Optional[bt.AsyncSubtensor] = None
 
-        # Per-invoice tasks (no global daemon)
-        self._payment_tasks: Dict[str, asyncio.Task] = {}
+        # Per-invoice tasks (stored as concurrent.futures.Futures from run_coroutine_threadsafe)
+        self._payment_tasks: Dict[str, "concurrent.futures.Future"] = {}
 
         # Discount mode: default False (use effective-discount transformation)
         # Will be finalized by _build_lines_from_config()
@@ -92,7 +108,7 @@ class Miner(BaseMinerNeuron, MinerMixins):
         self._retry_every_blocks: int = 2
         self._retry_max_attempts: int = 12
 
-        # === EAGER scheduling of unpaid invoices (immediate, sync path) ===
+        # === EAGER scheduling of unpaid invoices (immediate, now safe) ===
         try:
             self._ensure_payment_config()
             # Ensure we can pay as soon as possible (async subtensor will be made by workers)
@@ -105,19 +121,29 @@ class Miner(BaseMinerNeuron, MinerMixins):
         self._safe_create_task(self._resume_pending_payments(), name="resume_pending_payments")
         self._safe_create_task(self._pending_payments_watchdog(), name="payments_watchdog")
 
-    # ---------------------- small task helpers ----------------------
+    # ---------------------- background loop helpers ----------------------
+
+    def _run_bg_loop(self):
+        """Target for the daemon thread: run a dedicated asyncio loop forever."""
+        asyncio.set_event_loop(self._bg_loop)
+        self._bg_loop.run_forever()
+
+    def _submit(self, coro) -> "concurrent.futures.Future":
+        """
+        Thread-safe submission of a coroutine to our background loop.
+        Returns a concurrent.futures.Future (not an asyncio.Task).
+        """
+        import concurrent.futures
+        if not asyncio.iscoroutine(coro):
+            raise TypeError("Expected coroutine in _submit()")
+        return asyncio.run_coroutine_threadsafe(coro, self._bg_loop)
 
     def _safe_create_task(self, coro, *, name: Optional[str] = None):
-        """
-        Schedule `coro` even if we're still starting up and no event loop exists yet.
-        Avoids deprecated get_event_loop() warning and guarantees task creation.
-        """
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        loop.call_soon(loop.create_task, coro, name=name)
+        """Schedule `coro` onto the dedicated background loop."""
+        # `name` is ignored here; could be used with a small wrapper if desired.
+        self._submit(coro)
+
+    # ---------------------- startup tasks ----------------------
 
     async def _resume_pending_payments(self):
         """Run once at startup to (re)schedule unpaid invoices again (harmless if already scheduled)."""
@@ -269,15 +295,16 @@ class Miner(BaseMinerNeuron, MinerMixins):
         if inv.paid:
             return
         t = self._payment_tasks.get(inv.invoice_id)
+        # t is a concurrent.futures.Future
         if t and not t.done():
             return  # already scheduled
 
         # Update UX immediately
         inv.last_response = f"scheduled (wait ≥{self._pay_start_safety_blocks} blk)"
-        asyncio.create_task(self._async_save_state())
+        self._submit(self._async_save_state())
 
-        task = asyncio.create_task(self._payment_worker(inv), name=f"pay_{inv.invoice_id}")
-        self._payment_tasks[inv.invoice_id] = task
+        fut = self._submit(self._payment_worker(inv))
+        self._payment_tasks[inv.invoice_id] = fut
 
         pretty.kv_panel(
             "[cyan]Payment scheduled[/cyan]",
@@ -420,7 +447,7 @@ class Miner(BaseMinerNeuron, MinerMixins):
                     break
 
                 # Sleep until next retry
-                await asyncio.sleep(max(0.5, float(self._retry_every_blocks) * float(BLOCKTIME)))
+                await asyncio.sleep(max(0.5, float(BLOCKTIME) * float(self._retry_every_blocks)))
 
         except asyncio.CancelledError:
             inv.last_response = "cancelled"
@@ -437,9 +464,12 @@ class Miner(BaseMinerNeuron, MinerMixins):
             )
             return
         finally:
-            # cleanup finished/cancelled task
+            # cleanup finished/cancelled future
             t = self._payment_tasks.get(inv.invoice_id)
-            if t and t.done():
+            try:
+                if t and t.done():
+                    self._payment_tasks.pop(inv.invoice_id, None)
+            except Exception:
                 self._payment_tasks.pop(inv.invoice_id, None)
 
     def _schedule_unpaid_pending(self):
@@ -505,7 +535,7 @@ class Miner(BaseMinerNeuron, MinerMixins):
         epoch = int(synapse.epoch_index)
 
         # SECURITY: Never trust synapse.treasury_coldkey. We only use local allowlist.
-        treasury_ck, matched_key = self._lookup_local_treasury(caller_hot, vkey)
+        treasury_ck, _matched_key = self._lookup_local_treasury(caller_hot, vkey)
         if not treasury_ck:
             # Do not bid for unknown validators
             note = self._allowed_validator_note(caller_hot, vkey)
@@ -656,7 +686,7 @@ class Miner(BaseMinerNeuron, MinerMixins):
         vkey = self._validator_key(uid, caller_hot)
 
         # SECURITY: Use local allowlist only (ignore synapse-provided treasury).
-        treasury_ck, matched_key = self._lookup_local_treasury(caller_hot, vkey)
+        treasury_ck, _matched_key = self._lookup_local_treasury(caller_hot, vkey)
         if not treasury_ck:
             note = self._allowed_validator_note(caller_hot, vkey)
             pretty.kv_panel(
@@ -758,7 +788,7 @@ class Miner(BaseMinerNeuron, MinerMixins):
             style="bold green",
         )
 
-        # Schedule payment task (no daemon)
+        # Schedule payment task (runs on bg loop)
         self._schedule_payment(inv)
         self._status_tables()
 
