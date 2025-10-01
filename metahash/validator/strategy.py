@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from collections import defaultdict
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import bittensor as bt
 
@@ -13,7 +13,7 @@ except ImportError:
     yaml = None
 
 
-def load_subnet_weights(path: str | Path = "weights.yml") -> tuple[defaultdict[int, float], float]:
+def load_subnet_weights(path: str | Path = "weights.yml") -> Tuple[defaultdict[int, float], float]:
     """
     Load subnet weights from a YAML file with shape:
 
@@ -24,12 +24,11 @@ def load_subnet_weights(path: str | Path = "weights.yml") -> tuple[defaultdict[i
 
     Rules:
       - Keys are subnet IDs (ints).
-      - Values are floats (0.0 = off, 1.0 = on, or any positive float).
-      - 'default' (optional): sets the fallback value for subnets not listed.
-      - If 'default' is not provided, fallback is 1.0.
+      - Values are floats >= 0.0 (0.0 = off; can exceed 1.0 to upweight).
+      - 'default' (optional): fallback for subnets not listed; defaults to 1.0.
 
     Returns:
-      (weights mapping, default_value)
+      (weights mapping (defaultdict), default_value)
     """
     p = Path(path)
     if not p.exists():
@@ -46,7 +45,6 @@ def load_subnet_weights(path: str | Path = "weights.yml") -> tuple[defaultdict[i
             bt.logging.error(f"[strategy] {p} must be a mapping; using all=1.0.")
             return defaultdict(lambda: 1.0), 1.0
 
-        # Extract default value
         default_val = 1.0
         if "default" in raw:
             try:
@@ -75,11 +73,16 @@ def load_subnet_weights(path: str | Path = "weights.yml") -> tuple[defaultdict[i
 
 class Strategy:
     """
-    Strategy wrapper that auto-reloads YAML on change.
-    Allows a 'default' key in the YAML to override the fallback value.
+    Subnet weighting strategy that hot‑reloads YAML on change.
+
+    Exposes:
+      • weight_for(netuid) -> float
+      • compute_weights_bps(...) -> Dict[int, int]  # subnet_id -> 0..10_000
+      • default_value -> float
     """
 
-    def __init__(self, path: str | Path = "weights.yml"):
+    def __init__(self, path: str | Path = "weights.yml", algorithm_path: str | None = None):
+        # algorithm_path is accepted for compatibility; not used here.
         self.path = Path(path)
         self._weights, self._default_val = load_subnet_weights(self.path)
         self._mtime: Optional[float] = self._get_mtime()
@@ -98,16 +101,34 @@ class Strategy:
             bt.logging.info(f"[strategy] reloaded: {self.path} (mtime={mtime})")
 
     def weight_for(self, netuid: int) -> float:
-        """
-        Returns the weight (float) for a given subnet.
-        Defaults to the 'default' in YAML, or 1.0 if none is provided.
-        """
+        """Return the current float weight for a given subnet id (>=0)."""
         self._reload_if_changed()
         try:
             nid = int(netuid)
         except Exception:
             nid = netuid
         return float(self._weights[nid])
+
+    def compute_weights_bps(self, *, netuid: int | None = None, metagraph=None, active_uids=None) -> Dict[int, int]:
+        """
+        Compute subnet weights in basis points (0..10_000) from YAML.
+
+        Notes:
+          - We only emit explicit mappings found in YAML (plus any
+            subnets that have a non-default explicitly listed).
+          - Consumers may use `default_value` separately as a fallback.
+        """
+        self._reload_if_changed()
+        out: Dict[int, int] = {}
+        # Materialize all explicitly defined keys in the table (including those equal to default)
+        # so operators can see them in diagnostics.
+        for sid, fval in self._weights.items():
+            try:
+                bp = int(round(max(0.0, float(fval)) * 10_000.0))
+            except Exception:
+                bp = 0
+            out[int(sid)] = max(0, min(10_000, bp))
+        return out
 
     @property
     def default_value(self) -> float:

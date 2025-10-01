@@ -2,8 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import time
-
 import bittensor as bt
 from metahash.base.utils.logging import ColoredLogger as clog
 from metahash import __version__
@@ -12,7 +10,6 @@ from metahash.utils.pretty_logs import pretty
 # Config
 from metahash.config import (
     STRATEGY_PATH,
-    EPOCH_LENGTH_OVERRIDE,
     TESTING,
 )
 
@@ -26,8 +23,8 @@ from metahash.validator.engines.clearing import ClearingEngine
 # Base neuron
 from metahash.validator.epoch_validator import EpochValidatorNeuron
 
-# Strategy (new)
-from metahash.validator.strategy import StrategyManager
+# Strategy (unified)
+from metahash.validator.strategy import Strategy
 
 
 class Validator(EpochValidatorNeuron):
@@ -42,9 +39,10 @@ class Validator(EpochValidatorNeuron):
         if getattr(self.config, "fresh", False):
             self.state.wipe()
 
-        # NEW: Strategy manager (dynamic)
-        self.strategy = StrategyManager(strategy_path=STRATEGY_PATH, netuid=self.config.netuid)
-        self.weights_bps: list[int] = []  # will be computed each epoch
+        # Unified strategy: subnet weights from YAML
+        # (EpochValidatorNeuron also constructs Strategy; we overwrite with same API for clarity)
+        self.strategy = Strategy(path=STRATEGY_PATH)
+        self.weights_bps: dict[int, int] = {}  # subnet_id -> bps (0..10_000)
 
         # Engines
         self.commitments = CommitmentsEngine(self, self.state)
@@ -81,26 +79,12 @@ class Validator(EpochValidatorNeuron):
         return self._async_subtensor
 
     async def _new_async_subtensor(self) -> bt.AsyncSubtensor:
-        # Allow custom endpoint if present on config
         chain_endpoint = getattr(getattr(self.config, "subtensor", None), "chain_endpoint", None)
         stxn = bt.AsyncSubtensor(network=self.config.subtensor.network, chain_endpoint=chain_endpoint)
         await stxn.initialize()
         return stxn
 
     # ---------------------- Epoch alignment / population ----------------------
-    def _apply_epoch_override(self):
-        try:
-            if EPOCH_LENGTH_OVERRIDE and EPOCH_LENGTH_OVERRIDE > 0:
-                L = int(EPOCH_LENGTH_OVERRIDE)
-                blk = int(getattr(self, "block", 0))
-                e = blk // L
-                self.epoch_index = e
-                self.epoch_start_block = e * L
-                self.epoch_end_block = self.epoch_start_block + L - 1
-                self.epoch_length = L
-        except Exception:
-            pass
-
     async def _maybe_call_async(self, obj, method_name: str, *args, **kwargs):
         fn = getattr(obj, method_name, None)
         if callable(fn):
@@ -131,12 +115,13 @@ class Validator(EpochValidatorNeuron):
                 def _is_active(ax):
                     if ax is None:
                         return False
+                    # Be conservative: require at least one positive serving signal
                     flags = []
                     for flag in ("is_serving", "is_active", "active", "serving"):
                         v = getattr(ax, flag, None)
                         if isinstance(v, bool):
                             flags.append(v)
-                    return all(flags) if flags else True
+                    return any(flags) if flags else False
 
                 self.uid2axon = {uid: axons[uid] for uid in range(min(n, len(axons))) if axons[uid] is not None}
                 self.active_uids = [uid for uid, ax in self.uid2axon.items() if _is_active(ax)]
@@ -154,33 +139,41 @@ class Validator(EpochValidatorNeuron):
                 engine.weights_bps = self.weights_bps
             await self._maybe_call_async(engine, "on_metagraph_update", new=self.metagraph, old=None)
 
-        self._apply_epoch_override()
+        # NOTE: epoch override handled by EpochValidatorNeuron; do not duplicate here.
 
     # ---------------------- Dynamic weights each epoch ----------------------
     def _recompute_weights(self) -> None:
         """
-        Recompute weights before we run the epoch logic.
+        Recompute subnet weights before we run the epoch logic.
+        Produces a dict: {subnet_id: bps}.
         """
         try:
-            bps = self.strategy.compute_weights_bps(
+            bps_map = self.strategy.compute_weights_bps(
+                netuid=self.config.netuid,
                 metagraph=self.metagraph,
                 active_uids=self.active_uids,
             )
-            # Align to metagraph.n (pad/truncate as needed)
-            n = int(getattr(self.metagraph, "n", 0) or 0)
-            bps = (bps[:n] + [0] * max(0, n - len(bps))) if n > 0 else bps
-            self.weights_bps = bps
+            # Ensure int bps in range
+            clean: dict[int, int] = {}
+            for sid_raw, bp in (bps_map or {}).items():
+                try:
+                    sid = int(sid_raw)
+                    ival = int(bp)
+                except Exception:
+                    continue
+                clean[sid] = max(0, min(10_000, ival))
+
+            self.weights_bps = clean
 
             # Propagate to engines that cache reference
             for engine in (self.auction, self.clearing, self.settlement, self.commitments):
                 if hasattr(engine, "weights_bps"):
                     engine.weights_bps = self.weights_bps
 
-            # Optional: small log
-            nonzero = sum(1 for x in self.weights_bps if x > 0)
+            nonzero = sum(1 for x in self.weights_bps.values() if x > 0)
             pretty.kv_panel(
-                "[cyan]Weights updated[/cyan]",
-                [("nonzero", nonzero), ("sum_bps", sum(self.weights_bps))],
+                "[cyan]Subnet weights updated[/cyan]",
+                [("nonzero", nonzero), ("sum_bps", sum(self.weights_bps.values()))],
                 style="bold cyan",
             )
         except Exception as e:
@@ -191,7 +184,7 @@ class Validator(EpochValidatorNeuron):
         await self._stxn()
         await self._refresh_chain_and_population()
 
-        # NEW: recompute weights just-in-time
+        # recompute subnet weights just-in-time
         self._recompute_weights()
 
         e = int(getattr(self, "epoch_index", 0))
@@ -237,6 +230,5 @@ class Validator(EpochValidatorNeuron):
 if __name__ == "__main__":
     from metahash.bittensor_config import config
     with Validator(config=config(role="validator")) as v:
-        while True:
-            clog.info("Validator running…", color="gray")
-            time.sleep(120)
+        clog.info("Starting validator run loop…", color="gray")
+        v.run()

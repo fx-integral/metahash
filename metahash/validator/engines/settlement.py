@@ -745,25 +745,29 @@ class SettlementEngine:
                          ("miners_scored", sum(1 for x in final_scores if x > 0))],
                         style="bold green")
 
-    # ───────────────────────── helpers ─────────────────────────
+    # Inside SettlementEngine._normalize_inv (replace the whole method)
     def _normalize_inv(self, s: Dict) -> Optional[Dict[str, Dict]]:
         """
         Normalize inventory to:
-          inv = {
+        inv = {
             "<uid>": { "ck": "<coldkey|empty>", "ln": [[sid, disc_bps, weight_bps, required_rao, value_mu?], ...] },
             ...
-          }
+        }
         Accepts compact `i: [[uid, [[sid, disc_bps, w_bps, rao, value_mu?], ...]], ...]`
-        and legacy variants (ln with [sid, w_bps, rao, disc?, value_mu?]).
+        and legacy variants.
         """
-        inv: Dict[str, Dict] | None = s.get("inv")  # type: ignore[assignment]
-        if isinstance(inv, dict) and inv:
-            if VERBOSE_DUMPS:
-                sample_uid = next(iter(inv.keys()), None)
-                pretty.kv_panel("inv pre-normalized (dict)",
-                                [("uids", len(inv)), ("sample_uid", str(sample_uid))],
-                                style="bold cyan")
-            return inv
+        inv = s.get("inv")
+        # If inv exists but has no 'ln' lists, fall back to compact 'i'
+        if isinstance(inv, dict):
+            has_any_lines = any(isinstance(v, dict) and isinstance(v.get("ln"), list) for v in inv.values())
+            if has_any_lines:
+                if VERBOSE_DUMPS:
+                    sample_uid = next(iter(inv.keys()), None)
+                    pretty.kv_panel("inv pre-normalized (dict)",
+                                    [("uids", len(inv)), ("sample_uid", str(sample_uid))],
+                                    style="bold cyan")
+                return inv
+            # otherwise: fall through and rebuild from 'i'
 
         inv_tmp: Dict[str, Dict] = {}
         if "i" in s and isinstance(s["i"], list):
@@ -787,10 +791,7 @@ class SettlementEngine:
                         val_mu = int(ln[4]) if len(ln) >= 5 else 0
                     except Exception:
                         continue
-                    if val_mu:
-                        ln_list.append([sid, disc, w_bps, rao, val_mu])
-                    else:
-                        ln_list.append([sid, disc, w_bps, rao])
+                    ln_list.append([sid, disc, w_bps, rao] if not val_mu else [sid, disc, w_bps, rao, val_mu])
                 inv_tmp[str(uid_int)] = {"ck": "", "ln": ln_list}
 
         if VERBOSE_DUMPS and inv_tmp:

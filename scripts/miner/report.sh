@@ -1,360 +1,583 @@
 #!/usr/bin/env bash
-# miner_epoch_report.sh
-# Summarize last N pay epochs from a Metahash Miner pm2 log.
-# - Extracts "Win received" (accepted α) and "Payment OK" lines.
-# - Maps wins to their pay_epoch (e+1) and compares to executed payments.
-# - Prints per-epoch totals: expected (wins), paid, unpaid, failed, pending.
+# btv-health.sh — Validator health + bids/winners/reputation/settlement report
+# Works on mawk (Debian /usr/bin/awk) and gawk.
 # Usage:
-#   ./miner_epoch_report.sh -p <pm2_name> -n 6
-#   ./miner_epoch_report.sh -f /path/to/pm2-out.log -n 6 [--include-error]
-# Notes:
-#   * Requires only awk/sed/grep; optionally uses jq to resolve pm2 log paths.
-#   * Epochs here are **pay epochs** (when money is due / sent).
-#   * "Failed" = invoices with a terminal "PAY exit" (window over / max attempts).
-#     Anything else not yet paid is "Pending".
-
+#   ./scripts/validator/report.sh --pm2-index 4 --lines 8000 -n 5 --detailed
 set -euo pipefail
-
-N=5
-LOGFILE=""
-ERRFILE=""
-PM2_NAME=""
-INCLUDE_ERROR=0
 
 usage() {
   cat <<'USAGE'
-miner_epoch_report.sh - summarize Metahash miner activity by pay epoch
+btv-health.sh — Summarize Bittensor validator logs by epoch (health + payments + bids + reputation)
+
+Usage:
+  btv-health.sh [-n N] [--detailed] [-f FILE]
+  btv-health.sh --pm2-index N [--lines K] [-n N] [--detailed]
+  btv-health.sh --pm2-name  NAME [--lines K] [-n N] [--detailed]
 
 Options:
-  -n, --epochs N        Number of last pay epochs to include (default: 5)
-  -p, --pm2 NAME        pm2 process name to read logs from
-  -f, --file PATH       Path to pm2 out log file (overrides -p)
-      --include-error   Also include the pm2 error log, if available
-  -h, --help            Show this help
-
-Examples:
-  ./miner_epoch_report.sh -p miner -n 8
-  ./miner_epoch_report.sh -f ~/.pm2/logs/miner-out.log --include-error
+  -n, --epochs N       Number of last epochs to summarize (default: 5)
+  -f, --file FILE      Read logs from FILE (default: STDIN)
+  --pm2-index N        Use PM2 process by index to discover logs
+  --pm2-name  NAME     Use PM2 process by name to discover logs
+  --lines K            Tail K lines from each PM2 log file (default: 5000)
+  --detailed           Print per-epoch detailed sections
+  -h, --help           Show this help
 USAGE
 }
 
-# --- Parse args ---
+# Defaults
+N=5
+DETAIL=0
+INPUT="/dev/stdin"
+PM2_IDX=""
+PM2_NAME=""
+LINES=5000
+TMP_INPUT=""
+
+# Parse args
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -n|--epochs) N="${2:-}"; shift 2;;
-    -p|--pm2) PM2_NAME="${2:-}"; shift 2;;
-    -f|--file) LOGFILE="${2:-}"; shift 2;;
-    --include-error) INCLUDE_ERROR=1; shift;;
-    -h|--help) usage; exit 0;;
-    *) echo "Unknown argument: $1" >&2; usage; exit 1;;
+    -n|--epochs) N="${2:?}"; shift 2 ;;
+    -f|--file)   INPUT="${2:?}"; shift 2 ;;
+    --pm2-index) PM2_IDX="${2:?}"; shift 2 ;;
+    --pm2-name)  PM2_NAME="${2:?}"; shift 2 ;;
+    --lines)     LINES="${2:?}"; shift 2 ;;
+    --detailed)  DETAIL=1; shift ;;
+    -h|--help)   usage; exit 0 ;;
+    *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
   esac
 done
 
-# --- Resolve pm2 log paths if needed ---
-if [[ -z "$LOGFILE" && -n "$PM2_NAME" ]]; then
-  if command -v jq >/dev/null 2>&1; then
-    # Use pm2 JSON list for robust parsing.
-    if ! pm2 jlist >/dev/null 2>&1; then
-      echo "pm2 jlist failed. Is pm2 running?" >&2
-      exit 1
-    fi
-    LOGFILE="$(pm2 jlist | jq -r --arg name "$PM2_NAME" \
-      '.[] | select(.name==$name) | .pm2_env.pm_out_log_path' | head -n1)"
-    ERRFILE="$(pm2 jlist | jq -r --arg name "$PM2_NAME" \
-      '.[] | select(.name==$name) | .pm2_env.pm_err_log_path' | head -n1)"
-  else
-    # Fallback: parse `pm2 info` text output.
-    INFO="$(pm2 info "$PM2_NAME" 2>/dev/null || true)"
-    if [[ -z "$INFO" ]]; then
-      echo "pm2 info $PM2_NAME returned nothing. Is the process name correct?" >&2
-      exit 1
-    fi
-    LOGFILE="$(echo "$INFO" | grep -i 'out log path' | sed -E 's/.*out log path[^/]*([/A-Za-z0-9._:\-]+).*/\1/' | head -n1 || true)"
-    ERRFILE="$(echo "$INFO" | grep -i 'error log path' | sed -E 's/.*error log path[^/]*([/A-Za-z0-9._:\-]+).*/\1/' | head -n1 || true)"
+cleanup() { [[ -n "$TMP_INPUT" && -f "$TMP_INPUT" ]] && rm -f "$TMP_INPUT"; }
+trap cleanup EXIT
+
+resolve_pm2_logs() {
+  local idx="$1" name="$2" lines="$3"
+  local out="" err=""
+  if ! command -v pm2 >/dev/null 2>&1; then
+    echo "pm2 not found in PATH." >&2; exit 1
   fi
+  if command -v jq >/dev/null 2>&1; then
+    if [[ -n "$idx" ]]; then
+      out=$(pm2 jlist | jq -r --argjson i "$idx" '.[] | select(.pm_id == $i) | .pm2_env.pm_out_log_path' | head -n1)
+      err=$(pm2 jlist | jq -r --argjson i "$idx" '.[] | select(.pm_id == $i) | .pm2_env.pm_err_log_path' | head -n1)
+    elif [[ -n "$name" ]]; then
+      out=$(pm2 jlist | jq -r --arg n "$name" '.[] | select(.name == $n) | .pm2_env.pm_out_log_path' | head -n1)
+      err=$(pm2 jlist | jq -r --arg n "$name" '.[] | select(.name == $n) | .pm2_env.pm_err_log_path' | head -n1)
+    fi
+  else
+    local base="${HOME}/.pm2/logs"
+    if [[ -n "$idx" && -n "$name" ]]; then
+      out="${base}/${name}-out-${idx}.log"
+      err="${base}/${name}-error-${idx}.log"
+    elif [[ -n "$idx" ]]; then
+      echo "jq not found; with --pm2-index also pass --pm2-name for fallback paths." >&2; exit 1
+    elif [[ -n "$name" ]]; then
+      out="${base}/${name}-out-0.log"
+      err="${base}/${name}-error-0.log"
+    fi
+  fi
+  if [[ -z "${out}" && -z "${err}" ]]; then
+    echo "Failed to resolve PM2 log paths." >&2; exit 1
+  fi
+  if [[ ! -f "$out" && ! -f "$err" ]]; then
+    echo "PM2 logs not found:
+  out: $out
+  err: $err" >&2; exit 1
+  fi
+  TMP_INPUT=$(mktemp)
+  { [[ -f "$out" ]] && tail -n "$lines" -- "$out"; [[ -f "$err" ]] && tail -n "$lines" -- "$err"; } > "$TMP_INPUT"
+  INPUT="$TMP_INPUT"
+}
+
+if [[ -n "$PM2_IDX" || -n "$PM2_NAME" ]]; then
+  resolve_pm2_logs "$PM2_IDX" "$PM2_NAME" "$LINES"
 fi
 
-if [[ -z "$LOGFILE" || ! -f "$LOGFILE" ]]; then
-  echo "Could not find pm2 out log. Pass -f <file> or -p <pm2_name>." >&2
-  exit 1
-fi
+export LC_ALL=C
 
-# Merge out + err if requested.
-if [[ "$INCLUDE_ERROR" -eq 1 && -n "${ERRFILE:-}" && -f "$ERRFILE" ]]; then
-  # Tag error lines so they’re distinguishable (not necessary for parsing).
-  INPUT="$(cat "$LOGFILE"; sed 's/^/[err] /' "$ERRFILE")"
-else
-  INPUT="$(cat "$LOGFILE")"
-fi
-
-# Ensure UTF-8 so awk can happily see the α glyph when present.
-export LC_ALL="${LC_ALL:-C.UTF-8}"
-export LANG="${LANG:-C.UTF-8}"
-
-# --- Parse & summarize with awk ---
-# We look for blocks titled:
-#   "Win received"  -> fields include: invoice_id, epoch_now (e), subnet, accepted α, pay_epoch (e+1)
-#   "Payment OK"    -> fields include: inv, α, sid (or subnet), pay_e
-#   "PAY exit"      -> with reason "window over" or "max attempts" and an inv line
-#
-# We aggregate by pay epoch (the epoch when the payment should/may occur).
-
-awk -v N="$N" '
-function trim(s){ sub(/^[[:space:]]+/,"",s); sub(/[[:space:]]+$/,"",s); return s }
-function strip_ansi(s){ gsub(/\x1B\[[0-9;]*[A-Za-z]/,"",s); return s }
-function parse_int(s,    m){ if (match(s, /-?[0-9]+/)) { m=substr(s,RSTART,RLENGTH); return m+0 } return 0 }
-function parse_alpha(s,   m){
-  # Prefer number that’s right before an alpha glyph; fallback to first float.
-  if (match(s, /[0-9]+(\.[0-9]+)?[[:space:]]*α/)) {
-    m=substr(s,RSTART,RLENGTH); gsub(/[^0-9.]/,"",m); return m+0
-  } else if (match(s, /[0-9]+(\.[0-9]+)?/)) {
-    m=substr(s,RSTART,RLENGTH); return m+0
+awk -v wantN="$N" -v detailed="$DETAIL" '
+function trim(s){ gsub(/^[[:space:]]+|[[:space:]]+$/,"",s); return s }
+function toAlpha(rao){ return rao/1000000000.0 }
+function nz(v, d){ return (v == "" ? d : v) + 0 }
+function nzs(v, d){ return (v == "" ? d : v) }
+function key(e,i){ return e SUBSEP i }
+function kck(e,ck){ return e SUBSEP ck }
+function is_num(x){ return x ~ /^-?[0-9]+(\.[0-9]+)?$/ }
+function sanitize_num(s){ gsub(/[^0-9.\-]/,"",s); return s }
+function add_epoch(e){ if(e==""||e in seen_e) return; seen_e[e]=1; order[++nOrder]=e; current_e=e }
+function begin_json(_unused, epoch_var, kind){ json_accum=1; json_kind=kind; json_epoch=epoch_var; json_buf="" }
+function feed_json_line(line){
+  # strip ANSI sequences (portable to mawk)
+  gsub(/\033\[[0-9;]*[A-Za-z]/, "", line)
+  json_buf = json_buf line "\n"
+  if(index(line,"]")>0){ close_json() }
+}
+function close_json(   s,n,i,p,parts,ck,amt,pr){
+  json_accum=0
+  s=json_buf
+  sub(/.*\[[[:space:]]*/,"[",s)
+  gsub(/\r/,"",s); gsub(/\n/,"",s)
+  gsub(/\}\s*,\s*\{/, "}\n{", s)
+  n=split(s, parts, /\n/)
+  for(i=1;i<=n;i++){
+    p=parts[i]
+    ck=""; amt=0; pr=0
+    if(match(p,/"src_ck":"([^"]+)/,m)) ck=m[1]
+    gsub(/…/,"",ck)
+    if(json_kind=="events"){
+      if(match(p,/"amt\(rao\)":[[:space:]]*([0-9]+)/,mm)) amt=mm[1]+0
+      if(amt>0){ alpha_paid_rao[json_epoch]+=amt; if(ck!="") alpha_paid_by_ck[json_epoch,ck]+=amt }
+    } else if(json_kind=="paid_pools"){
+      if(match(p,/"ck":"([^"]+)/,mc)) ck=mc[1]
+      gsub(/…/,"",ck)
+      if(match(p,/"paid_rao":[[:space:]]*([0-9]+)/,mp)) pr=mp[1]+0
+      if(pr>0){ alpha_paid_rao[json_epoch]+=pr; if(ck!="") alpha_paid_by_ck[json_epoch,ck]+=pr }
+    }
   }
-  return 0
+  json_kind=""; json_epoch=""; json_buf=""
 }
 
 BEGIN{
-  FS="\n"; RS="\n"
-  in_win=0; in_pay=0; in_exit=0
+  nOrder=0
+  current_e=""; auction_e=""; budget_e=""; winners_e=""; settle_e=""
+  in_budget_block=0; in_winners=0; in_invoices=0; in_bids=0; in_rep=0
+  json_accum=0; json_kind=""; json_epoch=""
+  commit_epoch_cur=""
 }
 
-{
-  line=$0
-  s=strip_ansi(line)
+# ---- Epoch detection ----
+/\[epoch[[:space:]]+[0-9]+/ {
+  if(match($0,/\[epoch[[:space:]]+([0-9]+)/,m)) add_epoch(m[1])
+}
+$0 ~ /Epoch[[:space:]]+[0-9]+[[:space:]]+\(label: e\)/ {
+  if(match($0,/Epoch[[:space:]]+([0-9]+)/,m)) add_epoch(m[1])
+}
 
-  # Normalize for detections
-  sl=tolower(s)
-
-  # Any new panel-like header resets finer parsers:
-  if (sl ~ /auctionstart|win received|payment ok|payment failed|pay exit|bids sent|miner started/) {
-    in_win=0; in_pay=0; in_exit=0
-  }
-
-  # --- WIN RECEIVED PANEL ---
-  if (sl ~ /win received/) {
-    in_win=1
-    w_inv=""; w_epoch=""; w_alpha=""; w_subnet=""; w_payepoch=""
-    next
-  }
-  if (in_win) {
-    if (index(sl, "invoice_id")>0 && w_inv=="") {
-      w_inv=s; sub(/^.*invoice_id[^0-9A-Za-z_-]*/,"",w_inv); w_inv=trim(w_inv)
-    }
-    if (sl ~ /epoch_now.*\(e\)/) { w_epoch=parse_int(s) }
-    if ((index(sl,"accepted")>0 && index(s,"α")>0) || index(sl,"amount_to_pay")>0) {
-      # Prefer accepted α; fallback amount_to_pay
-      val=parse_alpha(s)
-      if (val>0) w_alpha=val
-    }
-    if (sl ~ /\bsubnet\b/) { w_subnet=parse_int(s) }
-    if (sl ~ /pay_epoch/) { w_payepoch=parse_int(s) }
-
-    # When we have the essentials, store & close the block.
-    if (w_inv!="" && w_payepoch!="" && w_alpha!="") {
-      wins[w_inv]=1
-      win_alpha[w_inv]=w_alpha+0.0
-      win_epoch[w_inv]=w_epoch+0
-      win_subnet[w_inv]=w_subnet+0
-      pay_epoch[w_inv]=w_payepoch+0
-      in_win=0
-    }
-    next
-  }
-
-  # --- PAYMENT OK PANEL ---
-  if (sl ~ /payment ok/) {
-    in_pay=1
-    p_inv=""; p_alpha=0; p_subnet=""; p_payepoch=""
-    next
-  }
-  if (in_pay) {
-    if (index(sl, "inv")>0 && p_inv=="") {
-      p_inv=s; sub(/^.*inv[^0-9A-Za-z_-]*/,"",p_inv); p_inv=trim(p_inv)
-    }
-    if (index(s,"α")>0) {
-      val=parse_alpha(s); if (val>0) p_alpha=val
-    }
-    if (sl ~ /\bsid\b/ || sl ~ /\bsubnet\b/) { p_subnet=parse_int(s) }
-    if (sl ~ /pay_e/) { p_payepoch=parse_int(s) }
-
-    if (p_inv!="" && p_alpha>0 && p_payepoch!="") {
-      payments[p_inv]=1
-      pay_amt[p_inv]=p_alpha+0.0
-      pay_epoch_by_inv[p_inv]=p_payepoch+0
-      pay_subnet_by_inv[p_inv]=p_subnet+0
-      in_pay=0
-    }
-    next
-  }
-
-  # --- PAY EXIT (terminal fail) ---
-  if (sl ~ /pay exit/ && (sl ~ /max attempts/ || sl ~ /window over/)) {
-    in_exit=1
-    ex_reason=(sl ~ /max attempts/ ? "max attempts" : "window over")
-    ex_inv=""
-    if (index(sl,"inv")>0) {
-      ex_inv=s; sub(/^.*inv[^0-9A-Za-z_-]*/,"",ex_inv); ex_inv=trim(ex_inv)
-      if (ex_inv!="") exit_status[ex_inv]=ex_reason
-      in_exit=0
-    }
-    next
-  }
-  if (in_exit) {
-    if (index(sl,"inv")>0) {
-      ex_inv=s; sub(/^.*inv[^0-9A-Za-z_-]*/,"",ex_inv); ex_inv=trim(ex_inv)
-      if (ex_inv!="") exit_status[ex_inv]=ex_reason
-      in_exit=0
-    }
+# ---- Status (head/start/end) ----
+$0 ~ /head_block=[0-9]+.*start=[0-9]+.*end=[0-9]+/ {
+  if(current_e!="" && match($0,/head_block=([0-9]+).*start=([0-9]+).*end=([0-9]+)/,m)){
+    head_block[current_e]=m[1]; start_block[current_e]=m[2]; end_block[current_e]=m[3]
   }
 }
+
+# ---- Axon filter ----
+/^ *Axon filter/ { }
+/^[[:space:]]*received:[[:space:]]*[0-9]+/ { if(current_e!="" && match($0,/received:[[:space:]]*([0-9]+)/,m)) ax_rcv[current_e]=m[1] }
+/^[[:space:]]*usable:[[:space:]]*[0-9]+/   { if(current_e!="" && match($0,/usable:[[:space:]]*([0-9]+)/,m))  ax_usable[current_e]=m[1] }
+/^[[:space:]]*filtered_out:[[:space:]]*[0-9]+/ { if(current_e!="" && match($0,/filtered_out:[[:space:]]*([0-9]+)/,m)) ax_filtered[current_e]=m[1] }
+
+# ---- AuctionStart ACKs ----
+/AuctionStart Broadcast/ { }
+$0 ~ /e \(now\):[[:space:]]*[0-9]+/ { if(match($0,/e \(now\):[[:space:]]*([0-9]+)/,m)){ auction_e=m[1]; add_epoch(auction_e) } }
+$0 ~ /acks_received:[[:space:]]*[0-9]+\/[0-9]+/ {
+  if(match($0,/acks_received:[[:space:]]*([0-9]+)\/([0-9]+)/,m)){
+    e = (auction_e!="" ? auction_e : current_e); acks_recv[e]+=m[1]; acks_total[e]+=m[2]
+  }
+}
+
+# ---- Budget (VALUE) block ----
+/Budget \(VALUE.*base subnet/ { in_budget_block=1 }
+in_budget_block && $0 ~ /epoch:[[:space:]]*[0-9]+/ { if(match($0,/epoch:[[:space:]]*([0-9]+)/,m)){ budget_e=m[1]; add_epoch(budget_e) } }
+in_budget_block && match($0,/base_price_tao[[:space:]]*\/[[:space:]]*α:[[:space:]]*([0-9.]+)/,m) { if(budget_e!="") base_price[budget_e]=m[1] }
+in_budget_block && match($0,/AUCTION_BUDGET_ALPHA.*:[[:space:]]*([0-9.]+)/,m) { if(budget_e!="") auction_budget_alpha[budget_e]=m[1] }
+in_budget_block && match($0,/my_budget_tao[[:space:]]*\(VALUE\):[[:space:]]*([0-9.]+)/,m) { if(budget_e!="") my_budget[budget_e]=m[1] }
+in_budget_block && ($0 ~ /^╰/ || $0 ~ /^$/ || $0 ~ /Connecting to Substrate/) { in_budget_block=0 }
+
+# Budget leftover after allocation
+/Budget leftover .* after allocation:/ {
+  if(match($0,/Budget leftover .*: ([0-9.]+)/,m)){ e=(budget_e!=""?budget_e:current_e); budget_leftover[e]=m[1] }
+}
+
+# ---- Bids — ordered by VALUE (TAO) ----
+/^.*Bids[[:space:]]*[—-].*VALUE.*TAO/ { in_bids=1; bids_e=(budget_e!=""?budget_e:(auction_e!=""?auction_e:current_e)); add_epoch(bids_e); next }
+in_bids {
+  if($0 ~ /^[[:space:]]*[0-9]+[[:space:]]*│/ && $0 !~ /UID[[:space:]]*│/){
+    n=split($0,col,/│/)
+    if(n<9) next
+    uid=trim(col[1]); ck=trim(col[2]); sid=trim(col[3]); wbps=trim(col[4]); disc=trim(col[5])
+    bida=sanitize_num(trim(col[6])); price=sanitize_num(trim(col[7])); val=sanitize_num(trim(col[9]))
+    if(!(uid ~ /^[0-9]+$/)) next
+    if(!(sid ~ /^[0-9]+$/)) next
+    if(!is_num(bida) || !is_num(price) || !is_num(val)) next
+    if((bida+0) <= 0) next
+    if((price+0) > 1.0) next
+    if((val+0) > 10.0) next
+    bcount[bids_e]++; i=bcount[bids_e]
+    bids_uid[key(bids_e,i)]=uid
+    bids_ck[key(bids_e,i)]=ck
+    bids_sid[key(bids_e,i)]=sid
+    bids_wbps[key(bids_e,i)]=wbps
+    bids_disc[key(bids_e,i)]=disc
+    bids_alpha[key(bids_e,i)]=bida+0
+    bids_price[key(bids_e,i)]=price+0
+    bids_value[key(bids_e,i)]=val+0
+  }
+  if($0 ~ /^╵|^╰|^$/){ in_bids=0 }
+}
+
+# ---- Reputation caps (TAO, per coldkey) ----
+/^.*Reputation caps.*\(TAO.*per coldkey\)/ { in_rep=1; rep_e=(budget_e!=""?budget_e:current_e); add_epoch(rep_e); next }
+in_rep {
+  if(index($0,"TAO")>0 && $0 ~ /│/ && $0 !~ /Coldkey/){
+    n=split($0,col,/│/)
+    ck=trim(col[1]); q=trim(col[2]); cap=trim(col[3])
+    if(!(ck ~ /^5/ || index(ck,"…")>0)) next
+    if(ck=="UID") next
+    q=sanitize_num(q); cap=sanitize_num(cap)
+    if(!is_num(q) || !is_num(cap)) next
+    rep_q[kck(rep_e,ck)]=q+0
+    rep_cap[kck(rep_e,ck)]=cap+0
+    rep_seen[rep_e]=1
+  }
+  if($0 ~ /^╵|^╰|^$/){ in_rep=0 }
+}
+
+# ---- Winners — acceptances ----
+/^.*Winners.*acceptances/ { in_winners=1; winners_e=(budget_e!=""?budget_e:(auction_e!=""?auction_e:current_e)); add_epoch(winners_e); next }
+in_winners {
+  if($0 ~ /^[[:space:]]*[0-9]+[[:space:]]*│/ && $0 !~ /UID[[:space:]]*│/){
+    n=split($0,col,/│/)
+    if(n<9) next
+    uid=trim(col[1]); ck=trim(col[2]); sid=trim(col[3])
+    reqa=sanitize_num(trim(col[4])); acca=sanitize_num(trim(col[5])); val=sanitize_num(trim(col[8]))
+    disc=trim(col[6]); wbps=trim(col[7]); fill=trim(col[9])
+    if(!(uid ~ /^[0-9]+$/) || !(sid ~ /^[0-9]+$/)) next
+    if(!is_num(reqa) || !is_num(acca) || !is_num(val)) next
+    if((reqa+0) <= 0 || (val+0)>10.0) next
+    wcount[winners_e]++; i=wcount[winners_e]
+    win_uid[key(winners_e,i)]=uid
+    win_ck[key(winners_e,i)]=ck
+    win_sid[key(winners_e,i)]=sid
+    win_req_alpha[key(winners_e,i)]=reqa+0
+    win_acc_alpha[key(winners_e,i)]=acca+0
+    win_disc[key(winners_e,i)]=disc
+    win_wbps[key(winners_e,i)]=wbps
+    win_value[key(winners_e,i)]=val+0
+    win_fill[key(winners_e,i)]=fill
+    winners_value[winners_e]+=val+0
+    winners_count[winners_e]+=1
+  }
+  if($0 ~ /^╵|^╰|^$/ || $0 ~ /Staged commit payload/ || $0 ~ /Invoices .*/){ in_winners=0 }
+}
+
+# ---- Early clear ----
+/Early Clear .*epoch e/ { }
+$0 ~ /winners:[[:space:]]*[0-9]+/ { if(match($0,/winners:[[:space:]]*([0-9]+)/,m)){ e=(budget_e!=""?budget_e:(auction_e!=""?auction_e:current_e)); early_winners[e]=m[1] } }
+$0 ~ /win_acks:[[:space:]]*([0-9]+)\/([0-9]+)/ {
+  if(match($0,/win_acks:[[:space:]]*([0-9]+)\/([0-9]+)/,m)){ e=(budget_e!=""?budget_e:(auction_e!=""?auction_e:current_e)); winacks_recv[e]+=m[1]; winacks_total[e]+=m[2] }
+}
+
+# ---- Invoices (expected α) ----
+/Invoices .*α to pay/ { in_invoices=1; invoice_e=(budget_e!=""?budget_e:current_e); add_epoch(invoice_e) }
+in_invoices && /╰/ { in_invoices=0 }
+in_invoices && $0 ~ /[0-9][[:space:]]*│/ && $0 !~ /UID[[:space:]]*│/ {
+  n=split($0,col,/│/)
+  ck=trim(col[2]); gsub(/…/,"",ck); gsub(/[[:space:]]/,"",ck)
+  alpha_str=trim(col[4]); sub(/[[:space:]]*α.*/,"",alpha_str)
+  val_str=trim(col[6]); sub(/[[:space:]]*TAO.*/,"",val_str)
+  if(alpha_str!="" && ck!=""){
+    a = alpha_str + 0
+    invoices_alpha_rao[invoice_e] += int(a*1000000000.0+0.5)
+    inv_by_ck[invoice_e,ck] += int(a*1000000000.0+0.5)
+  }
+  if(val_str!=""){ invoices_value_tao[invoice_e] += (val_str+0) }
+}
+
+# ---- Commit preview/publish ----
+/Staged commit payload/ { }
+/^[[:space:]]*e:[[:space:]]*[0-9]+/ { if(match($0,/e:[[:space:]]*([0-9]+)/,m)){ staged_e=m[1]; add_epoch(staged_e) } }
+$0 ~ /#miners:[[:space:]]*[0-9]+/ { if(staged_e!="" && match($0,/#miners:[[:space:]]*([0-9]+)/,m)) staged_miners[staged_e]=m[1] }
+$0 ~ /#lines_total:[[:space:]]*[0-9]+/ { if(staged_e!="" && match($0,/#[^:]*:[[:space:]]*([0-9]+)/,m)) staged_lines[staged_e]=m[1] }
+
+/Commit Payload \(preview\)/ { }
+$0 ~ /epoch:[[:space:]]*[0-9]+/ && $0 ~ /has_inv:/ {
+  if(match($0,/epoch:[[:space:]]*([0-9]+)/,a) && match($0,/has_inv:[[:space:]]*(true|false)/,b)){ e=a[1]; commit_has_inv[e]=b[1] }
+}
+
+/Commitment Published/ { }
+/epoch_cleared:[[:space:]]*([0-9]+)/ { if(match($0,/epoch_cleared:[[:space:]]*([0-9]+)/,m)){ commit_epoch_cur=m[1]; commit_published[commit_epoch_cur]=1 } }
+$0 ~ /cid:[[:space:]]*bafk/ { if(commit_epoch_cur!=""){ if(match($0,/cid:[[:space:]]*([a-z0-9]+)/,m)) commit_cid[commit_epoch_cur]=m[1] } }
+$0 ~ /payment_epoch .*:[[:space:]]*([0-9]+)/ { if(commit_epoch_cur!=""){ if(match($0,/payment_epoch .*:[[:space:]]*([0-9]+)/,m)) commit_pay_epoch[commit_epoch_cur]=m[1] } }
+
+# ---- Settlement ----
+/Settlement for epoch[[:space:]]*[0-9]+/ { if(match($0,/Settlement for epoch[[:space:]]*([0-9]+)/,m)){ settle_e=m[1]; add_epoch(settle_e) } }
+$0 ~ /Settlement Complete/ && /epoch_settled .*:[[:space:]]*([0-9]+)/ {
+  if(match($0,/epoch_settled .*:[[:space:]]*([0-9]+)/,m)){ e=m[1]; settled[e]=1; if(match($0,/miners_scored:[[:space:]]*([0-9]+)/,mm)) miners_scored[e]=mm[1] }
+}
+
+/mode=[a-zA-Z-]+/ { if(settle_e!="" && match($0,/mode=([a-zA-Z-]+)/,m)) weights_mode[settle_e]=m[1] }
+$0 ~ /nonzero:[[:space:]]*[0-9]+/ { if(settle_e!="" && match($0,/nonzero:[[:space:]]*([0-9]+)/,m)) weights_nonzero[settle_e]=m[1] }
+$0 ~ /max:[[:space:]]*[0-9.]+/    { if(settle_e!="" && match($0,/max:[[:space:]]*([0-9.]+)/,m)) weights_max[settle_e]=m[1] }
+$0 ~ /sum\(weights\):[[:space:]]*([0-9.]+)/ { if(settle_e!="" && match($0,/sum\(weights\):[[:space:]]*([0-9.]+)/,m)) sum_weights[settle_e]=m[1] }
+
+/Budget Accounting .* settlement/ { }
+$0 ~ /spent_from_payload .*:[[:space:]]*([0-9.]+)/    { if(settle_e!="" && match($0,/spent_from_payload .*:[[:space:]]*([0-9.]+)/,m)) spent_payload[settle_e]=m[1] }
+$0 ~ /leftover_from_payload .*:[[:space:]]*([0-9.]+)/ { if(settle_e!="" && match($0,/leftover_from_payload .*:[[:space:]]*([0-9.]+)/,m)) leftover_payload[settle_e]=m[1] }
+$0 ~ /target_budget .*:[[:space:]]*([0-9.]+)/         { if(settle_e!="" && match($0,/target_budget .*:[[:space:]]*([0-9.]+)/,m)) target_budget[settle_e]=m[1] }
+$0 ~ /credited_value .*:[[:space:]]*([0-9.]+)/        { if(settle_e!="" && match($0,/credited_value .*:[[:space:]]*([0-9.]+)/,m)) credited_value[settle_e]=m[1] }
+$0 ~ /burn_deficit .*:[[:space:]]*([0-9.]+)/          { if(settle_e!="" && match($0,/burn_deficit .*:[[:space:]]*([0-9.]+)/,m)) burn_deficit[settle_e]=m[1] }
+
+# ---- α scan & paid pools (multi-line JSON) ----
+/events\(sample\):/ {
+  if(settle_e!=""){
+    begin_json("", settle_e, "events")
+    feed_json_line($0); next
+  }
+}
+/paid_pools\(sample\):/ {
+  if(settle_e!=""){
+    begin_json("", settle_e, "paid_pools")
+    feed_json_line($0); next
+  }
+}
+json_accum { feed_json_line($0); next }
+
+# ---- Errors ----
+/Cannot connect to host/ { e=(auction_e!=""?auction_e:(budget_e!=""?budget_e:current_e)); conn_err[e]++ }
+/TimeoutError#/          { e=(auction_e!=""?auction_e:(budget_e!=""?budget_e:current_e)); timeouts[e]++ }
 
 END{
-  # Aggregate by pay epoch
-  max_pay=0
-  for (id in wins) {
-    e = pay_epoch[id]+0
-    wins_sum[e] += win_alpha[id]
-    wins_cnt[e] += 1
-    if (e > max_pay) max_pay=e
-  }
-  for (id in payments) {
-    e = pay_epoch_by_inv[id]+0
-    paid_sum[e] += pay_amt[id]
-    paid_cnt[e] += 1
-    if (e > max_pay) max_pay=e
-  }
-  # Failed / Pending classification based on exits and paid
-  for (id in wins) {
-    e = pay_epoch[id]+0
-    if (id in payments) {
-      # paid
-    } else if (id in exit_status) {
-      failed_sum[e] += win_alpha[id]
-      failed_cnt[e] += 1
-    } else {
-      pending_sum[e] += win_alpha[id]
-      pending_cnt[e] += 1
+  if(nOrder==0){ print "No epochs found in input."; exit 1 }
+  start = nOrder - wantN + 1; if(start<1) start=1
+  lastCnt=0; for(i=start;i<=nOrder;i++){ pick[order[i]]=1; last[++lastCnt]=order[i] }
+
+  agg_epochs=lastCnt
+  agg_commits=agg_settled=agg_winner_epochs=agg_winners=0
+  agg_value=agg_budget=agg_leftover=0
+  agg_ack_recv=agg_ack_total=0
+  agg_winack_recv=agg_winack_total=0
+  agg_reach_sum=agg_reach_den=agg_reach_filtered=0
+  w_normal=w_burn=w_other=0
+  agg_conn=agg_timeo=0
+
+  mat_epochs=0
+  mat_value_expected=mat_value_credited=0.0
+  mat_alpha_expected_rao=mat_alpha_paid_rao=0
+  mat_unpaid_invoices=0
+  epochs_with_unpaid=0
+
+  for(j=1;j<=lastCnt;j++){
+    e=last[j]
+    if(commit_published[e]) agg_commits++
+    if(settled[e]) agg_settled++
+
+    if(nz(winners_count[e],0)>0) agg_winner_epochs++
+    agg_winners += nz(winners_count[e],0)
+    agg_value   += nz(winners_value[e],0)
+
+    agg_budget   += nz(my_budget[e],0)
+    agg_leftover += nz(budget_leftover[e],0)
+
+    agg_ack_recv  += nz(acks_recv[e],0)
+    agg_ack_total += nz(acks_total[e],0)
+
+    agg_winack_recv  += nz(winacks_recv[e],0)
+    agg_winack_total += nz(winacks_total[e],0)
+
+    if(nz(ax_rcv[e],0) > 0){ agg_reach_sum += nz(ax_usable[e],0); agg_reach_den += nz(ax_rcv[e],0) }
+    agg_reach_filtered += nz(ax_filtered[e],0)
+
+    if(weights_mode[e]=="normal") w_normal++
+    else if(weights_mode[e]=="burn-all") w_burn++
+    else if(weights_mode[e]!="") w_other++
+
+    agg_conn  += nz(conn_err[e],0)
+    agg_timeo += nz(timeouts[e],0)
+
+    if(settled[e]){
+      mat_epochs++
+      mat_value_expected     += nz(spent_payload[e],0)
+      mat_value_credited     += nz(credited_value[e],0)
+      mat_alpha_expected_rao += nz(invoices_alpha_rao[e],0)
+      mat_alpha_paid_rao     += nz(alpha_paid_rao[e],0)
+      unpaid_here=0
+      for(k in inv_by_ck){
+        split(k,K,SUBSEP); ek=K[1]; ck=K[2]
+        if(ek!=e) continue
+        er = nz(inv_by_ck[ek,ck],0)
+        pr = nz(alpha_paid_by_ck[ek,ck],0)
+        if(pr < er){ unpaid_here++; unpaid_ck[e,ck]=er-pr }
+      }
+      mat_unpaid_invoices += unpaid_here
+      if(unpaid_here>0) epochs_with_unpaid++
     }
   }
 
-  if (N<=0) N=5
-  start = max_pay - N + 1
-  if (start < 0) start = 0
+  ack_rate    = (agg_ack_total>0    ? 100.0*agg_ack_recv/agg_ack_total : 0)
+  winack_rate = (agg_winack_total>0 ? 100.0*agg_winack_recv/agg_winack_total : 0)
+  reach_rate  = (agg_reach_den>0    ? 100.0*agg_reach_sum/agg_reach_den : 0)
+  budget_used = (agg_budget>0       ? 100.0*(agg_budget-agg_leftover)/agg_budget : 0)
 
-  # Header
-  printf("\nMetahash Miner summary (last %d pay epochs: %d..%d)\n", N, start, max_pay)
-  printf("Timeline reminder: bid now (e) → pay in (e+1) → weights from e in (e+2)\n\n")
+  value_shortfall = mat_value_expected - mat_value_credited; if(value_shortfall<0) value_shortfall=0
+  alpha_shortfall_rao = mat_alpha_expected_rao - mat_alpha_paid_rao; if(alpha_shortfall_rao<0) alpha_shortfall_rao=0
 
-  printf("%-7s | %15s | %10s | %15s | %10s | %15s | %12s | %12s\n",
-         "Epoch", "Wins α (due)", "Wins cnt", "Paid α", "Paid cnt", "Unpaid α", "Failed α", "Pending α")
-  printf("%-7s-+-%15s-+-%10s-+-%15s-+-%10s-+-%15s-+-%12s-+-%12s\n",
-         "-------","---------------","----------","---------------","----------","---------------","------------","------------")
+  fmt="%-34s %s\n"
+  line="--------------------------------------------------------------------"
+  printf("%s\n", line)
+  printf("Validator Health (last %d epochs: %s..%s)\n", agg_epochs, last[1], last[lastCnt])
+  printf("%s\n", line)
 
-  TW=0; TWC=0; TP=0; TPC=0; TU=0; TF=0; TPD=0
+  printf(fmt, "Epochs analyzed:", agg_epochs)
+  printf(fmt, "Commitments published:", sprintf("%d (%.1f%%)", agg_commits, (agg_epochs>0?100.0*agg_commits/agg_epochs:0)))
+  printf(fmt, "Settlements completed:", sprintf("%d (%.1f%%)", agg_settled, (agg_epochs>0?100.0*agg_settled/agg_epochs:0)))
 
-  for (e=start; e<=max_pay; e++) {
-    w = wins_sum[e]+0.0
-    wc = wins_cnt[e]+0
-    p = paid_sum[e]+0.0
-    pc = paid_cnt[e]+0
-    f = failed_sum[e]+0.0
-    pd = pending_sum[e]+0.0
-    u = w - p; if (u < 0) u = 0.0
+  printf(fmt, "Epochs with winners:", sprintf("%d / %d", agg_winner_epochs, agg_epochs))
+  printf(fmt, "TAO spent (winners VALUE):", sprintf("%.6f", agg_value))
+  printf(fmt, "Budget (my total TAO):", sprintf("%.6f", agg_budget))
+  printf(fmt, "Budget leftover (TAO):", sprintf("%.6f", agg_leftover))
+  printf(fmt, "Budget usage (est.):", sprintf("%.2f%%", budget_used))
 
-    printf("%-7d | %15.4f | %10d | %15.4f | %10d | %15.4f | %12.4f | %12.4f\n",
-           e, w, wc, p, pc, u, f, pd)
+  printf(fmt, "Auction ACK rate:", sprintf("%.2f%% (%d/%d)", ack_rate, agg_ack_recv, agg_ack_total))
+  if(agg_winack_total>0) printf(fmt, "Win ACK rate:", sprintf("%.2f%% (%d/%d)", winack_rate, agg_winack_recv, agg_winack_total))
+  if(agg_reach_den>0)    printf(fmt, "Axon reachability:", sprintf("%.2f%% (%d/%d usable; filtered=%d)", reach_rate, agg_reach_sum, agg_reach_den, agg_reach_filtered))
 
-    TW += w; TWC += wc; TP += p; TPC += pc; TU += u; TF += f; TPD += pd
-  }
+  printf(fmt, "Weights preview modes:", sprintf("normal=%d burn-all=%d other=%d", w_normal, w_burn, w_other))
+  printf("%s\n", line)
 
-  printf("\nTotals: Wins α=%.4f (cnt=%d) | Paid α=%.4f (cnt=%d) | Unpaid α=%.4f | Failed α=%.4f | Pending α=%.4f\n\n",
-         TW, TWC, TP, TPC, TU, TF, TPD)
+  printf("Payments (settled epochs only)\n")
+  printf(fmt, "Settled epochs considered:", mat_epochs)
+  printf(fmt, "VALUE expected vs credited:", sprintf("%.6f vs %.6f TAO (shortfall=%.6f)", mat_value_expected, mat_value_credited, value_shortfall))
+  printf(fmt, "α expected vs paid:", sprintf("%.4f vs %.4f α (shortfall=%.4f)", toAlpha(mat_alpha_expected_rao), toAlpha(mat_alpha_paid_rao), toAlpha(alpha_shortfall_rao)))
+  printf(fmt, "Unpaid/partial invoices:", sprintf("%d epochs with unpaid: %d", mat_unpaid_invoices, epochs_with_unpaid))
+  printf("%s\n", line)
 
-  # Subnet breakdown over the reported window
-  # Build per-subnet aggregates only for epochs within [start..max_pay]
-  delete subnet_wins; delete subnet_paid
-  for (id in wins) {
-    e = pay_epoch[id]+0
-    if (e>=start && e<=max_pay) {
-      sid = win_subnet[id]+0
-      subnet_wins[sid] += win_alpha[id]
+  if(agg_reach_den>0 && reach_rate < 20.0) print "WARN: Low axon reachability (<20%). Supply constrained."
+  if(agg_ack_total>0 && ack_rate < 20.0)   print "WARN: Low auction ACK rate (<20%). Miners unresponsive."
+  tburn=0; ttarget=0; for(j=1;j<=lastCnt;j++){ e=last[j]; tburn+=nz(burn_deficit[e],0); ttarget+=nz(target_budget[e],0) }
+  if(tburn>0 && ttarget>0 && (100.0*tburn/ttarget)>50.0) print "WARN: Large burn deficit (>50% of target). Expect UID0 skew."
+  printf("%s\n", line)
+
+  if(!detailed) exit 0
+
+  print "DETAILED EPOCH REPORT"
+  print line
+
+  for(jj=lastCnt; jj>=1; jj--){
+    e=last[jj]
+    printf("Epoch %s\n", e)
+
+    print "  Auction"
+    if(nz(acks_total[e],0)>0){
+      ar = 100.0*nz(acks_recv[e],0)/nz(acks_total[e],1)
+      printf("    acks:              %d/%d (%.2f%%)\n", nz(acks_recv[e],0), nz(acks_total[e],0), ar)
     }
-  }
-  for (id in payments) {
-    e = pay_epoch_by_inv[id]+0
-    if (e>=start && e<=max_pay) {
-      sid = pay_subnet_by_inv[id]+0
-      subnet_paid[sid] += pay_amt[id]
+    if(nz(ax_rcv[e],0)>0){
+      rr = 100.0*nz(ax_usable[e],0)/nz(ax_rcv[e],1)
+      printf("    axons usable:      %d/%d (%.2f%%), filtered_out=%d\n", nz(ax_usable[e],0), nz(ax_rcv[e],0), rr, nz(ax_filtered[e],0))
     }
-  }
-  # Print if any
-  hasSubnet=0
-  for (k in subnet_wins) { hasSubnet=1; break }
-  for (k in subnet_paid) { hasSubnet=1; break }
-  if (hasSubnet) {
-    printf("Subnet breakdown (epochs %d..%d):\n", start, max_pay)
-    printf("%-8s | %15s | %15s | %15s\n", "Subnet", "Wins α (due)", "Paid α", "Unpaid α")
-    printf("%-8s-+-%15s-+-%15s-+-%15s\n", "--------","---------------","---------------","---------------")
-    # Collect keys
-    n=0
-    for (sid in subnet_wins) { keys[++n]=sid }
-    for (sid in subnet_paid) {
-      found=0
-      for (i=1;i<=n;i++) if (keys[i]==sid) { found=1; break }
-      if (!found) keys[++n]=sid
+    if(my_budget[e]!="")       printf("    budget (my):       %.6f TAO  @price≈%s TAO/α\n", nz(my_budget[e],0), nzs(base_price[e],"?"))
+    if(auction_budget_alpha[e]!="") printf("    budget (α):        %s α (base subnet)\n", nzs(auction_budget_alpha[e],"?"))
+    if(budget_leftover[e]!="") printf("    leftover:          %.6f TAO\n", nz(budget_leftover[e],0))
+    if(nz(winners_count[e],0)>0) printf("    winners:           %d rows, total VALUE=%.6f TAO\n", nz(winners_count[e],0), nz(winners_value[e],0))
+    else                         printf("    winners:           none\n")
+    if(early_winners[e]!="")   printf("    cleared winners:   %d\n", nz(early_winners[e],0))
+    if(nz(winacks_total[e],0)>0){
+      wr = 100.0*nz(winacks_recv[e],0)/nz(winacks_total[e],1)
+      printf("    win acks:          %d/%d (%.2f%%)\n", nz(winacks_recv[e],0), nz(winacks_total[e],0), wr)
     }
-    # Sort keys numerically
-    for (i=1;i<=n;i++) for (j=i+1;j<=n;j++) if (keys[j]<keys[i]) { tmp=keys[i]; keys[i]=keys[j]; keys[j]=tmp }
-    for (i=1;i<=n;i++) {
-      sid=keys[i]
-      w = subnet_wins[sid]+0.0
-      p = subnet_paid[sid]+0.0
-      u = w - p; if (u < 0) u = 0.0
-      printf("%-8d | %15.4f | %15.4f | %15.4f\n", sid, w, p, u)
-    }
-    printf("\n")
-  }
 
-  # List pending invoices (truncated to 10)
-  pend_count=0
-  for (id in wins) {
-    e=pay_epoch[id]+0
-    if (e>=start && e<=max_pay) {
-      if (!(id in payments) && !(id in exit_status)) {
-        pend_list[id]=1; pend_count++
+    # Reputation caps
+    if(rep_seen[e]){
+      print "  Reputation caps (per coldkey)"
+      printf("      %-14s  %-10s  %-10s\n", "Coldkey", "Quota", "Cap(TAO)")
+      for(k in rep_cap){
+        split(k,K,SUBSEP); ek=K[1]; ck=K[2]
+        if(ek!=e) continue
+        printf("      %-14s  %-10.3f  %-10.6f\n", ck, nz(rep_q[k],0), nz(rep_cap[k],0))
       }
     }
-  }
-  if (pend_count>0) {
-    printf("Pending invoices (up to 10 shown):\n")
-    printf("%-10s | %-8s | %-6s | %-10s\n","Invoice","pay_e","sid","α due")
-    printf("%-10s-+-%-8s-+-%-6s-+-%-10s\n","----------","--------","------","----------")
-    shown=0
-    for (id in pend_list) {
-      if (shown>=10) break
-      printf("%-10s | %-8d | %-6d | %-10.4f\n", id, pay_epoch[id]+0, win_subnet[id]+0, win_alpha[id]+0.0)
-      shown++
-    }
-    printf("\n")
-  }
 
-  # List failures (truncated to 10)
-  fail_count=0
-  for (id in exit_status) {
-    e=pay_epoch[id]+0
-    if (e>=start && e<=max_pay) { fail_list[id]=1; fail_count++ }
-  }
-  if (fail_count>0) {
-    printf("Failed invoices (up to 10 shown):\n")
-    printf("%-10s | %-8s | %-12s | %-6s | %-10s\n","Invoice","pay_e","reason","sid","α")
-    printf("%-10s-+-%-8s-+-%-12s-+-%-6s-+-%-10s\n","----------","--------","------------","------","----------")
-    shown=0
-    for (id in fail_list) {
-      if (shown>=10) break
-      printf("%-10s | %-8d | %-12s | %-6d | %-10.4f\n", id, pay_epoch[id]+0, exit_status[id], win_subnet[id]+0, win_alpha[id]+0.0)
-      shown++
+    if(nz(bcount[e],0)>0){
+      print "  Bids — ordered by VALUE (TAO)"
+      printf("      %5s  %-14s  %6s  %6s  %6s  %9s  %11s  %9s\n", "UID","CK","Subnet","W_bps","Disc","Bid α","Price TAO/α","VALUE")
+      for(i=1;i<=bcount[e];i++){
+        uu=bids_uid[key(e,i)]
+        ck=bids_ck[key(e,i)]
+        ss=bids_sid[key(e,i)]
+        wb=bids_wbps[key(e,i)]
+        dc=bids_disc[key(e,i)]
+        ba=bids_alpha[key(e,i)]
+        pr=bids_price[key(e,i)]
+        va=bids_value[key(e,i)]
+        printf("      %5s  %-14s  %6s  %6s  %6s  %9.4f  %11.8f  %9.6f\n", uu, ck, ss, wb, dc, ba, pr, va)
+      }
     }
-    printf("\n")
+
+    if(nz(wcount[e],0)>0){
+      print "  Winning bids (acceptances)"
+      printf("      %5s  %-14s  %6s  %9s  %9s  %6s  %6s  %9s  %5s\n", "UID","CK","Subnet","Req α","Acc α","Disc","W_bps","VALUE","Fill")
+      for(i=1;i<=wcount[e];i++){
+        uu=win_uid[key(e,i)]
+        ck=win_ck[key(e,i)]
+        ss=win_sid[key(e,i)]
+        rq=win_req_alpha[key(e,i)]
+        ac=win_acc_alpha[key(e,i)]
+        dc=win_disc[key(e,i)]
+        wb=win_wbps[key(e,i)]
+        va=win_value[key(e,i)]
+        fl=win_fill[key(e,i)]
+        printf("      %5s  %-14s  %6s  %9.4f  %9.4f  %6s  %6s  %9.6f  %5s\n", uu, ck, ss, rq, ac, dc, wb, va, fl)
+      }
+    }
+
+    print "  Commitment"
+    if(staged_miners[e]!="" || staged_lines[e]!="")
+      printf("    staged:            miners=%s lines=%s\n", nzs(staged_miners[e],"?"), nzs(staged_lines[e],"?"))
+    if(commit_has_inv[e]!="")  printf("    payload:           has_inv=%s\n", commit_has_inv[e])
+    was_pub = (commit_published[e] ? "yes" : "no")
+    if(commit_published[e] && commit_cid[e]!="")
+      printf("    published:         %s (cid=%s…)\n", was_pub, substr(commit_cid[e],1,20))
+    else
+      printf("    published:         %s\n", was_pub)
+    if(commit_pay_epoch[e]!="") printf("    payment_epoch:     %s\n", commit_pay_epoch[e])
+
+    print "  Settlement"
+    if(settled[e]){
+      ms = nz(miners_scored[e],0)
+      printf("    status:            complete (miners_scored=%d)\n", ms)
+      if(weights_mode[e]!=""){
+        wn = nzs(weights_nonzero[e],"?")
+        wmax = nz(weights_max[e],0)
+        wsum = nz(sum_weights[e],0)
+        printf("    weights:           mode=%s nonzero=%s max=%.6f sum(weights)=%.6f\n", weights_mode[e], wn, wmax, wsum)
+      }
+      if(spent_payload[e]!="" || credited_value[e]!="" || burn_deficit[e]!=""){
+        sp = nz(spent_payload[e],0)
+        cv = nz(credited_value[e],0)
+        bd = nz(burn_deficit[e],0)
+        tb = nz(target_budget[e],0)
+        lo = nz(leftover_payload[e],0)
+        printf("    accounting:        spent=%.6f credited=%.6f burn_deficit=%.6f (target=%.6f leftover=%.6f)\n", sp, cv, bd, tb, lo)
+      }
+      exp_rao = nz(invoices_alpha_rao[e],0)
+      paid_rao = nz(alpha_paid_rao[e],0)
+      printf("  Payments\n")
+      printf("    invoices:          %s VALUE=%.6f TAO, α=%.4f\n", (invoices_value_tao[e]!=""?"present":"missing"), nz(invoices_value_tao[e],0), toAlpha(exp_rao))
+      shorta = exp_rao - paid_rao; if(shorta<0) shorta=0
+      printf("    paid α:            %.4f α (shortfall=%.4f α)\n", toAlpha(paid_rao), toAlpha(shorta))
+
+      unpaid_listed=0
+      for(k in inv_by_ck){
+        split(k,K,SUBSEP); ek=K[1]; ck=K[2]
+        if(ek!=e) continue
+        er = nz(inv_by_ck[ek,ck],0)
+        pr = nz(alpha_paid_by_ck[ek,ck],0)
+        if(pr < er){
+          if(unpaid_listed==0) print "    unpaid miners:"
+          printf("      - %s  need=%.4f α  paid=%.4f α  short=%.4f α\n", ck, toAlpha(er), toAlpha(pr), toAlpha(er-pr))
+          unpaid_listed++
+        }
+      }
+      if(unpaid_listed==0) print "    unpaid miners:     none"
+    } else {
+      print "    status:            pending (payments will be checked at settlement)"
+    }
+
+    if(nz(conn_err[e],0)>0 || nz(timeouts[e],0)>0)
+      printf("  Errors               connect=%d timeouts=%d\n", nz(conn_err[e],0), nz(timeouts[e],0))
+
+    print line
   }
 }
-' <<< "$INPUT"
+' "$INPUT"

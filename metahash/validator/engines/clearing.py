@@ -34,44 +34,15 @@ from metahash.utils.valuation import (
 )
 
 # Tolerances
-EPS_ALPHA = 1e-18          # α resolution guard (we still quantize on rao later)
-EPS_VALUE = 1e-12          # TAO dust threshold: stop when budget < EPS_VALUE
+EPS_ALPHA = 1e-18
+EPS_VALUE = 1e-12
 
 
 class ClearingEngine:
-    """
-    Clear winners *now* with PARTIAL FILLS to greedily consume TAO budget.
-    We store the exact pay window (as,de) in StateStore.pending_commits[e]
-    so CommitmentsEngine can publish the same snapshot in e+1.
-
-    Budget & ordering are in VALUE (TAO), not α. With slippage:
-        VALUE_TAO(α) = weight × (1 − discount) × post_slip(price, depth, α)
-
-    If REPUTATION_ENABLED, we enforce per-coldkey caps in VALUE (TAO).
-
-    NEW (budget signals for settlement burn):
-      - We serialize `bt_mu` (total budget VALUE in μTAO) and
-        `bl_mu` (leftover VALUE in μTAO) into the staged payload.
-      - This lets Settlement infer the target budget and burn underfill to uid 0.
-
-    FIX (v2.3.7):
-      - Two-pass allocation: pass1 honors reputation caps; pass2 relaxes caps to
-        consume leftover budget if any bids remain (no reason to leave VALUE idle).
-      - Track accepted α per bid across passes to never exceed request.
-
-    NEW (diagnostics snapshots in payload):
-      - Include ALL accepted bids (not only winners) with requested α and estimated VALUE.
-      - Include rejected bids with reasons (from AuctionEngine) if any.
-      - Include reputation snapshot for involved coldkeys (+ caps/params).
-      - Include jail snapshot for involved coldkeys.
-      - Include weights used by this validator (bps map and optional default).
-    """
-
     def __init__(self, parent, state: StateStore):
         self.parent = parent
         self.state = state
 
-        # Detect WinAllocation signature once (handles schema variations)
         try:
             self._winalloc_params = set(inspect.signature(WinAllocation).parameters.keys())
         except Exception:
@@ -80,20 +51,39 @@ class ClearingEngine:
     # ─────────────── Reachability & helpers ───────────────
 
     @staticmethod
-    def _is_reachable_axon(ax) -> bool:
-        """Guard against axons with host=0.0.0.0/[::] or port=0."""
+    def _extract_ip_port(ax) -> Tuple[None | str, None | int]:
         try:
-            host = getattr(ax, "external_ip", None) or getattr(ax, "ip", None)
-            port = getattr(ax, "external_port", None) or getattr(ax, "port", None)
-            if isinstance(host, str):
-                host = host.strip()
-            if not host or host in ("0.0.0.0", "[::]"):
+            ip = getattr(ax, "ip", None) or getattr(ax, "external_ip", None)
+            port = getattr(ax, "port", None) or getattr(ax, "external_port", None)
+            ep = getattr(ax, "endpoint", None)
+            if ep is not None:
+                ip = ip or getattr(ep, "ip", None)
+                port = port or getattr(ep, "port", None)
+        except Exception:
+            ip, port = None, None
+        try:
+            port = int(port) if port is not None else None
+        except Exception:
+            port = None
+        return ip, port
+
+    @staticmethod
+    def _is_bad_ip(ip: None | str) -> bool:
+        if not ip:
+            return True
+        ip_l = str(ip).strip().lower()
+        return ip_l in {"0.0.0.0", "::", "localhost", "127.0.0.1", "::1"}
+
+    @classmethod
+    def _is_reachable_axon(cls, ax) -> bool:
+        """Guard against axons with host=0.0.0.0/[::]/localhost or invalid port."""
+        try:
+            host, port = cls._extract_ip_port(ax)
+            if cls._is_bad_ip(host):
                 return False
-            try:
-                port = int(port)
-            except Exception:
+            if port is None or not (1 <= int(port) <= 65535):
                 return False
-            if port <= 0:
+            if getattr(ax, "is_serving", True) is False:
                 return False
             return True
         except Exception:
@@ -111,7 +101,6 @@ class ClearingEngine:
         return mapping
 
     def _to_bid_inputs(self, bid_map) -> List[BidInput]:
-        """Convert AuctionEngine._Bid entries → BidInput for allocator."""
         out: List[BidInput] = []
         for (uid, subnet_id), b in bid_map.items():
             w_bps = int(round(float(getattr(b, "weight_snap", 0.0)) * 10_000.0))
@@ -129,7 +118,6 @@ class ClearingEngine:
         return out
 
     async def _safe_price(self, sid: int, start_block: int, end_block: int) -> float:
-        """Cancellation-safe wrapper around pricing oracle used for ordering & budget conversion."""
         try:
             st = await self.parent._stxn()
             p = await average_price(sid, start_block=start_block, end_block=end_block, st=st)
@@ -143,18 +131,16 @@ class ClearingEngine:
     ) -> Dict[int, float]:
         sids = sorted({b.subnet_id for b in bids})
         out: Dict[int, float] = {}
-        # use a single client for the loop
-        try:
-            st = await self.parent._new_async_subtensor()
-        except Exception:
-            st = None
-        for sid in sids:
+        st = await self.parent._stxn()
+
+        async def _one(sid: int):
             try:
                 p = await average_price(sid, start_block=start_block, end_block=end_block, st=st)
                 out[sid] = float(getattr(p, "tao", 0.0) or 0.0)
             except Exception as e:
                 pretty.log(f"[yellow]Price lookup failed for sid={sid}: {e}[/yellow]")
                 out[sid] = 0.0
+        await asyncio.gather(*[_one(s) for s in sids])
         return out
 
     async def _estimate_depths_for_bids(
@@ -162,17 +148,16 @@ class ClearingEngine:
     ) -> Dict[int, int]:
         sids = sorted({b.subnet_id for b in bids})
         out: Dict[int, int] = {}
-        try:
-            st = await self.parent._new_async_subtensor()
-        except Exception:
-            st = None
-        for sid in sids:
+        st = await self.parent._stxn()
+
+        async def _one(sid: int):
             try:
                 d = await average_depth(sid, start_block=start_block, end_block=end_block, st=st)
                 out[sid] = int(d or 0)
             except Exception as e:
                 pretty.log(f"[yellow]Depth lookup failed for sid={sid}: {e}[/yellow]")
                 out[sid] = 0
+        await asyncio.gather(*[_one(s) for s in sids])
         return out
 
     def _compute_quota_caps_tao(

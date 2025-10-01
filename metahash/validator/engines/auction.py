@@ -28,7 +28,7 @@ class _Bid:
     coldkey: str
     discount_bps: int         # for ordering (not payment)
     weight_snap: float = 0.0  # snapshot at acceptance (0..1)
-    idx: int = 0              # stable order per miner+subnet
+    idx: int = 0              # stable order per miner across subnets
 
 
 @dataclass(slots=True, frozen=True)
@@ -54,34 +54,18 @@ class WinAllocation:
 
 
 def budget_from_share(*, share: float, auction_budget_alpha: float = AUCTION_BUDGET_ALPHA) -> float:
-    """(Legacy) Returns an α-denominated budget = share * AUCTION_BUDGET_ALPHA."""
     if share <= 0:
         return 0.0
     return auction_budget_alpha * float(share)
 
 
-def budget_tao_from_share(
-    *,
-    share: float,
-    auction_budget_alpha: float = AUCTION_BUDGET_ALPHA,
-    price_tao_per_alpha_base: float,
-) -> float:
-    """
-    Convert the base α budget (for validator's netuid) to a TAO budget for allocation:
-        budget_tao = share * auction_budget_alpha (α) * price_tao_per_alpha_base
-    """
-    if share <= 0 or auction_budget_alpha <= 0 or price_tao_per_alpha_base <= 0:
-        return 0.0
-    return float(share) * float(auction_budget_alpha) * float(price_tao_per_alpha_base)
-
-
 class AuctionEngine:
     """AuctionStart broadcast & bid management (masters only)."""
 
-    def __init__(self, parent, state: StateStore, weights_bps: Dict[int, float], clearer=None):
+    def __init__(self, parent, state: StateStore, weights_bps: Dict[int, int], clearer=None):
         self.parent = parent
         self.state = state
-        self.weights_bps = weights_bps
+        self.weights_bps = weights_bps  # subnet_id -> bps
         self.clearer = clearer  # object with async clear_now_and_notify(epoch: int)
 
         # epoch-local bid state (masters only)
@@ -90,7 +74,6 @@ class AuctionEngine:
         self._ck_subnets_bid: Dict[int, Dict[str, int]] = defaultdict(dict)  # distinct subnet count per coldkey
 
         # NEW: record rejected bids (for IPFS diagnostics snapshot)
-        # { epoch: [ {uid, coldkey, subnet_id, alpha, discount_bps, reason} ] }
         self._rejected_bids_by_epoch: Dict[int, List[Dict[str, object]]] = defaultdict(list)
 
         # snapshot of master stakes & our share per epoch e
@@ -133,16 +116,22 @@ class AuctionEngine:
             return False
 
     def _norm_weight(self, subnet_id: int) -> float:
+        """
+        Normalize subnet weight to 0..1 from bps or float. Works with dict or list.
+        """
+        raw = 0.0
         try:
-            raw = float(self.weights_bps[subnet_id])
+            if isinstance(self.weights_bps, dict):
+                raw = float(self.weights_bps.get(subnet_id, 0.0))
+            elif isinstance(self.weights_bps, (list, tuple)) and 0 <= subnet_id < len(self.weights_bps):
+                raw = float(self.weights_bps[subnet_id])
         except Exception:
-            raw = float(self.weights_bps.get(subnet_id, 0.0))
+            raw = 0.0
         if raw > 1.0:
             raw = raw / 10_000.0
         return max(0.0, min(1.0, raw))
 
     def _snapshot_master_stakes_for_epoch(self, epoch: int) -> float:
-        """Snapshots current masters' stakes and returns our share in [0,1]."""
         pretty.kv_panel(
             "Master Stakes => Budget",
             [("epoch (e)", epoch), ("action", "Calculating master validators’ stakes to compute personal budget share…")],
@@ -173,17 +162,13 @@ class AuctionEngine:
             pretty.log("[yellow]No active masters meet the threshold this epoch.[/yellow]")
         return share
 
-    # --- NEW: axon filtering helpers to avoid 0.0.0.0:0 / localhost / bad ports ---
+    # --- Axon reachability helpers ---
     @staticmethod
     def _extract_ip_port(ax) -> Tuple[Optional[str], Optional[int]]:
-        """Best-effort extraction of (ip, port) from various axon layouts."""
-        ip = None
-        port = None
+        ip, port = None, None
         try:
-            # Common attrs
             ip = getattr(ax, "ip", None) or getattr(ax, "external_ip", None)
             port = getattr(ax, "port", None) or getattr(ax, "external_port", None)
-            # Endpoint object fallback
             ep = getattr(ax, "endpoint", None)
             if ep is not None:
                 ip = ip or getattr(ep, "ip", None)
@@ -213,7 +198,6 @@ class AuctionEngine:
             return False, f"bad ip {ip!r}"
         if port is None or not (1 <= int(port) <= 65535):
             return False, f"bad port {port!r}"
-        # optional flag many axons expose
         is_serving = getattr(ax, "is_serving", True)
         if is_serving is False:
             return False, "not serving"
@@ -241,6 +225,7 @@ class AuctionEngine:
             style="bold cyan",
         )
         return good
+
     # -----------------------------------------------------------------------
 
     def _accept_bid_from(self, *, uid: int, subnet_id: int, alpha: float, discount_bps: int) -> Tuple[bool, Optional[str]]:
@@ -276,7 +261,7 @@ class AuctionEngine:
         if w <= 0.0:
             return False, f"subnet weight {w:.4f} ≤ 0 (sid={subnet_id})"
 
-        # enforce one uid per coldkey (per epoch per master)  ← anti DDOS / anti split
+        # enforce one uid per coldkey (per epoch per master)
         ck_map = self._ck_uid_epoch[epoch]
         existing_uid = ck_map.get(ck)
         if existing_uid is not None and existing_uid != uid:
@@ -293,7 +278,9 @@ class AuctionEngine:
         if first_on_subnet:
             self._ck_subnets_bid[epoch][ck] = count + 1
 
-        idx = len([b for (u, s), b in self._bid_book[epoch].items() if u == uid and s == subnet_id])
+        # idx should be stable per-miner across all subnets, not per (uid, subnet)
+        idx = sum(1 for (u, _s), _b in self._bid_book[epoch].items() if u == uid)
+
         self._bid_book[epoch][(uid, subnet_id)] = _Bid(
             epoch=epoch,
             subnet_id=subnet_id,
@@ -342,7 +329,7 @@ class AuctionEngine:
             auction_start_block=self.parent.block,
             min_stake_alpha=S_MIN_ALPHA_MINER,
             auction_budget_alpha=my_budget,
-            weights_bps=dict(self.weights_bps),
+            weights_bps=dict(self.weights_bps),  # subnet_id -> bps
             treasury_coldkey=VALIDATOR_TREASURIES.get(self.parent.hotkey_ss58, ""),
             validator_uid=v_uid,
             validator_hotkey=self.parent.hotkey_ss58,
@@ -374,7 +361,6 @@ class AuctionEngine:
             if uid is None:
                 continue
             for b in bids:
-                # Attempt to parse; on failure record a rejection entry
                 malformed = False
                 try:
                     subnet_id = int(b.get("subnet_id"))
@@ -392,15 +378,10 @@ class AuctionEngine:
                     reasons_counter[reason] += 1
                     if len(reject_rows) < max(10, LOG_TOP_N):
                         reject_rows.append([uid, subnet_id if subnet_id is not None else "?", f"{alpha}", f"{discount_bps}", reason])
-                    # persist diagnostic
                     ck = self.parent.metagraph.coldkeys[uid] if (0 <= uid < len(self.parent.metagraph.coldkeys)) else ""
                     self._rejected_bids_by_epoch[e].append({
-                        "uid": uid,
-                        "coldkey": ck,
-                        "subnet_id": subnet_id,
-                        "alpha": alpha,
-                        "discount_bps": discount_bps,
-                        "reason": reason,
+                        "uid": uid, "coldkey": ck, "subnet_id": subnet_id, "alpha": alpha,
+                        "discount_bps": discount_bps, "reason": reason,
                     })
                     continue
 
@@ -413,15 +394,10 @@ class AuctionEngine:
                     reasons_counter[r] += 1
                     if len(reject_rows) < max(10, LOG_TOP_N):
                         reject_rows.append([uid, subnet_id, f"{alpha:.4f} α", f"{discount_bps} bps", r])
-                    # persist diagnostic
                     ck = self.parent.metagraph.coldkeys[uid] if (0 <= uid < len(self.parent.metagraph.coldkeys)) else ""
                     self._rejected_bids_by_epoch[e].append({
-                        "uid": uid,
-                        "coldkey": ck,
-                        "subnet_id": subnet_id,
-                        "alpha": float(alpha),
-                        "discount_bps": int(discount_bps),
-                        "reason": r,
+                        "uid": uid, "coldkey": ck, "subnet_id": subnet_id, "alpha": float(alpha),
+                        "discount_bps": int(discount_bps), "reason": r,
                     })
 
         self._auction_start_sent_for = self.parent.epoch_index
@@ -453,7 +429,6 @@ class AuctionEngine:
             if self.clearer is not None:
                 ok = await self.clearer.clear_now_and_notify(epoch_to_clear=self.parent.epoch_index)
 
-                # Post-clear staging snapshot
                 try:
                     keys = list(self.state.pending_commits.keys()) if isinstance(self.state.pending_commits, dict) else []
                 except Exception:

@@ -1,37 +1,27 @@
-# ╭──────────────────────────────────────────────────────────────────────╮
-# metahash/validator/epoch_validator.py                                  #
-# (v2.3 + EPOCH_LENGTH_OVERRIDE support + TESTING bootstrap forward)     #
-# + Strategy refresh-before-forward                                       #
-# ╰──────────────────────────────────────────────────────────────────────╯
+# metahash/validator/epoch_validator.py
 from __future__ import annotations
 
 import asyncio
 from datetime import datetime
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, Any
 
 import bittensor as bt
-from bittensor import BLOCKTIME  # 12 s on Finney
+from bittensor import BLOCKTIME
 
 from metahash.base.validator import BaseValidatorNeuron
 from metahash.config import EPOCH_LENGTH_OVERRIDE, TESTING
-from metahash.validator.strategy import Strategy  # <-- NEW
+from metahash.validator.strategy import Strategy  # unified
 
 
 class EpochValidatorNeuron(BaseValidatorNeuron):
-    """Validator base-class with robust epoch rollover handling.
+    """
+    Validator base-class with robust epoch rollover handling.
 
-    This version additionally honors `EPOCH_LENGTH_OVERRIDE` from
-    `metahash.config`. When > 0, epoch length and the wait loop are driven
-    by the override (e.g., 10 blocks) instead of the chain's tempo.
-    This lets you test full e/e+1/e+2 flows quickly.
+    This version honors `EPOCH_LENGTH_OVERRIDE` and refreshes Strategy weights
+    immediately before each forward() invocation.
 
-    ⚠️ Note: With overrides you are *not* aligned to real chain epoch heads.
-    If you try to call `set_weights()` outside real heads, the chain will
-    reject it. When `TESTING=True`, you should also configure the validator
-    to avoid on-chain `set_weights` (e.g., via `config.no_epoch=True`).
-
-    Additionally, this class now refreshes Strategy weights immediately
-    before each forward() invocation.
+    Note: Strategy here is used for operator visibility; subnet weights are
+    also recomputed in the concrete Validator and injected into engines.
     """
 
     def __init__(self, *args, log_interval_blocks: int = 2, **kwargs):
@@ -40,15 +30,13 @@ class EpochValidatorNeuron(BaseValidatorNeuron):
         self._epoch_len: Optional[int] = None
         self.epoch_end_block: Optional[int] = None
         self._override_active: bool = False
-        self._bootstrapped: bool = False  # run forward immediately if TESTING
+        self._bootstrapped: bool = False
 
-        # --- Strategy wiring (defaults are safe; YAML is optional) ---- #
-        # You can override the defaults by extending __init__ in your concrete
-        # validator or by exposing config values that feed here.
+        # Strategy wiring
         strategy_path = getattr(self.config, "strategy_path", "weights.yml")
         strategy_algo_path = getattr(self.config, "strategy_algo_path", None)
         self.strategy = Strategy(path=strategy_path, algorithm_path=strategy_algo_path)
-        self.current_weights_bps: List[int] = []  # refreshed before each forward
+        self.current_strategy_out: Any = None  # can be dict (subnet bps) or list
 
     # ----------------------- helpers ---------------------------------- #
     def _discover_epoch_length(self) -> int:
@@ -96,7 +84,6 @@ class EpochValidatorNeuron(BaseValidatorNeuron):
         return blk, start, end, idx, ep_l
 
     def _apply_epoch_state(self, blk: int, start: int, end: int, idx: int, ep_len: int):
-        """Persist epoch fields to the instance and log the head."""
         self.epoch_start_block = start
         self.epoch_end_block = end
         self.epoch_index = idx
@@ -127,27 +114,28 @@ class EpochValidatorNeuron(BaseValidatorNeuron):
             await asyncio.sleep(sleep_blocks * BLOCKTIME * 0.95)
 
     # ----------------------- strategy refresh ------------------------- #
-    def _refresh_strategy_before_forward(self) -> List[int]:
+    def _refresh_strategy_before_forward(self):
         """
-        Recompute weights from the Strategy right before forward().
-        Keeps the most recent vector on self.current_weights_bps.
+        Recompute strategy output for operator visibility.
+        Supports dict (subnet bps) or list outputs.
         """
         try:
-            # self.sync() is called by run() around this; metagraph is fresh.
-            weights = self.strategy.compute_weights_bps(
+            out = self.strategy.compute_weights_bps(
                 netuid=self.config.netuid,
-                metagraph=self.metagraph,   # provided by BaseValidatorNeuron
-                active_uids=None,           # strategy picks range(n) by default
+                metagraph=self.metagraph,
+                active_uids=None,
             )
-            self.current_weights_bps = weights
-            bt.logging.info(
-                f"[strategy] refreshed weights (sum={sum(weights)}) "
-                f"nonzeros={sum(1 for w in weights if w)}"
-            )
-            return weights
+            self.current_strategy_out = out
+            # tolerant logging
+            if isinstance(out, dict):
+                nonzero = sum(1 for v in out.values() if int(v) > 0)
+                total = sum(int(v) for v in out.values())
+                bt.logging.info(f"[strategy] refreshed subnet weights (entries={len(out)} nonzero={nonzero} sum_bps={total})")
+            else:
+                nz = sum(1 for v in (out or []) if v)
+                bt.logging.info(f"[strategy] refreshed weights (len={len(out or [])} nonzeros={nz})")
         except Exception as e:
             bt.logging.warning(f"[strategy] refresh failed: {e}")
-            return getattr(self, "current_weights_bps", [])
 
     # ----------------------- main loop -------------------------------- #
     def run(self):  # noqa: D401
@@ -171,16 +159,14 @@ class EpochValidatorNeuron(BaseValidatorNeuron):
                     f"blocks (~{int(eta_s // 60)}m{int(eta_s % 60):02d}s)"
                 )
 
-                # --- TESTING bootstrap: run a forward immediately on first loop ---
+                # TESTING bootstrap
                 if TESTING and not self._bootstrapped:
-                    # Treat the *current* position as a head for testing purposes.
-                    # This avoids waiting for the next real/override head on startup.
                     self._apply_epoch_state(blk, start, end, idx, ep_len)
                     self._bootstrapped = True
 
                     try:
                         self.sync()
-                        self._refresh_strategy_before_forward()  # <-- NEW
+                        self._refresh_strategy_before_forward()
                         await self.concurrent_forward()
                     except Exception as err:
                         bt.logging.error(f"bootstrap forward() raised: {err}")
@@ -191,27 +177,23 @@ class EpochValidatorNeuron(BaseValidatorNeuron):
                             bt.logging.warning(f"wallet sync failed: {e}")
                         self.step += 1
 
-                    # After bootstrap, continue the loop to await the next head normally (unless no_epoch).
                     if self.config.no_epoch:
-                        # When no_epoch is True, we keep looping to call forward at each detected head
-                        # (below, after the wait). Skip the wait here so we can refresh the snapshot now.
                         pass
                     else:
                         await self._wait_for_next_head()
 
                 else:
-                    # Normal path: wait for the next head unless explicitly disabled.
                     if not self.config.no_epoch:
                         await self._wait_for_next_head()
 
-                # Recompute snapshot *at* the head (or immediately after bootstrap)
-                self._epoch_len = None  # allow re-probe in case tempo/override changed
+                # head snapshot
+                self._epoch_len = None
                 blk2, start2, end2, idx2, ep_len2 = self._epoch_snapshot()
                 self._apply_epoch_state(blk2, start2, end2, idx2, ep_len2)
 
                 try:
                     self.sync()
-                    self._refresh_strategy_before_forward()  # <-- NEW (always before forward)
+                    self._refresh_strategy_before_forward()
                     await self.concurrent_forward()
                 except Exception as err:
                     bt.logging.error(f"forward() raised: {err}")
