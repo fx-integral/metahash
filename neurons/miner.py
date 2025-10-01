@@ -27,6 +27,9 @@ class Miner(BaseMinerNeuron):
     """
 
     def __init__(self, config=None):
+        # Wallet unlock (best-effort)
+        unlock_wallet(wallet=self.wallet)
+
         super().__init__(config=config)
 
         # ---------------------- Per-coldkey state directory ----------------------
@@ -40,9 +43,6 @@ class Miner(BaseMinerNeuron):
             # Fallback to cwd but still keep per-coldkey filename to avoid clobbering
             self._state_dir = Path(".")
             state_path = Path(f"miner_state_{self._coldkey_ss58}.json")
-
-        # Wallet unlock (best-effort)
-        unlock_wallet(wallet=self.wallet)
 
         # ---------------------- StateStore ----------------------
         self.state = StateStore(state_path)
