@@ -89,6 +89,10 @@ class AuctionEngine:
         self._ck_uid_epoch: Dict[int, Dict[str, int]] = defaultdict(dict)
         self._ck_subnets_bid: Dict[int, Dict[str, int]] = defaultdict(dict)  # distinct subnet count per coldkey
 
+        # NEW: record rejected bids (for IPFS diagnostics snapshot)
+        # { epoch: [ {uid, coldkey, subnet_id, alpha, discount_bps, reason} ] }
+        self._rejected_bids_by_epoch: Dict[int, List[Dict[str, object]]] = defaultdict(list)
+
         # snapshot of master stakes & our share per epoch e
         self._master_stakes_by_epoch: Dict[int, Dict[str, float]] = {}
         self._my_share_by_epoch: Dict[int, float] = {}
@@ -370,17 +374,36 @@ class AuctionEngine:
             if uid is None:
                 continue
             for b in bids:
+                # Attempt to parse; on failure record a rejection entry
+                malformed = False
                 try:
                     subnet_id = int(b.get("subnet_id"))
                     alpha = float(b.get("alpha"))
                     discount_bps = int(b.get("discount_bps"))
                 except Exception:
+                    malformed = True
+                    subnet_id = b.get("subnet_id", None)
+                    alpha = b.get("alpha", None)
+                    discount_bps = b.get("discount_bps", None)
+
+                if malformed:
                     bids_rejected += 1
                     reason = "malformed bid"
                     reasons_counter[reason] += 1
                     if len(reject_rows) < max(10, LOG_TOP_N):
-                        reject_rows.append([uid, b.get("subnet_id", "?"), f"{b.get('alpha', '?')}", f"{b.get('discount_bps', '?')}", reason])
+                        reject_rows.append([uid, subnet_id if subnet_id is not None else "?", f"{alpha}", f"{discount_bps}", reason])
+                    # persist diagnostic
+                    ck = self.parent.metagraph.coldkeys[uid] if (0 <= uid < len(self.parent.metagraph.coldkeys)) else ""
+                    self._rejected_bids_by_epoch[e].append({
+                        "uid": uid,
+                        "coldkey": ck,
+                        "subnet_id": subnet_id,
+                        "alpha": alpha,
+                        "discount_bps": discount_bps,
+                        "reason": reason,
+                    })
                     continue
+
                 ok, reason = self._accept_bid_from(uid=uid, subnet_id=subnet_id, alpha=alpha, discount_bps=discount_bps)
                 if ok:
                     bids_accepted += 1
@@ -390,6 +413,16 @@ class AuctionEngine:
                     reasons_counter[r] += 1
                     if len(reject_rows) < max(10, LOG_TOP_N):
                         reject_rows.append([uid, subnet_id, f"{alpha:.4f} α", f"{discount_bps} bps", r])
+                    # persist diagnostic
+                    ck = self.parent.metagraph.coldkeys[uid] if (0 <= uid < len(self.parent.metagraph.coldkeys)) else ""
+                    self._rejected_bids_by_epoch[e].append({
+                        "uid": uid,
+                        "coldkey": ck,
+                        "subnet_id": subnet_id,
+                        "alpha": float(alpha),
+                        "discount_bps": int(discount_bps),
+                        "reason": r,
+                    })
 
         self._auction_start_sent_for = self.parent.epoch_index
 
@@ -445,3 +478,4 @@ class AuctionEngine:
         self._bid_book.pop(before_epoch, None)
         self._ck_uid_epoch.pop(before_epoch, None)
         self._ck_subnets_bid.pop(before_epoch, None)
+        self._rejected_bids_by_epoch.pop(before_epoch, None)

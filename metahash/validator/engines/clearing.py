@@ -58,6 +58,13 @@ class ClearingEngine:
       - Two-pass allocation: pass1 honors reputation caps; pass2 relaxes caps to
         consume leftover budget if any bids remain (no reason to leave VALUE idle).
       - Track accepted α per bid across passes to never exceed request.
+
+    NEW (diagnostics snapshots in payload):
+      - Include ALL accepted bids (not only winners) with requested α and estimated VALUE.
+      - Include rejected bids with reasons (from AuctionEngine) if any.
+      - Include reputation snapshot for involved coldkeys (+ caps/params).
+      - Include jail snapshot for involved coldkeys.
+      - Include weights used by this validator (bps map and optional default).
     """
 
     def __init__(self, parent, state: StateStore):
@@ -280,7 +287,7 @@ class ClearingEngine:
         # 2) Build allocation inputs (subnet weights already snapped when accepting the bid)
         bids_in_all: List[BidInput] = self._to_bid_inputs(bid_map)
 
-        # Enforce forbidden subnets at clearing time as well
+        # Enforce forbidden subnets at clearing time as well (for allocation)
         bids_in: List[BidInput] = [
             b for b in bids_in_all if b.subnet_id not in FORBIDDEN_ALPHA_SUBNETS
         ]
@@ -291,8 +298,9 @@ class ClearingEngine:
             return False
 
         # 2.a Estimate prices & depths for **ordering + valuation with slippage**
-        price_by_sid: Dict[int, float] = await self._estimate_prices_for_bids(bids_in, start_block, end_block)
-        depth_by_sid: Dict[int, int] = await self._estimate_depths_for_bids(bids_in, start_block, end_block)
+        # Use *all* accepted bids for pricing so we can snapshot values for non-winners too
+        price_by_sid: Dict[int, float] = await self._estimate_prices_for_bids(bids_in_all, start_block, end_block)
+        depth_by_sid: Dict[int, int] = await self._estimate_depths_for_bids(bids_in_all, start_block, end_block)
 
         def line_value_tao(b: BidInput, alpha: float) -> float:
             """VALUE TAO for *alpha* of this bid using price+slippage × weight × (1−discount)."""
@@ -449,15 +457,8 @@ class ClearingEngine:
 
             # Update per-CK cap if used
             if cap_left_tao and ck_cap_left != float("inf"):
-                # consumed was reflected via remaining_budget_tao, but to reduce per-CK cap
-                # we need to recompute how much was consumed for this bid:
-                # We approximate by the last row added (safe for logs; cap update exactness not critical).
-                # For strict correctness, we'd recompute line_value_tao for the "take_alpha" we just accepted.
-                # For simplicity, get "take_alpha" from accepted map delta:
                 key = (b.miner_uid, b.subnet_id, b.idx)
                 take_alpha = accepted_alpha_by_key[key]  # total accepted so far on this bid
-                # compute consumed just for this bid acceptance: value at "take_alpha" minus previous acceptance value
-                # (assume previous acceptance was 0.0 on pass1)
                 tao_consumed = line_value_tao(b, take_alpha)
                 cap_left_tao[ck] = max(0.0, ck_cap_left - tao_consumed)
 
@@ -522,6 +523,96 @@ class ClearingEngine:
             rows_w,
         )
 
+        # ---------- NEW: Build snapshot of ALL accepted bids (not only winners) ----------
+        bids_lines_by_uid: Dict[int, List[List[int]]] = defaultdict(list)
+        uids_involved = set()
+        cks_involved = set()
+        for b in bids_in_all:
+            req_alpha = max(0.0, float(b.alpha))
+            req_rao = int(round(req_alpha * PLANCK))
+            val_req = line_value_tao(b, req_alpha)
+            bids_lines_by_uid[int(b.miner_uid)].append(
+                [
+                    int(b.subnet_id),
+                    int(b.discount_bps),
+                    int(b.weight_bps),
+                    int(req_rao),
+                    int(encode_value_mu(val_req)),
+                ]
+            )
+            uids_involved.add(int(b.miner_uid))
+            cks_involved.add(str(b.coldkey))
+
+        # rejected bids (recorded by AuctionEngine during accept stage)
+        rejected_compact: List[List[object]] = []
+        try:
+            rej = getattr(self.parent.auction, "_rejected_bids_by_epoch", {}).get(epoch_to_clear, []) or []
+        except Exception:
+            rej = []
+        for r in rej:
+            try:
+                uid = int(r.get("uid", -1))
+                subnet_id = r.get("subnet_id", 0)
+                subnet_id = int(subnet_id) if subnet_id is not None else 0
+                alpha = float(r.get("alpha", 0.0)) if r.get("alpha") is not None else 0.0
+                discount_bps = int(r.get("discount_bps", 0)) if r.get("discount_bps") is not None else 0
+                reason = str(r.get("reason", ""))
+                req_rao = int(round(max(0.0, alpha) * PLANCK))
+                rejected_compact.append([uid, subnet_id, req_rao, discount_bps, reason])
+            except Exception:
+                # best-effort; skip malformed diagnostic line
+                continue
+
+        # coldkey mapping for involved UIDs
+        ck_by_uid: Dict[int, str] = {}
+        try:
+            coldkeys = list(self.parent.metagraph.coldkeys or [])
+        except Exception:
+            coldkeys = []
+        for uid in sorted(uids_involved):
+            if 0 <= uid < len(coldkeys):
+                ck_by_uid[uid] = str(coldkeys[uid])
+
+        # reputation snapshot for involved coldkeys + caps/params
+        rep_store: Dict[str, float] = getattr(self.state, "reputation", {}) or {}
+        rep_snapshot = {ck: float(rep_store.get(ck, 0.0)) for ck in sorted(cks_involved)}
+        rep_caps_mu = {ck: int(encode_value_mu(float(cap_tao_by_ck.get(ck, 0.0)))) for ck in sorted(cks_involved)} if cap_tao_by_ck else {}
+        rep_quota_frac = {ck: float(quota_frac.get(ck, 0.0)) for ck in sorted(cks_involved)} if quota_frac else {}
+
+        # jail snapshot for involved coldkeys
+        try:
+            jail_map = getattr(self.state, "ck_jail_until_epoch", {}) or {}
+        except Exception:
+            jail_map = {}
+        jail_snapshot = {ck: int(jail_map.get(ck, -1)) for ck in sorted(cks_involved) if ck in jail_map}
+
+        # weights snapshot (bps integer map + optional default from Strategy)
+        try:
+            weights_src = dict(getattr(self.parent.auction, "weights_bps", {}) or {})
+        except Exception:
+            weights_src = {}
+        wbps = {}
+        for sid_raw, val in weights_src.items():
+            try:
+                sid = int(sid_raw)
+            except Exception:
+                continue
+            try:
+                v = float(val)
+            except Exception:
+                v = 0.0
+            if v <= 1.0:
+                bp = int(round(v * 10_000.0))
+            else:
+                bp = int(round(v))
+            wbps[sid] = max(0, min(10_000, bp))
+        try:
+            strat = getattr(self.parent, "strategy", None)
+            default_val = float(getattr(strat, "default_value", None)) if strat is not None else None
+        except Exception:
+            default_val = None
+        wbps_default = int(round(default_val * 10_000.0)) if default_val is not None else None
+
         # 5) Stash pending commitment snapshot (publish later with SAME window)
         pay_epoch = int(epoch_to_clear + 1)
         epoch_len = int(self.parent.epoch_end_block - self.parent.epoch_start_block + 1)
@@ -556,7 +647,7 @@ class ClearingEngine:
             "de": int(win_end),
             "hk": self.parent.hotkey_ss58,
             "t": VALIDATOR_TREASURIES.get(self.parent.hotkey_ss58, ""),
-            # inventory (compact):
+            # inventory (compact winners):
             "inv": {str(uid): {"ck": ""} for uid in inv_i.keys()},
             "i": [[uid, lines] for uid, lines in inv_i.items()],
             # budget markers
@@ -564,6 +655,32 @@ class ClearingEngine:
             "bl_mu": bl_mu,
             "bt_tao": float(my_budget_tao),
             "bl_tao": float(remaining_budget_tao),
+
+            # ---------- NEW snapshots ----------
+            # All accepted bids this epoch (requested α), per-uid compact list:
+            # each line: [subnet_id, discount_bps, weight_bps, req_rao, est_value_mu]
+            "b": [[uid, lines] for uid, lines in bids_lines_by_uid.items()],
+            # mapping uid -> coldkey for involved miners
+            "ck_by_uid": {str(uid): ck for uid, ck in ck_by_uid.items()},
+            # rejected bids with reasons: [uid, subnet_id, req_rao, discount_bps, reason]
+            "rj": rejected_compact,
+            # reputation snapshot and params
+            "rep": {
+                "enabled": bool(REPUTATION_ENABLED),
+                "gamma": float(REPUTATION_MIX_GAMMA),
+                "baseline": float(REPUTATION_BASELINE_CAP_FRAC),
+                "capmax": float(REPUTATION_MAX_CAP_FRAC),
+                "scores": rep_snapshot,           # {coldkey: score in [0,1]}
+                "cap_tao_mu": rep_caps_mu,        # {coldkey: cap in μTAO for this epoch}
+                "quota_frac": rep_quota_frac,     # {coldkey: fraction used to derive cap}
+            },
+            # jail snapshot for involved coldkeys
+            "jail": jail_snapshot,                # {coldkey: jail_until_epoch}
+            # weights used by this validator when accepting bids (bps integers 0..10000)
+            "wbps": {
+                "map": wbps,                      # {subnet_id: weight_bps}
+                "default": wbps_default,          # int or null
+            },
         }
 
         key = str(epoch_to_clear)
@@ -581,6 +698,11 @@ class ClearingEngine:
                 ("de", payload["de"]),
                 ("#miners", len(payload["inv"])),
                 ("#lines_total", sum(len(v) for _, v in inv_i.items())),
+                ("#bidders_all", len(bids_lines_by_uid)),
+                ("#rejected", len(rejected_compact)),
+                ("#rep_keys", len(rep_snapshot)),
+                ("#jail_keys", len(jail_snapshot)),
+                ("#wbps_sids", len(wbps)),
             ],
             style="bold magenta",
         )

@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # btv-health.sh — Validator health + bids/winners/reputation report
+# Works on mawk (Debian /usr/bin/awk) and gawk.
 # Usage examples:
-#   ./btv-health.sh --pm2-index 4 --lines 8000 -n 5 --detailed
-#   ./btv-health.sh --pm2-name validator-v3 --lines 12000 -n 10
-#   tail -n 5000 validator.log | ./btv-health.sh -n 5 --detailed
+#   ./scripts/validator/report.sh --pm2-index 4 --lines 8000 -n 5 --detailed
+#   ./scripts/validator/report.sh --pm2-name validator-v3 --lines 12000 -n 10
+#   tail -n 5000 validator.log | ./scripts/validator/report.sh -n 5 --detailed
 set -euo pipefail
 
 usage() {
@@ -23,10 +24,6 @@ Options:
   --lines K            Tail K lines from each PM2 log file (default: 5000)
   --detailed           Print per-epoch detailed sections
   -h, --help           Show this help
-
-Notes:
-  • Requires 'pm2' if using --pm2-*; 'jq' improves log-path discovery.
-  • Without --pm2-* or -f, reads from STDIN.
 USAGE
 }
 
@@ -37,6 +34,7 @@ INPUT="/dev/stdin"
 PM2_IDX=""
 PM2_NAME=""
 LINES=5000
+TMP_INPUT=""
 
 # Parse args
 while [[ $# -gt 0 ]]; do
@@ -51,6 +49,9 @@ while [[ $# -gt 0 ]]; do
     *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
   esac
 done
+
+cleanup() { [[ -n "$TMP_INPUT" && -f "$TMP_INPUT" ]] && rm -f "$TMP_INPUT"; }
+trap cleanup EXIT
 
 resolve_pm2_logs() {
   local idx="$1" name="$2" lines="$3"
@@ -86,8 +87,9 @@ resolve_pm2_logs() {
   out: $out
   err: $err" >&2; exit 1
   fi
-  INPUT=$(mktemp)
-  { [[ -f "$out" ]] && tail -n "$lines" -- "$out"; [[ -f "$err" ]] && tail -n "$lines" -- "$err"; } > "$INPUT"
+  TMP_INPUT=$(mktemp)
+  { [[ -f "$out" ]] && tail -n "$lines" -- "$out"; [[ -f "$err" ]] && tail -n "$lines" -- "$err"; } > "$TMP_INPUT"
+  INPUT="$TMP_INPUT"
 }
 
 if [[ -n "$PM2_IDX" || -n "$PM2_NAME" ]]; then
@@ -105,7 +107,7 @@ function key(e,i){ return e SUBSEP i }
 function kck(e,ck){ return e SUBSEP ck }
 
 BEGIN{
-  PROCINFO["sorted_in"] = "cmp_num_asc"
+  # NOTE: Do NOT set PROCINFO["sorted_in"] here; mawk doesn’t support it.
   nOrder=0
   current_e=""; auction_e=""; budget_e=""; winners_e=""; settle_e=""
   in_budget_block=0; in_winners=0; in_invoices=0
@@ -155,8 +157,6 @@ in_budget_block && ($0 ~ /^╰/ || $0 ~ /^$/ || $0 ~ /Connecting to Substrate/) 
 # ---- Bids — ordered by VALUE (TAO) ----
 /^.*Bids[[:space:]]*[—-].*VALUE.*TAO/ { in_bids=1; bids_e=(budget_e!=""?budget_e:(auction_e!=""?auction_e:current_e)); add_epoch(bids_e); next }
 in_bids {
-  # Table row looks like:
-  #   185 │ 5G6C… │ 39 │ 10000 │ 0 │ 3.0000 │ 0.0124… │ 98825… │ 0.0372…
   if($0 ~ /^[[:space:]]*[0-9]+[[:space:]]*│/ && $0 !~ /UID[[:space:]]*│/){
     n=split($0,col,/│/)
     uid=trim(col[1]); ck=trim(col[2]); sid=trim(col[3]); wbps=trim(col[4]); disc=trim(col[5])
@@ -178,7 +178,6 @@ in_bids {
 # ---- Reputation caps (TAO, per coldkey) ----
 /^.*Reputation caps.*\(TAO.*per coldkey\)/ { in_rep=1; rep_e=(budget_e!=""?budget_e:current_e); add_epoch(rep_e); next }
 in_rep {
-  # Row looks like: 5CcbwD9d… │ 0.333 │ 0.253982 TAO
   if($0 ~ /│/ && $0 !~ /Coldkey/){
     n=split($0,col,/│/)
     ck=trim(col[1]); q=trim(col[2]); cap=trim(col[3])
@@ -193,7 +192,6 @@ in_rep {
 # ---- Winners — acceptances ----
 /^.*Winners.*acceptances/ { in_winners=1; winners_e=(budget_e!=""?budget_e:(auction_e!=""?auction_e:current_e)); add_epoch(winners_e); next }
 in_winners {
-  # Row looks like: UID │ CK │ Subnet │ Req α │ Acc α │ Disc… │ W_bps │ TAO │ Fill
   if($0 ~ /^[[:space:]]*[0-9]+[[:space:]]*│/ && $0 !~ /UID[[:space:]]*│/){
     n=split($0,col,/│/)
     uid=trim(col[1]); ck=trim(col[2]); sid=trim(col[3])
@@ -404,7 +402,6 @@ END{
   printf(fmt, "Unpaid/partial invoices:", sprintf("%d epochs with unpaid: %d", mat_unpaid_invoices, epochs_with_unpaid))
   printf("%s\n", line)
 
-  # Warnings (simple)
   if(agg_reach_den>0 && reach_rate < 20.0) print "WARN: Low axon reachability (<20%). Supply constrained."
   if(agg_ack_total>0 && ack_rate < 20.0)   print "WARN: Low auction ACK rate (<20%). Miners unresponsive."
   tburn=0; ttarget=0; for(j=1;j<=lastCnt;j++){ e=last[j]; tburn+=nz(burn_deficit[e],0); ttarget+=nz(target_budget[e],0) }
@@ -439,7 +436,7 @@ END{
       printf("    win acks:          %d/%d (%.2f%%)\n", nz(winacks_recv[e],0), nz(winacks_total[e],0), wr)
     }
 
-    # --- Reputation caps for this epoch ---
+    # Reputation caps only if captured
     if(rep_seen[e]){
       print "  Reputation caps (per coldkey)"
       printf("      %-14s  %-10s  %-10s\n", "Coldkey", "Quota", "Cap(TAO)")
@@ -450,7 +447,6 @@ END{
       }
     }
 
-    # --- Bids (ordered by VALUE) ---
     if(nz(bcount[e],0)>0){
       print "  Bids — ordered by VALUE (TAO)"
       printf("      %5s  %-14s  %6s  %6s  %6s  %9s  %11s  %9s\n", "UID","CK","Subnet","W_bps","Disc","Bid α","Price TAO/α","VALUE")
@@ -467,7 +463,6 @@ END{
       }
     }
 
-    # --- Winners (acceptances) ---
     if(nz(wcount[e],0)>0){
       print "  Winning bids (acceptances)"
       printf("      %5s  %-14s  %6s  %9s  %9s  %6s  %6s  %9s  %5s\n", "UID","CK","Subnet","Req α","Acc α","Disc","W_bps","VALUE","Fill")
