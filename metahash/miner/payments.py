@@ -31,7 +31,7 @@ def _as_int(x: Any, default: int = 0) -> int:
         if isinstance(x, float):
             return int(x)
         s = str(x).strip()
-        return int(float(s))  # tolerate "123.0" and " 123 "
+        return int(float(s))
     except Exception:
         return default
 
@@ -80,7 +80,6 @@ class Payments:
 
     def _run_bg_loop(self):
         asyncio.set_event_loop(self._bg_loop)
-        # create locks on the actual running loop
         self._pay_lock = asyncio.Lock()
         self._bg_loop.run_forever()
 
@@ -94,7 +93,6 @@ class Payments:
         self.submit(self._pending_payments_watchdog())
 
     def shutdown_background(self):
-        # try cancel running tasks
         for fut in list(self._tasks.values()):
             try:
                 fut.cancel()
@@ -205,7 +203,7 @@ class Payments:
     async def _pending_payments_watchdog(self):
         try:
             while True:
-                self.schedule_unpaid_pending()  # idempotent
+                self.schedule_unpaid_pending()
                 await asyncio.sleep(max(0.5, float(BLOCKTIME)))
         except asyncio.CancelledError:
             raise
@@ -217,7 +215,6 @@ class Payments:
         for w in self.state.wins:
             if bool(getattr(w, "paid", False) or getattr(w, "expired", False)):
                 continue
-            # ensure treasury present for allowlisted validator
             treasury_ck = self.state.treasuries.get(w.validator_key) or self.state.treasuries.get(getattr(w, "validator_key", ""))
             if not treasury_ck:
                 pretty.kv_panel(
@@ -234,7 +231,7 @@ class Payments:
         tid = inv.invoice_id
         t = self._tasks.get(tid)
         if t and not t.done():
-            return  # already scheduled
+            return
 
         inv.last_response = f"scheduled (wait ≥{self._pay_start_safety_blocks} blk)"
         self.submit(self.state.save_async())
@@ -258,7 +255,6 @@ class Payments:
     # ---------------------- Worker ----------------------
 
     async def _maybe_transfer_alpha(self, **kwargs) -> Any:
-        """Call transfer_alpha whether it's sync or async depending on environment."""
         try:
             result = transfer_alpha(**kwargs)
             if inspect.isawaitable(result):
@@ -269,7 +265,7 @@ class Payments:
 
     async def _payment_worker(self, inv: WinInvoice):
         try:
-            await self.runtime._ensure_async_subtensor()  # ensure chain is ready
+            await self.runtime._ensure_async_subtensor()
 
             start = int(inv.pay_window_start_block or 0)
             end = int(inv.pay_window_end_block or 0)
@@ -279,7 +275,6 @@ class Payments:
             while True:
                 blk = await self.runtime.get_current_block()
 
-                # Too early
                 if start and (blk <= 0 or blk < allowed_start):
                     inv.last_response = f"waiting (blk {blk} < start {allowed_start})"
                     await self.state.save_async()
@@ -293,7 +288,6 @@ class Payments:
                     await asyncio.sleep(sleep_s)
                     continue
 
-                # Window over
                 if end and blk > end:
                     inv.last_response = f"window over (blk {blk} > end {end})"
                     inv.expired = True
@@ -306,7 +300,6 @@ class Payments:
                     self.state.status_tables()
                     break
 
-                # Attempt payment
                 attempt += 1
                 inv.last_attempt_ts = time.time()
                 await self.state.save_async()
@@ -322,7 +315,6 @@ class Payments:
                 paid_block: Optional[int] = None
                 origin_hotkey = self._origin_hotkey_for_invoice(inv)
 
-                # Check α balance on TARGET subnet before sending
                 need_alpha = float(inv.amount_rao) / float(PLANCK)
                 bal_alpha = await self.runtime.get_alpha_balance(inv.subnet_id, origin_hotkey)
                 if bal_alpha is not None and bal_alpha + 1e-12 < need_alpha:
@@ -333,11 +325,9 @@ class Payments:
                         [("inv", inv.invoice_id), ("subnet", inv.subnet_id), ("have α", f"{bal_alpha:.6f}"), ("need α", f"{need_alpha:.6f}")],
                         style="bold red",
                     )
-                    # Sleep until next retry
                     await asyncio.sleep(max(0.5, float(BLOCKTIME) * float(self._retry_every_blocks)))
                     continue
 
-                # Serialize critical RPC section (pay path)
                 async with self.runtime._rpc_lock:  # type: ignore
                     blk2 = await self.runtime.get_current_block()
                     if start and (blk2 <= 0 or blk2 < allowed_start):
@@ -440,7 +430,6 @@ class Payments:
             )
             return
         finally:
-            # cleanup finished/cancelled future
             t = self._tasks.get(inv.invoice_id)
             try:
                 if t and t.done():
@@ -451,22 +440,18 @@ class Payments:
     # ---------------------- Win handler ----------------------
 
     def _sanitize_win_synapse_numbers_inplace(self, syn: WinSynapse) -> None:
-        """Coerce common numeric fields on WinSynapse to real ints/floats to avoid Pydantic warnings."""
-        # ints
         for name in ("validator_uid", "subnet_id", "pay_window_start_block", "pay_window_end_block", "pay_epoch_index", "attempts"):
             if hasattr(syn, name):
                 try:
                     setattr(syn, name, _as_int(getattr(syn, name)))
                 except Exception:
                     pass
-        # floats
         for name in ("accepted_alpha", "requested_alpha", "alpha"):
             if hasattr(syn, name):
                 try:
                     setattr(syn, name, _as_float(getattr(syn, name)))
                 except Exception:
                     pass
-        # booleans that could arrive oddly
         if hasattr(syn, "was_partially_accepted"):
             try:
                 v = getattr(syn, "was_partially_accepted")
@@ -478,7 +463,6 @@ class Payments:
         await self.runtime._ensure_async_subtensor()
         self.ensure_payment_config()
 
-        # Normalize inbound numerics early to keep the model clean on the way out.
         self._sanitize_win_synapse_numbers_inplace(synapse)
 
         uid = getattr(synapse, "validator_uid", None)
@@ -536,13 +520,11 @@ class Payments:
             epoch_seen=epoch_now,
         )
 
-        # minimal-stable invoice id
         import hashlib
         inv.invoice_id = hashlib.sha1(
             f"{vkey}|{inv.subnet_id}|{inv.alpha:.12f}|{inv.discount_bps}|{inv.amount_rao}|{inv.pay_window_start_block}|{inv.pay_window_end_block}|{inv.pay_epoch_index or 0}".encode("utf-8")
         ).hexdigest()[:12]
 
-        # Merge duplicate if present
         for w in self.state.wins:
             if (
                 w.validator_key == inv.validator_key
@@ -588,7 +570,6 @@ class Payments:
         self._schedule_payment(inv)
         self.state.status_tables()
 
-        # Update outbound fields cleanly typed
         synapse.ack = True
         synapse.payment_attempted = bool(inv.pay_attempts > 0)
         synapse.payment_ok = bool(inv.paid)

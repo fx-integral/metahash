@@ -24,11 +24,9 @@ class StateStore:
     def __init__(self, path: Path):
         self.path: Path = Path(path)
         self.treasuries: Dict[str, str] = {}
-        # validator_key -> list[(epoch, subnet, alpha, discount_bps)]
         self.already_bid: Dict[str, List[Tuple[int, int, float, int]]] = {}
         self.wins: List[WinInvoice] = []
 
-        # Use a threading lock so both main loop and background thread can write safely.
         self._state_lock: threading.Lock = threading.Lock()
 
     # ---------------------- I/O ----------------------
@@ -60,7 +58,6 @@ class StateStore:
             try:
                 allowed = set(WinInvoice.__dataclass_fields__.keys())
                 clean = {k: v for k, v in w.items() if k in allowed}
-                # Ensure invoice_id present (backfill older entries)
                 if not clean.get("invoice_id"):
                     payload = (
                         f"{clean.get('validator_key', '')}|"
@@ -103,7 +100,7 @@ class StateStore:
             try:
                 with os.fdopen(tmp_fd, "w") as f:
                     json.dump(payload, f, indent=2, sort_keys=True)
-                os.replace(tmp_path, self.path)  # atomic on same fs
+                os.replace(tmp_path, self.path)
             finally:
                 try:
                     if os.path.exists(tmp_path):
@@ -112,7 +109,6 @@ class StateStore:
                     pass
 
     async def save_async(self):
-        # Offload sync write to a thread; safe from any loop / thread.
         import asyncio
         await asyncio.to_thread(self._save_sync)
 

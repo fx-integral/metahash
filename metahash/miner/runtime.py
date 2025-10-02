@@ -52,6 +52,32 @@ def parse_discount_token(tok: str) -> int:
     return max(0, min(10_000, int(round(val * 100))))
 
 
+def _as_int(x: Any, default: int = 0) -> int:
+    try:
+        if x is None:
+            return default
+        if isinstance(x, bool):
+            return int(x)
+        if isinstance(x, int):
+            return x
+        if isinstance(x, float):
+            return int(x)
+        return int(float(str(x).strip()))
+    except Exception:
+        return default
+
+
+def _as_float(x: Any, default: float = 0.0) -> float:
+    try:
+        if x is None:
+            return default
+        if isinstance(x, (int, float)):
+            return float(x)
+        return float(str(x).strip())
+    except Exception:
+        return default
+
+
 class Runtime:
     """
     Combines:
@@ -160,7 +186,6 @@ class Runtime:
             self._blk_cache_ts = now
             return height
 
-        # Last resort: substrate helper
         try:
             substrate = getattr(st, "substrate", None)
             if substrate is not None:
@@ -194,10 +219,6 @@ class Runtime:
             return 0.0
 
     async def get_validator_stakes_map(self, validator_hotkey_ss58: Optional[str], subnet_ids: List[int]) -> Dict[int, float]:
-        """
-        Per-subnet α that THIS miner's coldkey has delegated to the given validator hotkey.
-        Missing/failed lookups resolve to 0.0.
-        """
         await self._ensure_async_subtensor()
         st = self._async_subtensor
         if st is None or not validator_hotkey_ss58:
@@ -231,7 +252,6 @@ class Runtime:
         return out
 
     async def get_alpha_balance(self, subnet_id: int, hotkey_ss58: str) -> Optional[float]:
-        """Read α balance for a hotkey on a given subnet. Returns α (float) or None."""
         await self._ensure_async_subtensor()
         st = self._async_subtensor
         for name in ("get_alpha_balance", "alpha_balance", "get_balance_alpha"):
@@ -258,7 +278,13 @@ class Runtime:
     # ---------------------- AuctionStart handler ----------------------
 
     def _resolve_caller(self, syn: AuctionStartSynapse) -> tuple[Optional[int], str]:
-        uid = getattr(syn, "validator_uid", None)
+        uid_raw = getattr(syn, "validator_uid", None)
+        uid: Optional[int]
+        try:
+            uid = int(uid_raw) if uid_raw is not None else None
+        except Exception:
+            uid = None
+
         hk = getattr(syn, "validator_hotkey", None)
         if uid is None:
             try:
@@ -278,7 +304,6 @@ class Runtime:
 
     @staticmethod
     def _normalize_weights_bps(raw: Any) -> Dict[int, int]:
-        """Accept dict-like {sid: bps} or list-like [(sid, bps), ...], coerce to {int(sid): clamp_bps(int(bps))}."""
         out: Dict[int, int] = {}
         if isinstance(raw, dict):
             items: Iterable[Tuple[Any, Any]] = raw.items()
@@ -299,20 +324,40 @@ class Runtime:
             out[int(sid)] = int(bps)
         return out
 
+    def _sanitize_auction_synapse_inplace(self, syn: AuctionStartSynapse) -> None:
+        # ints
+        for name in ("validator_uid", "epoch_index", "auction_start_block"):
+            if hasattr(syn, name):
+                try:
+                    setattr(syn, name, _as_int(getattr(syn, name)))
+                except Exception:
+                    pass
+        # floats
+        for name in ("auction_budget_alpha", "min_stake_alpha"):
+            if hasattr(syn, name):
+                try:
+                    setattr(syn, name, _as_float(getattr(syn, name)))
+                except Exception:
+                    pass
+        # dict normalization
+        wb = getattr(syn, "weights_bps", {}) or {}
+        setattr(syn, "weights_bps", {int(_as_int(k)): int(clamp_bps(_as_int(v))) for k, v in (wb.items() if isinstance(wb, dict) else {})})
+
     async def handle_auction_start(self, synapse: AuctionStartSynapse, lines: List[BidLine]) -> AuctionStartSynapse:
         await self._ensure_async_subtensor()
+
+        # Sanitize inbound first (important for Axon serializer)
+        self._sanitize_auction_synapse_inplace(synapse)
 
         uid, caller_hot = self._resolve_caller(synapse)
         vkey = self._validator_key(uid, caller_hot)
 
-        # Coerce request-side numerics immediately (local vars only)
-        epoch = int(getattr(synapse, "epoch_index", 0) or 0)
-        budget_alpha = float(getattr(synapse, "auction_budget_alpha", 0.0) or 0.0)
-        min_stake_alpha = float(getattr(synapse, "min_stake_alpha", S_MIN_ALPHA_MINER) or S_MIN_ALPHA_MINER)
-        auction_start_block = int(getattr(synapse, "auction_start_block", 0) or 0)
+        epoch = _as_int(getattr(synapse, "epoch_index", 0))
+        budget_alpha = _as_float(getattr(synapse, "auction_budget_alpha", 0.0))
+        min_stake_alpha = _as_float(getattr(synapse, "min_stake_alpha", S_MIN_ALPHA_MINER) or S_MIN_ALPHA_MINER)
+        auction_start_block = _as_int(getattr(synapse, "auction_start_block", 0))
         treasury_ck_req = str(getattr(synapse, "treasury_coldkey", "") or "")
 
-        # Normalize weights map (handles dict or list-of-pairs, str->int coercion)
         weights_bps_in = getattr(synapse, "weights_bps", {}) or {}
         weights_bps: Dict[int, int] = self._normalize_weights_bps(weights_bps_in)
 
@@ -327,22 +372,21 @@ class Runtime:
                  ("note", note)],
                 style="bold red",
             )
-            # Respond minimally & cleanly typed
-            return AuctionStartSynapse(
-                epoch_index=epoch,
-                auction_start_block=auction_start_block,
-                min_stake_alpha=min_stake_alpha,
-                auction_budget_alpha=budget_alpha,
-                weights_bps=dict(weights_bps),
-                treasury_coldkey=treasury_ck_req,
-                validator_uid=uid,
-                validator_hotkey=caller_hot or None,
-                ack=True,
-                retries_attempted=0,
-                bids=[],
-                bids_sent=0,
-                note=note,
-            )
+            # Mutate response in-place with clean types
+            synapse.ack = True
+            synapse.retries_attempted = 0
+            synapse.bids = []
+            synapse.bids_sent = 0
+            synapse.note = note
+            synapse.epoch_index = int(epoch)
+            synapse.auction_start_block = int(auction_start_block)
+            synapse.min_stake_alpha = float(min_stake_alpha)
+            synapse.auction_budget_alpha = float(budget_alpha)
+            synapse.weights_bps = dict(weights_bps)
+            synapse.treasury_coldkey = str(treasury_ck_req)
+            synapse.validator_uid = uid
+            synapse.validator_hotkey = caller_hot or None
+            return synapse
 
         pretty.kv_panel(
             "[cyan]AuctionStart[/cyan]",
@@ -359,7 +403,6 @@ class Runtime:
             style="bold cyan",
         )
 
-        # Fetch per-target-subnet delegated α with this validator
         candidate_subnets = [int(ln.subnet_id) for ln in lines if isfinite(ln.alpha) and ln.alpha > 0 and 0 <= ln.discount_bps <= 10_000]
         stake_by_subnet: Dict[int, float] = {}
         if candidate_subnets and (caller_hot or vkey):
@@ -372,7 +415,6 @@ class Runtime:
                 stake_by_subnet = {int(s): 0.0 for s in candidate_subnets}
                 pretty.log(f"[yellow]Stake check failed; defaulting to 0 availability.[/yellow] {_e}")
 
-        # Stake gate by *target-subnet* availability
         if min_stake_alpha > 0:
             has_any = any(amt >= min_stake_alpha for amt in stake_by_subnet.values())
             if not has_any:
@@ -388,27 +430,26 @@ class Runtime:
                     style="bold yellow",
                 )
                 self.state.status_tables()
-                return AuctionStartSynapse(
-                    epoch_index=epoch,
-                    auction_start_block=auction_start_block,
-                    min_stake_alpha=min_stake_alpha,
-                    auction_budget_alpha=budget_alpha,
-                    weights_bps=dict(weights_bps),
-                    treasury_coldkey=treasury_ck_req,
-                    validator_uid=uid,
-                    validator_hotkey=caller_hot or None,
-                    ack=True,
-                    retries_attempted=0,
-                    bids=[],
-                    bids_sent=0,
-                    note="stake gate (per-subnet)",
-                )
 
-        # Track remaining stake per subnet to avoid oversubscription across lines
+                synapse.ack = True
+                synapse.retries_attempted = 0
+                synapse.bids = []
+                synapse.bids_sent = 0
+                synapse.note = "stake gate (per-subnet)"
+                synapse.epoch_index = int(epoch)
+                synapse.auction_start_block = int(auction_start_block)
+                synapse.min_stake_alpha = float(min_stake_alpha)
+                synapse.auction_budget_alpha = float(budget_alpha)
+                synapse.weights_bps = dict(weights_bps)
+                synapse.treasury_coldkey = str(treasury_ck_req)
+                synapse.validator_uid = uid
+                synapse.validator_hotkey = caller_hot or None
+                return synapse
+
         remaining_by_subnet: Dict[int, float] = dict(stake_by_subnet)
 
-        # IMPORTANT: out_bids are JSON-native 4-lists: [subnet_id:int, alpha:float, discount_bps:int, bid_id:str]
-        out_bids: List[List[Any]] = []
+        # out_bids are 4-tuples: (int subnet_id, float alpha, int discount_bps, str bid_id)
+        out_bids: List[Tuple[int, float, int, str]] = []
         rows_sent = []
 
         for ln in lines:
@@ -437,7 +478,6 @@ class Runtime:
             if budget_alpha > 0 and send_alpha > budget_alpha:
                 pretty.log(f"[grey58]Note:[/grey58] line α {send_alpha:.4f} exceeds validator budget α {budget_alpha:.4f}; may be partially filled.")
 
-            # Compute discount to send
             if self._bids_raw_discount:
                 send_disc_bps = int(ln.discount_bps)
                 eff_factor_bps = int(round(weight_bps * (1.0 - (send_disc_bps / 10_000.0))))
@@ -447,14 +487,12 @@ class Runtime:
                 eff_factor_bps = int(round(weight_bps * (1.0 - (send_disc_bps / 10_000.0))))
                 mode_note = "effective→raw"
 
-            # Skip duplicates
             if self.state.has_bid(vkey, epoch, subnet_id, send_alpha, send_disc_bps):
                 continue
 
             bid_id = hashlib.sha1(f"{vkey}|{epoch}|{subnet_id}|{send_alpha:.12f}|{send_disc_bps}".encode("utf-8")).hexdigest()[:10]
 
-            # Emit a PLAIN 4-LIST (JSON-friendly)
-            out_bids.append([int(subnet_id), float(send_alpha), int(send_disc_bps), str(bid_id)])
+            out_bids.append((int(subnet_id), float(send_alpha), int(send_disc_bps), str(bid_id)))
 
             self.state.remember_bid(vkey, epoch, subnet_id, send_alpha, send_disc_bps)
 
@@ -482,34 +520,20 @@ class Runtime:
         await self.state.save_async()
         self.state.status_tables()
 
-        # Return a FRESH synapse with sanitized numeric types and JSON-native bids
-        resp = AuctionStartSynapse(
-            epoch_index=int(epoch),
-            auction_start_block=int(auction_start_block),
-            min_stake_alpha=float(min_stake_alpha),
-            auction_budget_alpha=float(budget_alpha),
-            weights_bps=dict({int(k): int(v) for k, v in weights_bps.items()}),
-            treasury_coldkey=str(treasury_ck_req),
-            validator_uid=uid,
-            validator_hotkey=caller_hot or None,
-            ack=True,
-            retries_attempted=0,
-            bids=list(out_bids),          # <- list of 4-lists (no tuples)
-            bids_sent=int(len(out_bids)),
-            note=None,
-        )
+        # Mutate the same inbound synapse with clean types
+        synapse.ack = True
+        synapse.retries_attempted = 0
+        synapse.bids = list(out_bids)           # pydantic will accept list[tuple[...]]
+        synapse.bids_sent = int(len(out_bids))
+        synapse.note = None
 
-        # Optional sanity checks (safe to remove later)
-        try:
-            assert isinstance(resp.bids, list)
-            for b in resp.bids:
-                assert isinstance(b, list) and len(b) == 4
-                s, a, d, i = b
-                assert isinstance(s, int)
-                assert isinstance(a, float)
-                assert isinstance(d, int)
-                assert isinstance(i, str)
-        except AssertionError:
-            pretty.log("[red]Sanity check failed: bids must be a list of [int, float, int, str] lists.[/red]")
+        synapse.epoch_index = int(epoch)
+        synapse.auction_start_block = int(auction_start_block)
+        synapse.min_stake_alpha = float(min_stake_alpha)
+        synapse.auction_budget_alpha = float(budget_alpha)
+        synapse.weights_bps = dict({int(k): int(v) for k, v in weights_bps.items()})
+        synapse.treasury_coldkey = str(treasury_ck_req)
+        synapse.validator_uid = uid
+        synapse.validator_hotkey = caller_hot or None
 
-        return resp
+        return synapse

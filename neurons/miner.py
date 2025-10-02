@@ -28,7 +28,7 @@ class Miner(BaseMinerNeuron):
 
     def __init__(self, config=None):
         super().__init__(config=config)
-          
+
         # Wallet unlock (best-effort)
         unlock_wallet(wallet=self.wallet)
 
@@ -40,7 +40,6 @@ class Miner(BaseMinerNeuron):
             state_path = desired_state_dir / "miner_state.json"
             self._state_dir = desired_state_dir
         except Exception:
-            # Fallback to cwd but still keep per-coldkey filename to avoid clobbering
             self._state_dir = Path(".")
             state_path = Path(f"miner_state_{self._coldkey_ss58}.json")
 
@@ -66,7 +65,7 @@ class Miner(BaseMinerNeuron):
         self.payments = Payments(
             config=self.config,
             wallet=self.wallet,
-            runtime=self.runtime,  # gives access to chain client + locks + block, balances, transfer
+            runtime=self.runtime,
             state=self.state,
         )
 
@@ -107,15 +106,18 @@ class Miner(BaseMinerNeuron):
     # ---------------------- Protocol handlers ----------------------
 
     async def auctionstart_forward(self, synapse: AuctionStartSynapse) -> AuctionStartSynapse:
-        # delegate to runtime (includes per-target-subnet stake gate)
+        # Delegate to runtime (includes per-target-subnet stake gate)
         return await self.runtime.handle_auction_start(synapse, self.lines)
 
     async def win_forward(self, synapse: WinSynapse) -> WinSynapse:
-        # delegate to payments (schedule + worker)
+        # Delegate to payments (schedule + worker)
         return await self.payments.handle_win(synapse)
 
     async def forward(self, synapse: Synapse):
-        return synapse
+        # IMPORTANT: return a clean response, never echo the inbound Synapse.
+        # Some callers send malformed base payloads; echoing them causes Axon's serializer
+        # to trip on types (incl. the 'slice' error). A fresh Synapse() avoids that path.
+        return Synapse()
 
     # ---------------------- Context manager shutdown ----------------------
 
@@ -132,4 +134,4 @@ if __name__ == "__main__":
         import time as _t
         while True:
             clog.info("Miner running…", color="gray")
-            _t.sleep(120)
+            _t.sleep(12)
