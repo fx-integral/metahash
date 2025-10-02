@@ -142,7 +142,7 @@ class Validator(EpochValidatorNeuron):
         # NOTE: epoch override handled by EpochValidatorNeuron; do not duplicate here.
 
     # ---------------------- Dynamic weights each epoch ----------------------
-    def _recompute_weights(self) -> None:
+    def _recompute_adquisition_weights(self) -> None:
         """
         Recompute subnet weights before we run the epoch logic.
         Produces a dict: {subnet_id: bps}.
@@ -185,7 +185,7 @@ class Validator(EpochValidatorNeuron):
         await self._refresh_chain_and_population()
 
         # recompute subnet weights just-in-time
-        self._recompute_weights()
+        self._recompute_adquisition_weights()
 
         e = int(getattr(self, "epoch_index", 0))
         pretty.banner(
