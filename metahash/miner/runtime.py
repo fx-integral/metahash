@@ -52,41 +52,6 @@ def parse_discount_token(tok: str) -> int:
     return max(0, min(10_000, int(round(val * 100))))
 
 
-class BidDictShim(dict):
-    """
-    A dict that *also* behaves like a 4-tuple in the order:
-      (subnet_id, alpha, discount_bps, bid_id)
-
-    This lets validators that do `bid[:4]` or `bid[2]` work,
-    while we still serialize to JSON as a dict to respect the protocol.
-    """
-    __slots__ = ("_order", "_vals_cache")
-
-    def __init__(self, subnet_id: int, alpha: float, discount_bps: int, bid_id: str):
-        super().__init__(
-            subnet_id=int(subnet_id),
-            alpha=float(alpha),
-            discount_bps=int(discount_bps),
-            bid_id=str(bid_id),
-        )
-        self._order = ("subnet_id", "alpha", "discount_bps", "bid_id")
-        self._vals_cache: Optional[List[Any]] = None
-
-    def _vals(self) -> List[Any]:
-        # Build once for cheap integer/slice indexing
-        if self._vals_cache is None:
-            self._vals_cache = [self[k] for k in self._order]
-        return self._vals_cache
-
-    def __getitem__(self, key):
-        # Allow bid[0], bid[1], ..., and bid[:4]
-        if isinstance(key, int):
-            return self._vals()[key]
-        if isinstance(key, slice):
-            return self._vals()[key]
-        return super().__getitem__(key)
-
-
 class Runtime:
     """
     Combines:
@@ -442,7 +407,8 @@ class Runtime:
         # Track remaining stake per subnet to avoid oversubscription across lines
         remaining_by_subnet: Dict[int, float] = dict(stake_by_subnet)
 
-        out_bids: List[Dict[str, Any]] = []
+        # IMPORTANT: out_bids are plain tuples: (subnet_id:int, alpha:float, discount_bps:int, bid_id:str)
+        out_bids: List[Tuple[int, float, int, str]] = []
         rows_sent = []
 
         for ln in lines:
@@ -487,11 +453,8 @@ class Runtime:
 
             bid_id = hashlib.sha1(f"{vkey}|{epoch}|{subnet_id}|{send_alpha:.12f}|{send_disc_bps}".encode("utf-8")).hexdigest()[:10]
 
-            # IMPORTANT:
-            #   - Externally, this is a dict (protocol unchanged).
-            #   - Internally, BidDictShim also supports bid[:4] and bid[i] like a tuple.
-            bid_item = BidDictShim(int(subnet_id), float(send_alpha), int(send_disc_bps), str(bid_id))
-            out_bids.append(bid_item)
+            # Emit a PLAIN 4-TUPLE (sliceable by validator code)
+            out_bids.append((int(subnet_id), float(send_alpha), int(send_disc_bps), str(bid_id)))
 
             self.state.remember_bid(vkey, epoch, subnet_id, send_alpha, send_disc_bps)
 
@@ -519,20 +482,34 @@ class Runtime:
         await self.state.save_async()
         self.state.status_tables()
 
-        # Return a FRESH synapse with sanitized numeric types and dict(+tuple-like) bids
+        # Return a FRESH synapse with sanitized numeric types and tuple bids
         resp = AuctionStartSynapse(
-            epoch_index=epoch,
-            auction_start_block=auction_start_block,
-            min_stake_alpha=min_stake_alpha,
-            auction_budget_alpha=budget_alpha,
-            weights_bps=dict(weights_bps),
-            treasury_coldkey=treasury_ck_req,
+            epoch_index=int(epoch),
+            auction_start_block=int(auction_start_block),
+            min_stake_alpha=float(min_stake_alpha),
+            auction_budget_alpha=float(budget_alpha),
+            weights_bps=dict({int(k): int(v) for k, v in weights_bps.items()}),
+            treasury_coldkey=str(treasury_ck_req),
             validator_uid=uid,
             validator_hotkey=caller_hot or None,
             ack=True,
             retries_attempted=0,
-            bids=out_bids,
+            bids=list(out_bids),          # <- list of 4-tuples
             bids_sent=int(len(out_bids)),
             note=None,
         )
+
+        # Optional sanity checks (safe to remove later)
+        try:
+            assert isinstance(resp.bids, list)
+            for b in resp.bids:
+                assert isinstance(b, tuple) and len(b) == 4
+                s, a, d, i = b
+                assert isinstance(s, int)
+                assert isinstance(a, float)
+                assert isinstance(d, int)
+                assert isinstance(i, str)
+        except AssertionError:
+            pretty.log("[red]Sanity check failed: bids must be a list of (int, float, int, str) tuples.[/red]")
+
         return resp
