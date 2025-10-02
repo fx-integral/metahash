@@ -325,7 +325,7 @@ $0 ~ /burn_deficit .*:[[:space:]]*([0-9.]+)/          { if(settle_e!="" && match
 # ---- α scan & paid pools (multi-line JSON) ----
 /events\(sample\):/ { if(settle_e!=""){ begin_json(settle_e, settle_e, "events") } }
 /paid_pools\(sample\):/ { if(settle_e!=""){ begin_json(settle_e, settle_e, "paid_pools") } }
-json_accum && { feed_json_line($0); next }
+json_accum { feed_json_line($0); next }
 
 # ---- Errors ----
 /Cannot connect to host/ { e=(auction_e!=""?auction_e:(budget_e!=""?budget_e:current_e)); conn_err[e]++ }
