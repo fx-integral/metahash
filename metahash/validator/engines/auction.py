@@ -16,7 +16,8 @@ from metahash.config import (AUCTION_BUDGET_ALPHA, AUCTION_START_TIMEOUT, LOG_TO
                              MAX_BIDS_PER_MINER, S_MIN_ALPHA_MINER, S_MIN_MASTER_VALIDATOR, START_V3_BLOCK)
 from metahash.protocol import AuctionStartSynapse
 
-EPS_ALPHA = 1e-12  # keep small epsilon for partial fill checks
+# Use same α epsilon everywhere to avoid accept/clear inconsistencies
+EPS_ALPHA = 1e-12  # small epsilon for partial fill checks and gating
 
 
 @dataclass(slots=True)
@@ -54,9 +55,26 @@ class WinAllocation:
 
 
 def budget_from_share(*, share: float, auction_budget_alpha: float = AUCTION_BUDGET_ALPHA) -> float:
+    """
+    Per-epoch budget in α (base-subnet alpha) from master share.
+    """
     if share <= 0:
         return 0.0
     return auction_budget_alpha * float(share)
+
+
+def budget_tao_from_share(
+    *,
+    share: float,
+    auction_budget_alpha: float,
+    price_tao_per_alpha_base: float,
+) -> float:
+    """
+    Convert master share → TAO VALUE budget using the base-subnet α→TAO price.
+    """
+    if share <= 0 or auction_budget_alpha <= 0 or price_tao_per_alpha_base <= 0:
+        return 0.0
+    return float(share) * float(auction_budget_alpha) * float(price_tao_per_alpha_base)
 
 
 class AuctionEngine:
@@ -145,7 +163,10 @@ class AuctionEngine:
             uid = hk2uid.get(hk)
             if uid is None or uid >= len(self.parent.metagraph.stake):
                 continue
-            st = float(self.parent.metagraph.stake[uid])
+            try:
+                st = float(self.parent.metagraph.stake[uid])
+            except Exception:
+                st = 0.0
             if st >= S_MIN_MASTER_VALIDATOR:
                 stakes[hk] = st
                 total += st
@@ -237,23 +258,47 @@ class AuctionEngine:
         if uid == 0:
             return False, "uid 0 not allowed"
 
+        # basic bounds for metagraph arrays
+        try:
+            n_stake = len(self.parent.metagraph.stake)
+        except Exception:
+            n_stake = 0
+        try:
+            n_ck = len(self.parent.metagraph.coldkeys)
+        except Exception:
+            n_ck = 0
+        if uid < 0 or uid >= max(n_stake, n_ck):
+            return False, f"bad uid {uid}"
+
         # epoch-jail (by coldkey)
-        ck = self.parent.metagraph.coldkeys[uid]
+        ck = ""
+        try:
+            if uid < n_ck:
+                ck = self.parent.metagraph.coldkeys[uid]
+        except Exception:
+            ck = ""
         jail_upto = self.state.ck_jail_until_epoch.get(ck, -1)
         if jail_upto is not None and epoch < jail_upto:
             return False, f"jailed until epoch {jail_upto}"
 
         # stake gate (miner’s UID)
-        stake_alpha = self.parent.metagraph.stake[uid]
+        try:
+            stake_alpha = float(self.parent.metagraph.stake[uid])
+        except Exception:
+            stake_alpha = 0.0
         if stake_alpha < S_MIN_ALPHA_MINER:
             return False, f"stake {stake_alpha:.3f} α < S_MIN_ALPHA_MINER"
 
         # sanity-checks
-        if not (alpha > 0):
+        try:
+            alpha_val = float(alpha)
+        except Exception:
+            alpha_val = 0.0
+        if not (alpha_val > 0):
             return False, "invalid α"
-        if alpha > AUCTION_BUDGET_ALPHA:
+        if alpha_val > AUCTION_BUDGET_ALPHA:
             return False, "α exceeds max per bid"
-        if not (0 <= discount_bps <= 10_000):
+        if not (0 <= int(discount_bps) <= 10_000):
             return False, "discount out of range"
 
         # weight gate: reject zero-weight subnets outright
@@ -284,10 +329,10 @@ class AuctionEngine:
         self._bid_book[epoch][(uid, subnet_id)] = _Bid(
             epoch=epoch,
             subnet_id=subnet_id,
-            alpha=alpha,
+            alpha=alpha_val,
             miner_uid=uid,
             coldkey=ck,
-            discount_bps=discount_bps,
+            discount_bps=int(discount_bps),
             weight_snap=w,
             idx=idx,
         )
@@ -449,8 +494,8 @@ class AuctionEngine:
             self._wins_notified_for = self.parent.epoch_index
 
     def cleanup_old_epoch_books(self, before_epoch: int):
-        """Cleanup old bid state older than (e−2)."""
-        self._bid_book.pop(before_epoch, None)
-        self._ck_uid_epoch.pop(before_epoch, None)
-        self._ck_subnets_bid.pop(before_epoch, None)
-        self._rejected_bids_by_epoch.pop(before_epoch, None)
+        """Cleanup old bid state **older than** the given epoch."""
+        for d in (self._bid_book, self._ck_uid_epoch, self._ck_subnets_bid, self._rejected_bids_by_epoch):
+            for k in list(d.keys()):
+                if k < before_epoch:
+                    d.pop(k, None)

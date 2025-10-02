@@ -48,7 +48,6 @@ def _isatty() -> bool:
 
 
 def _pause(msg: str):
-    return
     """Optional interactive pause."""
     if not PAUSE_ON_CHECKPOINTS or not _isatty():
         return
@@ -633,7 +632,6 @@ class SettlementEngine:
                         continue
 
                     # proportional shares with largest remainder
-                    # compute raw shares
                     tmp = []
                     sum_floor = 0
                     for uid in uid_list:

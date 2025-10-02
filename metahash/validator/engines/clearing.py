@@ -34,7 +34,7 @@ from metahash.utils.valuation import (
 )
 
 # Tolerances
-EPS_ALPHA = 1e-18
+EPS_ALPHA = 1e-12   # unified with auction
 EPS_VALUE = 1e-12
 
 
@@ -223,6 +223,8 @@ class ClearingEngine:
         FIX: two-pass:
           - pass1 honors per-CK TAO caps (reputation)
           - pass2 (if leftover) relaxes caps to consume remaining budget
+
+        FIX (dup notifications): aggregate accepts per (uid, subnet) and send ONE WinSynapse per winner.
         """
         if epoch_to_clear is None or epoch_to_clear < 0:
             return False
@@ -346,10 +348,19 @@ class ClearingEngine:
         remaining_budget_tao = float(my_budget_tao)
         cap_left_tao = {ck: float(v) for ck, v in cap_tao_by_ck.items()} if cap_tao_by_ck else {}
 
-        winners: List[WinAllocation] = []
+        # Aggregators
+        # Track accepted per (uid, subnet) to avoid duplicate notifications
+        accepted_alpha_by_key: Dict[Tuple[int, int], float] = defaultdict(float)  # (uid, subnet_id) -> α accepted
+        requested_alpha_by_key: Dict[Tuple[int, int], float] = {}  # total requested α per (uid, subnet)
+        bid_meta_by_key: Dict[Tuple[int, int], Tuple[int, int, int, str]] = {}  # (uid, subnet)->(discount_bps, weight_bps, idx, coldkey)
+
+        # Fill requested & meta maps
+        for b in bids_in:
+            key = (b.miner_uid, b.subnet_id)
+            requested_alpha_by_key[key] = max(0.0, float(b.alpha))
+            bid_meta_by_key[key] = (int(b.discount_bps), int(b.weight_bps), int(b.idx), str(b.coldkey))
+
         dbg_rows = []
-        # FIX: track accepted per bid to support pass2 (relaxed)
-        accepted_alpha_by_key: Dict[Tuple[int, int, int], float] = defaultdict(float)  # (uid, subnet_id, idx) -> α accepted
 
         # helper: solve α such that VALUE(α) ≤ limit (monotone → bisection), α ∈ [0, want]
         def _solve_take_alpha_for_limit(b: BidInput, want_alpha: float, limit_tao: float) -> float:
@@ -359,8 +370,7 @@ class ClearingEngine:
             if line_value_tao(b, want_alpha) <= limit_tao:
                 return want_alpha
             lo, hi = 0.0, want_alpha
-            # bisection on α (continuous), then quantize to rao (integer planck of α)
-            for _ in range(60):  # high precision on α
+            for _ in range(60):  # high precision
                 mid = 0.5 * (lo + hi)
                 val = line_value_tao(b, mid)
                 if val <= limit_tao:
@@ -373,26 +383,12 @@ class ClearingEngine:
                 return 0.0
             return rao / float(PLANCK)
 
-        def _make_winalloc(b: BidInput, take_alpha: float) -> WinAllocation:
-            kwargs = dict(
-                miner_uid=b.miner_uid,
-                coldkey=b.coldkey,
-                subnet_id=b.subnet_id,
-                alpha_accepted=take_alpha,
-                discount_bps=b.discount_bps,
-                weight_bps=b.weight_bps,
-            )
-            if "alpha_requested" in self._winalloc_params:
-                kwargs["alpha_requested"] = float(b.alpha)
-            return WinAllocation(**kwargs)
-
         def _consider_bid(b: BidInput, tao_limit: float, pass_label: str):
-            """Inner step used by both passes."""
             nonlocal remaining_budget_tao
             if tao_limit <= EPS_VALUE:
                 return
-            key = (b.miner_uid, b.subnet_id, b.idx)
-            already = accepted_alpha_by_key.get(key, 0.0)
+            key = (b.miner_uid, b.subnet_id)
+            already = float(accepted_alpha_by_key.get(key, 0.0))
             want_total = max(0.0, float(b.alpha))
             want_alpha = max(0.0, want_total - already)
             if want_alpha <= EPS_ALPHA:
@@ -401,11 +397,11 @@ class ClearingEngine:
             if take_alpha <= EPS_ALPHA:
                 return
 
-            w = _make_winalloc(b, take_alpha)
-            winners.append(w)
-
             tao_consumed = line_value_tao(b, take_alpha)
             per_alpha = tao_consumed / max(EPS_ALPHA, take_alpha)
+
+            accepted_alpha_by_key[key] = already + take_alpha
+            remaining_budget_tao = max(0.0, remaining_budget_tao - tao_consumed)
 
             dbg_rows.append(
                 [
@@ -421,9 +417,6 @@ class ClearingEngine:
                     pass_label,
                 ]
             )
-
-            accepted_alpha_by_key[key] = already + take_alpha
-            remaining_budget_tao = max(0.0, remaining_budget_tao - tao_consumed)
 
         # ----- PASS 1: with caps -----
         for b in ordered:
@@ -442,8 +435,8 @@ class ClearingEngine:
 
             # Update per-CK cap if used
             if cap_left_tao and ck_cap_left != float("inf"):
-                key = (b.miner_uid, b.subnet_id, b.idx)
-                take_alpha = accepted_alpha_by_key[key]  # total accepted so far on this bid
+                key = (b.miner_uid, b.subnet_id)
+                take_alpha = float(accepted_alpha_by_key.get(key, 0.0))  # total accepted so far on this bid
                 tao_consumed = line_value_tao(b, take_alpha)
                 cap_left_tao[ck] = max(0.0, ck_cap_left - tao_consumed)
 
@@ -452,7 +445,6 @@ class ClearingEngine:
             for b in ordered:
                 if remaining_budget_tao <= EPS_VALUE:
                     break
-                # no per-CK cap in pass2
                 _consider_bid(b, remaining_budget_tao, "relaxed")
 
         if dbg_rows:
@@ -465,30 +457,47 @@ class ClearingEngine:
         if remaining_budget_tao > EPS_VALUE:
             pretty.log(f"[yellow]Budget leftover (TAO) after allocation: {remaining_budget_tao:.12f} (dust or not enough bids).[/yellow]")
 
+        # Build winners from aggregated accepts
+        winners: List[WinAllocation] = []
+        for (uid, sid), acc_alpha in accepted_alpha_by_key.items():
+            if acc_alpha <= EPS_ALPHA:
+                continue
+            req_alpha = float(requested_alpha_by_key.get((uid, sid), 0.0))
+            disc_bps, w_bps, _idx, ck = bid_meta_by_key[(uid, sid)]
+            kwargs = dict(
+                miner_uid=uid,
+                coldkey=ck,
+                subnet_id=sid,
+                alpha_accepted=acc_alpha,
+                discount_bps=disc_bps,
+                weight_bps=w_bps,
+            )
+            if "alpha_requested" in self._winalloc_params:
+                kwargs["alpha_requested"] = req_alpha
+            winners.append(WinAllocation(**kwargs))
+
         if not winners:
             pretty.log("[red]No winners after applying VALUE (TAO) budget and reputation caps.[/red]")
             return False
 
         # Winners detail computed at accepted α
         rows_w = []
-        per_win_value_tao: Dict[int, float] = {}
-        per_win_value_mu: Dict[int, int] = {}
+        per_win_value_tao: Dict[Tuple[int, int], float] = {}
+        per_win_value_mu: Dict[Tuple[int, int], int] = {}
         for w in winners[: max(20, LOG_TOP_N)]:
             req_alpha = float(getattr(w, "alpha_requested", w.alpha_accepted))
             acc_alpha = float(w.alpha_accepted)
-            val_acc = line_value_tao(
-                BidInput(
-                    miner_uid=w.miner_uid,
-                    coldkey=w.coldkey,
-                    subnet_id=w.subnet_id,
-                    alpha=acc_alpha,
-                    discount_bps=w.discount_bps,
-                    weight_bps=w.weight_bps,
-                ),
-                acc_alpha,
+            b = BidInput(
+                miner_uid=w.miner_uid,
+                coldkey=w.coldkey,
+                subnet_id=w.subnet_id,
+                alpha=acc_alpha,
+                discount_bps=w.discount_bps,
+                weight_bps=w.weight_bps,
             )
-            per_win_value_tao[id(w)] = val_acc
-            per_win_value_mu[id(w)] = int(encode_value_mu(val_acc))
+            val_acc = line_value_tao(b, acc_alpha)
+            per_win_value_tao[(w.miner_uid, w.subnet_id)] = val_acc
+            per_win_value_mu[(w.miner_uid, w.subnet_id)] = int(encode_value_mu(val_acc))
             rows_w.append(
                 [
                     w.miner_uid,
@@ -515,6 +524,7 @@ class ClearingEngine:
         for b in bids_in_all:
             req_alpha = max(0.0, float(b.alpha))
             req_rao = int(round(req_alpha * PLANCK))
+            # value estimate for requested α (for diagnostics)
             val_req = line_value_tao(b, req_alpha)
             bids_lines_by_uid[int(b.miner_uid)].append(
                 [
@@ -545,7 +555,6 @@ class ClearingEngine:
                 req_rao = int(round(max(0.0, alpha) * PLANCK))
                 rejected_compact.append([uid, subnet_id, req_rao, discount_bps, reason])
             except Exception:
-                # best-effort; skip malformed diagnostic line
                 continue
 
         # coldkey mapping for involved UIDs
@@ -561,8 +570,8 @@ class ClearingEngine:
         # reputation snapshot for involved coldkeys + caps/params
         rep_store: Dict[str, float] = getattr(self.state, "reputation", {}) or {}
         rep_snapshot = {ck: float(rep_store.get(ck, 0.0)) for ck in sorted(cks_involved)}
-        rep_caps_mu = {ck: int(encode_value_mu(float(cap_tao_by_ck.get(ck, 0.0)))) for ck in sorted(cks_involved)} if cap_tao_by_ck else {}
-        rep_quota_frac = {ck: float(quota_frac.get(ck, 0.0)) for ck in sorted(cks_involved)} if quota_frac else {}
+        rep_caps_mu = {ck: int(encode_value_mu(float((cap_tao_by_ck or {}).get(ck, 0.0)))) for ck in sorted(cks_involved)} if cap_tao_by_ck else {}
+        rep_quota_frac = {ck: float((quota_frac or {}).get(ck, 0.0)) for ck in sorted(cks_involved)} if quota_frac else {}
 
         # jail snapshot for involved coldkeys
         try:
@@ -613,7 +622,7 @@ class ClearingEngine:
                     int(w.discount_bps),
                     int(w.weight_bps),
                     int(acc_rao_full),
-                    int(per_win_value_mu[id(w)]),
+                    int(per_win_value_mu[(w.miner_uid, w.subnet_id)]),
                 ]
             )
 
@@ -694,10 +703,10 @@ class ClearingEngine:
 
         # 6) Human-friendly invoice preview (α to pay = accepted α)
         preview_rows = []
-        for w in winners:
+        for w in winners[: max(20, LOG_TOP_N)]:
             acc_alpha = float(w.alpha_accepted)
             acc_rao = int(round(acc_alpha * PLANCK))
-            value_tao = per_win_value_tao[id(w)]
+            value_tao = per_win_value_tao[(w.miner_uid, w.subnet_id)]
             per_alpha = value_tao / max(EPS_ALPHA, acc_alpha)
             inv_id = self._make_invoice_id(
                 self.parent.hotkey_ss58,
@@ -726,7 +735,7 @@ class ClearingEngine:
             preview_rows[: max(20, LOG_TOP_N)],
         )
 
-        # 7) Notify winners immediately; payment window = next epoch (e+1)
+        # 7) Notify winners once per (uid, subnet)
         ack_ok = 0
         calls_sent = 0
         targets_resolved = 0
@@ -749,7 +758,7 @@ class ClearingEngine:
                     continue
                 targets_resolved += 1
 
-                val_tao = per_win_value_tao[id(w)]
+                val_tao = per_win_value_tao[(w.miner_uid, w.subnet_id)]
                 per_alpha = val_tao / max(EPS_ALPHA, float(w.alpha_accepted))
                 partial = (w.alpha_accepted + 1e-12) < float(req_alpha)
 

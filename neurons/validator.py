@@ -103,7 +103,7 @@ class Validator(EpochValidatorNeuron):
             except TypeError:
                 self.metagraph.sync(self.subtensor)
             except Exception:
-                pass
+                pass  # keep tolerant; engines handle empty population
 
         try:
             axons = getattr(self.metagraph, "axons", None)
@@ -142,7 +142,7 @@ class Validator(EpochValidatorNeuron):
         # NOTE: epoch override handled by EpochValidatorNeuron; do not duplicate here.
 
     # ---------------------- Dynamic weights each epoch ----------------------
-    def _recompute_adquisition_weights(self) -> None:
+    def _recompute_weights(self) -> None:
         """
         Recompute subnet weights before we run the epoch logic.
         Produces a dict: {subnet_id: bps}.
@@ -185,7 +185,7 @@ class Validator(EpochValidatorNeuron):
         await self._refresh_chain_and_population()
 
         # recompute subnet weights just-in-time
-        self._recompute_adquisition_weights()
+        self._recompute_weights()
 
         e = int(getattr(self, "epoch_index", 0))
         pretty.banner(
@@ -210,8 +210,8 @@ class Validator(EpochValidatorNeuron):
         try:
             await self.auction.broadcast_auction_start()
         except asyncio.CancelledError as ce:
+            # FIX: do not return; continue the epoch so commitments still have a chance to publish
             pretty.log(f"[yellow]AuctionStart cancelled by RPC: {ce}. Will retry next epoch.[/yellow]")
-            return
         except Exception as exc:
             pretty.log(f"[yellow]AuctionStart failed: {exc}[/yellow]")
 
