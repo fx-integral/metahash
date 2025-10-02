@@ -96,6 +96,14 @@ Notes
 - Subnet weights are set in weights.yml
 ```
 
+### Using Docker
+```bash
+docker run --rm \
+  -v ~/.bittensor:/root/.bittensor:ro \
+  ghcr.io/fx-integral/metahash:latest \
+  neurons/validator.py --netuid 73 --subtensor.network archive --wallet.name validator-wallet --wallet.hotkey validator-hotkey --neuron.axon_off --logging.debug
+```
+
 ## 🔍 Observability & state
 ``` text
 - Structured logs: Auction, Clearing, Commitments, Settlement sections.
