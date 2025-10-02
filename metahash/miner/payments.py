@@ -5,7 +5,7 @@ import asyncio
 import time
 import inspect
 from concurrent.futures import Future
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Coroutine
 
 import bittensor as bt
 from bittensor import BLOCKTIME
@@ -18,6 +18,34 @@ from metahash.protocol import WinSynapse
 from metahash.miner.models import WinInvoice
 from metahash.miner.state import StateStore
 from metahash.miner.runtime import Runtime
+
+
+def _as_int(x: Any, default: int = 0) -> int:
+    try:
+        if x is None:
+            return default
+        if isinstance(x, bool):
+            return int(x)
+        if isinstance(x, int):
+            return x
+        if isinstance(x, float):
+            return int(x)
+        s = str(x).strip()
+        return int(float(s))  # tolerate "123.0" and " 123 "
+    except Exception:
+        return default
+
+
+def _as_float(x: Any, default: float = 0.0) -> float:
+    try:
+        if x is None:
+            return default
+        if isinstance(x, (int, float)):
+            return float(x)
+        s = str(x).strip()
+        return float(s)
+    except Exception:
+        return default
 
 
 class Payments:
@@ -80,13 +108,13 @@ class Payments:
         except Exception:
             pass
 
-    def submit(self, coro: asyncio.coroutines.Coroutine[Any, Any, Any]) -> Future[Any]:
+    def submit(self, coro: Coroutine[Any, Any, Any]) -> Future[Any]:
         if not asyncio.iscoroutine(coro):
             raise TypeError("Expected coroutine in submit()")
         if not self._bg_loop or self._bg_loop.is_closed():
             raise RuntimeError("Background loop not running")
         fut = asyncio.run_coroutine_threadsafe(coro, self._bg_loop)
-      
+
         def _log_exc(f: Future[Any]) -> None:
             try:
                 f.result()
@@ -422,9 +450,36 @@ class Payments:
 
     # ---------------------- Win handler ----------------------
 
+    def _sanitize_win_synapse_numbers_inplace(self, syn: WinSynapse) -> None:
+        """Coerce common numeric fields on WinSynapse to real ints/floats to avoid Pydantic warnings."""
+        # ints
+        for name in ("validator_uid", "subnet_id", "pay_window_start_block", "pay_window_end_block", "pay_epoch_index", "attempts"):
+            if hasattr(syn, name):
+                try:
+                    setattr(syn, name, _as_int(getattr(syn, name)))
+                except Exception:
+                    pass
+        # floats
+        for name in ("accepted_alpha", "requested_alpha", "alpha"):
+            if hasattr(syn, name):
+                try:
+                    setattr(syn, name, _as_float(getattr(syn, name)))
+                except Exception:
+                    pass
+        # booleans that could arrive oddly
+        if hasattr(syn, "was_partially_accepted"):
+            try:
+                v = getattr(syn, "was_partially_accepted")
+                setattr(syn, "was_partially_accepted", bool(v))
+            except Exception:
+                pass
+
     async def handle_win(self, synapse: WinSynapse) -> WinSynapse:
         await self.runtime._ensure_async_subtensor()
         self.ensure_payment_config()
+
+        # Normalize inbound numerics early to keep the model clean on the way out.
+        self._sanitize_win_synapse_numbers_inplace(synapse)
 
         uid = getattr(synapse, "validator_uid", None)
         caller_hot = getattr(synapse, "validator_hotkey", None)
@@ -435,7 +490,7 @@ class Payments:
                 uid = uid
             if uid is not None and 0 <= uid < len(self.runtime.metagraph.axons):
                 caller_hot = getattr(self.runtime.metagraph.axons[uid], "hotkey", None)
-        vkey = caller_hot or f"uid:{uid}" if uid is not None else "<unknown>"
+        vkey = caller_hot or (f"uid:{uid}" if uid is not None else "<unknown>")
 
         treasury_ck = self.state.treasuries.get(caller_hot or "") or self.state.treasuries.get(vkey)
         if not treasury_ck:
@@ -454,17 +509,17 @@ class Payments:
             synapse.last_response = note
             return synapse
 
-        accepted_alpha = float(getattr(synapse, "accepted_alpha", None) or synapse.alpha)
-        requested_alpha = float(getattr(synapse, "requested_alpha", None) or accepted_alpha)
+        accepted_alpha = _as_float(getattr(synapse, "accepted_alpha", None) or getattr(synapse, "alpha", 0.0))
+        requested_alpha = _as_float(getattr(synapse, "requested_alpha", None) or accepted_alpha)
         was_partial = bool(getattr(synapse, "was_partially_accepted", accepted_alpha < requested_alpha - 1e-12))
 
         amount_rao = int(round(accepted_alpha * PLANCK))
         epoch_now = int(getattr(self.runtime, "epoch_index", 0) or getattr(self, "epoch_index", 0) or 0)
 
-        pay_start = int(getattr(synapse, "pay_window_start_block", 0) or 0)
-        pay_end = int(getattr(synapse, "pay_window_end_block", 0) or 0)
-        pay_ep = int(getattr(synapse, "pay_epoch_index", 0) or 0)
-        clearing_bps = int(getattr(synapse, "clearing_discount_bps", 0) or 0)
+        pay_start = _as_int(getattr(synapse, "pay_window_start_block", 0))
+        pay_end = _as_int(getattr(synapse, "pay_window_end_block", 0))
+        pay_ep = _as_int(getattr(synapse, "pay_epoch_index", 0))
+        clearing_bps = _as_int(getattr(synapse, "clearing_discount_bps", 0))
 
         inv = WinInvoice(
             validator_key=vkey,
@@ -492,7 +547,7 @@ class Payments:
             if (
                 w.validator_key == inv.validator_key
                 and w.subnet_id == inv.subnet_id
-                and w.alpha == inv.alpha
+                and abs(w.alpha - inv.alpha) < 1e-12
                 and w.discount_bps == inv.discount_bps
                 and w.amount_rao == inv.amount_rao
                 and w.pay_window_start_block == inv.pay_window_start_block
@@ -533,9 +588,10 @@ class Payments:
         self._schedule_payment(inv)
         self.state.status_tables()
 
+        # Update outbound fields cleanly typed
         synapse.ack = True
-        synapse.payment_attempted = inv.pay_attempts > 0
-        synapse.payment_ok = inv.paid
-        synapse.attempts = inv.pay_attempts
+        synapse.payment_attempted = bool(inv.pay_attempts > 0)
+        synapse.payment_ok = bool(inv.paid)
+        synapse.attempts = int(inv.pay_attempts)
         synapse.last_response = inv.last_response[:300] if inv.last_response else ""
         return synapse

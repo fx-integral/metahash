@@ -407,8 +407,8 @@ class Runtime:
         # Track remaining stake per subnet to avoid oversubscription across lines
         remaining_by_subnet: Dict[int, float] = dict(stake_by_subnet)
 
-        # IMPORTANT: out_bids are plain tuples: (subnet_id:int, alpha:float, discount_bps:int, bid_id:str)
-        out_bids: List[Tuple[int, float, int, str]] = []
+        # IMPORTANT: out_bids are JSON-native 4-lists: [subnet_id:int, alpha:float, discount_bps:int, bid_id:str]
+        out_bids: List[List[Any]] = []
         rows_sent = []
 
         for ln in lines:
@@ -453,8 +453,8 @@ class Runtime:
 
             bid_id = hashlib.sha1(f"{vkey}|{epoch}|{subnet_id}|{send_alpha:.12f}|{send_disc_bps}".encode("utf-8")).hexdigest()[:10]
 
-            # Emit a PLAIN 4-TUPLE (sliceable by validator code)
-            out_bids.append((int(subnet_id), float(send_alpha), int(send_disc_bps), str(bid_id)))
+            # Emit a PLAIN 4-LIST (JSON-friendly)
+            out_bids.append([int(subnet_id), float(send_alpha), int(send_disc_bps), str(bid_id)])
 
             self.state.remember_bid(vkey, epoch, subnet_id, send_alpha, send_disc_bps)
 
@@ -482,7 +482,7 @@ class Runtime:
         await self.state.save_async()
         self.state.status_tables()
 
-        # Return a FRESH synapse with sanitized numeric types and tuple bids
+        # Return a FRESH synapse with sanitized numeric types and JSON-native bids
         resp = AuctionStartSynapse(
             epoch_index=int(epoch),
             auction_start_block=int(auction_start_block),
@@ -494,7 +494,7 @@ class Runtime:
             validator_hotkey=caller_hot or None,
             ack=True,
             retries_attempted=0,
-            bids=list(out_bids),          # <- list of 4-tuples
+            bids=list(out_bids),          # <- list of 4-lists (no tuples)
             bids_sent=int(len(out_bids)),
             note=None,
         )
@@ -503,13 +503,13 @@ class Runtime:
         try:
             assert isinstance(resp.bids, list)
             for b in resp.bids:
-                assert isinstance(b, tuple) and len(b) == 4
+                assert isinstance(b, list) and len(b) == 4
                 s, a, d, i = b
                 assert isinstance(s, int)
                 assert isinstance(a, float)
                 assert isinstance(d, int)
                 assert isinstance(i, str)
         except AssertionError:
-            pretty.log("[red]Sanity check failed: bids must be a list of (int, float, int, str) tuples.[/red]")
+            pretty.log("[red]Sanity check failed: bids must be a list of [int, float, int, str] lists.[/red]")
 
         return resp

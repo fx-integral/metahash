@@ -173,37 +173,37 @@ class StateStore:
 
         rows_pend = [[
             (w.validator_key[:8] + "…"),
-            w.epoch_seen,
-            w.subnet_id,
-            f"{w.alpha:.4f} α",
-            f"{w.alpha_requested:.4f} α",
+            int(w.epoch_seen or 0),
+            int(w.subnet_id),
+            f"{float(w.alpha):.4f} α",
+            f"{float(w.alpha_requested):.4f} α",
             "P" if w.was_partial else "F",
-            f"{w.discount_bps} bps",
-            w.pay_epoch_index,
-            w.pay_window_start_block,
-            (w.pay_window_end_block if w.pay_window_end_block else 0),
-            f"{w.amount_rao/PLANCK:.4f} α",
-            w.pay_attempts,
+            f"{int(w.discount_bps)} bps",
+            int(w.pay_epoch_index or 0),
+            int(w.pay_window_start_block or 0),
+            (int(w.pay_window_end_block) if w.pay_window_end_block else 0),
+            f"{(float(w.amount_rao)/PLANCK):.4f} α",
+            int(w.pay_attempts or 0),
             (w.invoice_id[:8] + "…"),
             (w.last_response or "")[:24] + ("…" if len(w.last_response or "") > 24 else "")
         ] for w in sorted(pend, key=lambda x: (x.pay_epoch_index, x.pay_window_start_block, x.validator_key))[:LOG_TOP_N]]
 
         rows_done = [[
             (w.validator_key[:8] + "…"),
-            w.epoch_seen,
-            w.subnet_id,
-            f"{w.alpha:.4f} α",
-            f"{w.alpha_requested:.4f} α",
+            int(w.epoch_seen or 0),
+            int(w.subnet_id),
+            f"{float(w.alpha):.4f} α",
+            f"{float(w.alpha_requested):.4f} α",
             "P" if w.was_partial else "F",
-            f"{w.discount_bps} bps",
-            w.pay_epoch_index,
-            w.pay_window_start_block,
-            (w.pay_window_end_block if w.pay_window_end_block else 0),
-            f"{w.amount_rao/PLANCK:.4f} α",
-            w.pay_attempts,
+            f"{int(w.discount_bps)} bps",
+            int(w.pay_epoch_index or 0),
+            int(w.pay_window_start_block or 0),
+            (int(w.pay_window_end_block) if w.pay_window_end_block else 0),
+            f"{(float(w.amount_rao)/PLANCK):.4f} α",
+            int(w.pay_attempts or 0),
             (w.invoice_id[:8] + "…"),
             (w.last_response or "")[:24] + ("…" if len(w.last_response or "") > 24 else "")
-        ] for w in sorted(done, key=lambda row: -(getattr(row, "last_attempt_ts", 0) or 0))[:LOG_TOP_N]]
+        ] for w in sorted(done, key=lambda w: -float(getattr(w, "last_attempt_ts", 0.0) or 0.0))[:LOG_TOP_N]]
 
         if rows_pend:
             pretty.table(
