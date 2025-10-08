@@ -161,10 +161,20 @@ class Strategy:
         Compute subnet weights in basis points (0..10_000) from YAML.
 
         Notes:
-          - We materialize all explicit keys from YAML so operators can see them in diagnostics.
+          - We materialize defaults for subnet ids 0..128 so missing entries are included.
+          - Explicit keys from YAML are overlaid on top of defaults.
         """
         self._reload_if_changed()
         out: Dict[int, int] = {}
+        # Prefill 0..128 with defaults from self._weights (defaultdict uses current default)
+        for sid in range(0, 129):
+            try:
+                bp = int(round(max(0.0, float(self._weights[sid])) * 10_000.0))
+            except Exception:
+                bp = 0
+            out[int(sid)] = max(0, min(10_000, bp))
+
+        # Overlay explicit YAML entries (and include any beyond 128)
         for sid, fval in self._weights.items():
             try:
                 bp = int(round(max(0.0, float(fval)) * 10_000.0))

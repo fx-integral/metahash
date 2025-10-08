@@ -132,6 +132,19 @@ def add_miner_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
 
+    # Optional: list of validator hotkeys whose delegated α should be used
+    # for bidding availability checks and as the default payment source hotkeys.
+    parser.add_argument(
+        "--miner.bids.validators",
+        nargs="+",
+        type=str,
+        default=[],
+        help=(
+            "Validator hotkeys to source α from when bidding/paying. If set, availability "
+            "is computed from these delegations and payments default to these hotkeys."
+        ),
+    )
+
     # NEW: Origin hotkey selection for payments
     parser.add_argument("--payment.validators", nargs="+", type=str, default=[],
                         help="Round-robin pool of origin hotkeys (ss58) to use for α payments.")

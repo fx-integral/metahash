@@ -30,6 +30,7 @@ class StateStore:
         self.treasuries: Dict[str, str] = {}
         self.already_bid: Dict[str, List[Tuple[int, int, float, int]]] = {}
         self.wins: List[WinInvoice] = []
+        self.disabled_subnets: List[int] = []
 
         self._state_lock: threading.Lock = threading.Lock()
         
@@ -65,6 +66,10 @@ class StateStore:
 
         self.treasuries = dict(data.get("treasuries", {}))
         self.already_bid = {k: [tuple(x) for x in v] for k, v in data.get("already_bid", {}).items()}
+        try:
+            self.disabled_subnets = [int(s) for s in data.get("disabled_subnets", [])]
+        except Exception:
+            self.disabled_subnets = []
 
         self.wins = []
         loaded_wins = 0
@@ -108,6 +113,7 @@ class StateStore:
             "treasuries": self.treasuries,
             "already_bid": self.already_bid,
             "wins": [asdict(w) for w in self.wins],
+            "disabled_subnets": [int(s) for s in self.disabled_subnets],
         }
 
         with self._state_lock:
@@ -150,6 +156,24 @@ class StateStore:
     def has_bid(self, validator_key: str, epoch: int, subnet_id: int, alpha: float, discount_bps: int) -> bool:
         rec = (int(epoch), int(subnet_id), float(alpha), int(discount_bps))
         return rec in self.already_bid.get(validator_key, [])
+
+    # ---------------------- Disabled subnets ----------------------
+
+    def disable_subnet(self, subnet_id: int):
+        sid = int(subnet_id)
+        if sid not in self.disabled_subnets:
+            self.disabled_subnets.append(sid)
+            log_settlement(LogLevel.HIGH, "Subnet disabled for bidding", "state", {"subnet_id": sid})
+            try:
+                self.save()
+            except Exception:
+                pass
+
+    def is_subnet_disabled(self, subnet_id: int) -> bool:
+        try:
+            return int(subnet_id) in self.disabled_subnets
+        except Exception:
+            return False
 
     # ---------------------- Tables & aggregates ----------------------
 

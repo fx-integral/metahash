@@ -78,7 +78,7 @@ class Payments:
         self._pay_map: Dict[int, str] = {}
         self._pay_start_safety_blocks: int = 0
         self._retry_every_blocks: int = 2
-        self._retry_max_attempts: int = 12
+        self._retry_max_attempts: int = 3
         
 
     # ---------------------- Background loop ----------------------
@@ -173,9 +173,20 @@ class Payments:
             self._retry_every_blocks = 2
 
         try:
-            self._retry_max_attempts = max(1, int(getattr(pay_cfg, "retry_max_attempts", 12) or 12))
+            self._retry_max_attempts = max(1, int(getattr(pay_cfg, "retry_max_attempts", 3) or 3))
         except Exception:
-            self._retry_max_attempts = 12
+            self._retry_max_attempts = 3
+
+        # Default payment hotkeys from --miner.bids.validators if no explicit pool set
+        if not self._pay_pool:
+            try:
+                cfg_miner = getattr(self.config, "miner", None)
+                cfg_bids = getattr(cfg_miner, "bids", cfg_miner)
+                bids_validators = [hk.strip() for hk in list(getattr(cfg_bids, "validators", []) or []) if isinstance(hk, str) and hk.strip()]
+                if bids_validators:
+                    self._pay_pool = bids_validators
+            except Exception:
+                pass
 
         if not self._pay_map and not self._pay_pool and not self._pay_start_safety_blocks:
             log_init(LogLevel.HIGH, "No payment configuration found - using defaults", "payments")
@@ -483,15 +494,23 @@ class Payments:
                     )
 
                 if attempt >= int(self._retry_max_attempts or 1):
-                    inv.last_response = f"max attempts ({attempt})"
+                    inv.expired = True  # stop any future scheduling
+                    # disable further bids on this subnet to avoid repeated wins without ability to pay
+                    try:
+                        self.state.disable_subnet(int(inv.subnet_id))
+                    except Exception:
+                        pass
+                    inv.last_response = f"max attempts reached ({attempt}); marking invoice expired and disabling subnet {int(inv.subnet_id)}"
                     await self.state.save_async()
                     log_settlement(LogLevel.HIGH, "Payment max attempts reached", "worker", {
                         "invoice_id": inv.invoice_id,
-                        "attempts": attempt
+                        "subnet_id": int(inv.subnet_id),
+                        "attempts": attempt,
+                        "action": "expired invoice; subnet disabled for bidding"
                     })
                     miner_logger.phase_panel(
                         MinerPhase.SETTLEMENT, "PAY Exit",
-                        [("inv", inv.invoice_id), ("reason", "max attempts"), ("attempts", attempt)],
+                        [("inv", inv.invoice_id), ("reason", "max attempts"), ("attempts", attempt), ("action", "expired+disable subnet")],
                         LogLevel.HIGH
                     )
                     break

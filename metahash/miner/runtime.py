@@ -287,6 +287,20 @@ class Runtime:
                 out[int(sid)] = self._balance_to_alpha(res)
         return out
 
+    async def get_multi_validator_stakes_map(self, validator_hotkeys: List[str], subnet_ids: List[int]) -> Dict[int, float]:
+        """
+        Sum delegated α to our coldkey across multiple validator hotkeys per subnet.
+        Used when --miner.bids.validators is provided to pool availability.
+        """
+        if not validator_hotkeys:
+            return await self.get_validator_stakes_map(None, subnet_ids)
+        totals: Dict[int, float] = {int(s): 0.0 for s in subnet_ids}
+        for hk in validator_hotkeys:
+            m = await self.get_validator_stakes_map(hk, subnet_ids)
+            for sid, amt in m.items():
+                totals[int(sid)] = float(totals.get(int(sid), 0.0)) + float(amt or 0.0)
+        return totals
+
     async def get_alpha_balance(self, subnet_id: int, hotkey_ss58: str) -> Optional[float]:
         await self._ensure_async_subtensor()
         st = self._async_subtensor
@@ -455,7 +469,14 @@ class Runtime:
         )
         
 
-        candidate_subnets = [int(ln.subnet_id) for ln in lines if isfinite(ln.alpha) and ln.alpha > 0 and 0 <= ln.discount_bps <= 10_000]
+        candidate_subnets = [
+            int(ln.subnet_id)
+            for ln in lines
+            if isfinite(ln.alpha)
+            and ln.alpha > 0
+            and 0 <= ln.discount_bps <= 10_000
+            and not self.state.is_subnet_disabled(int(ln.subnet_id))
+        ]
         stake_by_subnet: Dict[int, float] = {}
         if candidate_subnets and (caller_hot or vkey):
             log_auction(LogLevel.MEDIUM, "Checking validator stakes for candidate subnets", "stake", {
@@ -463,7 +484,17 @@ class Runtime:
                 "validator": caller_hot or vkey
             })
             try:
-                stake_by_subnet = await self.get_validator_stakes_map(caller_hot or vkey, candidate_subnets)
+                # If user provided --miner.bids.validators, compute availability across them
+                cfg_miner = getattr(self.config, "miner", None)
+                cfg_bids = getattr(cfg_miner, "bids", cfg_miner)
+                try:
+                    cfg_validators = list(getattr(cfg_bids, "validators", []) or [])
+                except Exception:
+                    cfg_validators = []
+                if cfg_validators:
+                    stake_by_subnet = await self.get_multi_validator_stakes_map(cfg_validators, candidate_subnets)
+                else:
+                    stake_by_subnet = await self.get_validator_stakes_map(caller_hot or vkey, candidate_subnets)
                 # Use the new clean stake summary method
                 miner_logger.stake_summary(stake_by_subnet, min_stake_alpha)
             except Exception as _e:
@@ -518,6 +549,12 @@ class Runtime:
         })
         
         for ln in lines:
+            # skip disabled subnets proactively
+            if self.state.is_subnet_disabled(int(ln.subnet_id)):
+                log_auction(LogLevel.MEDIUM, "Bid skipped - subnet disabled", "bidding", {
+                    "subnet_id": int(ln.subnet_id)
+                })
+                continue
             if not isfinite(ln.alpha) or ln.alpha <= 0:
                 log_auction(LogLevel.HIGH, "Invalid alpha - skipping line", "bidding", {
                     "subnet_id": ln.subnet_id,
