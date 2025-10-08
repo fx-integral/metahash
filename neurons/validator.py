@@ -1,7 +1,8 @@
-# neurons/validator.py
+# metahash/neurons/validator.py
 from __future__ import annotations
 
 import asyncio
+import time  # <- necesario para time.sleep()
 import bittensor as bt
 from metahash.base.utils.logging import ColoredLogger as clog
 from metahash import __version__
@@ -40,8 +41,7 @@ class Validator(EpochValidatorNeuron):
             self.state.wipe()
 
         # Unified strategy: subnet weights from YAML
-        # (EpochValidatorNeuron also constructs Strategy; we overwrite with same API for clarity)
-        self.strategy = Strategy(path=STRATEGY_PATH)
+        self.strategy = Strategy(path=STRATEGY_PATH or "weights.yml")
         self.weights_bps: dict[int, int] = {}  # subnet_id -> bps (0..10_000)
 
         # Engines
@@ -55,8 +55,9 @@ class Validator(EpochValidatorNeuron):
         self.active_uids: list[int] = []
         self.active_axons: list[object] = []
 
+        # Enhanced validator initialization logging
         pretty.banner(
-            f"Validator v{__version__} initialized",
+            f"🏛️ Validator v{__version__} Initialized",
             " | ".join(
                 filter(
                     None,
@@ -71,6 +72,20 @@ class Validator(EpochValidatorNeuron):
             ),
             style="bold magenta",
         )
+        
+        # Add validator configuration summary
+        pretty.kv_panel(
+            "⚙️ Validator Configuration",
+            [
+                ("version", __version__),
+                ("hotkey", self.hotkey_ss58[:8] + "…"),
+                ("netuid", self.config.netuid),
+                ("fresh_start", getattr(self.config, "fresh", False)),
+                ("testing_mode", TESTING),
+                ("strategy_path", STRATEGY_PATH or "weights.yml"),
+            ],
+            style="bold magenta",
+        )
 
     # ---------------------- AsyncSubtensor helpers ----------------------
     async def _stxn(self) -> bt.AsyncSubtensor:
@@ -79,9 +94,18 @@ class Validator(EpochValidatorNeuron):
         return self._async_subtensor
 
     async def _new_async_subtensor(self) -> bt.AsyncSubtensor:
-        chain_endpoint = getattr(getattr(self.config, "subtensor", None), "chain_endpoint", None)
-        stxn = bt.AsyncSubtensor(network=self.config.subtensor.network, chain_endpoint=chain_endpoint)
-        await stxn.initialize()
+        """
+        Create AsyncSubtensor compatible with multiple bittensor versions.
+        Avoid passing unsupported kwargs like `chain_endpoint`.
+        """
+        # Minimal constructor; older versions only accept 'network'
+        stxn = bt.AsyncSubtensor(network=self.config.subtensor.network)
+        # Initialize if method exists and is coroutine
+        init = getattr(stxn, "initialize", None)
+        if callable(init):
+            maybe_coro = init()
+            if asyncio.iscoroutine(maybe_coro):
+                await maybe_coro
         return stxn
 
     # ---------------------- Epoch alignment / population ----------------------
@@ -103,7 +127,7 @@ class Validator(EpochValidatorNeuron):
             except TypeError:
                 self.metagraph.sync(self.subtensor)
             except Exception:
-                pass  # keep tolerant; engines handle empty population
+                pass  # tolerant; engines handle empty population
 
         try:
             axons = getattr(self.metagraph, "axons", None)
@@ -115,7 +139,6 @@ class Validator(EpochValidatorNeuron):
                 def _is_active(ax):
                     if ax is None:
                         return False
-                    # Be conservative: require at least one positive serving signal
                     flags = []
                     for flag in ("is_serving", "is_active", "active", "serving"):
                         v = getattr(ax, flag, None)
@@ -171,9 +194,15 @@ class Validator(EpochValidatorNeuron):
                     engine.weights_bps = self.weights_bps
 
             nonzero = sum(1 for x in self.weights_bps.values() if x > 0)
+            total_bps = sum(self.weights_bps.values())
             pretty.kv_panel(
-                "[cyan]Subnet weights updated[/cyan]",
-                [("nonzero", nonzero), ("sum_bps", sum(self.weights_bps.values()))],
+                "⚖️ Subnet Weights Updated",
+                [
+                    ("nonzero_subnets", nonzero),
+                    ("total_bps", total_bps),
+                    ("avg_weight", f"{total_bps / max(1, len(self.weights_bps)):.0f} bps" if self.weights_bps else "0 bps"),
+                    ("strategy", "YAML-based"),
+                ],
                 style="bold cyan",
             )
         except Exception as e:
@@ -189,7 +218,7 @@ class Validator(EpochValidatorNeuron):
 
         e = int(getattr(self, "epoch_index", 0))
         pretty.banner(
-            f"Epoch {e} (label: e)",
+            f"🔄 Epoch {e} Processing",
             f"head_block={self.block} | start={self.epoch_start_block} | end={self.epoch_end_block}\n"
             f"• PHASE 1/3: settle e−2 → {e-2} (scan pe={e-1})\n"
             f"• PHASE 2/3: auction & clear e={e} (miners pay in e+1={e+1})\n"
@@ -203,14 +232,23 @@ class Validator(EpochValidatorNeuron):
 
         # Only master broadcasts/clears
         if not self.auction._is_master_now() and getattr(self.auction, "_not_master_log_epoch", None) != e:
-            pretty.log("[yellow]Validator is not a master — skipping broadcast/clear for this epoch.[/yellow]")
+            pretty.kv_panel(
+                "👑 Master Status",
+                [
+                    ("status", "❌ Not Master"),
+                    ("epoch", e),
+                    ("action", "Skipping broadcast/clear"),
+                    ("reason", "Insufficient stake or not in treasury"),
+                ],
+                style="bold yellow",
+            )
             self.auction._not_master_log_epoch = e
 
         # Broadcast AuctionStart (best-effort)
         try:
             await self.auction.broadcast_auction_start()
         except asyncio.CancelledError as ce:
-            # FIX: do not return; continue the epoch so commitments still have a chance to publish
+            # do not return; continue the epoch so commitments still have a chance to publish
             pretty.log(f"[yellow]AuctionStart cancelled by RPC: {ce}. Will retry next epoch.[/yellow]")
         except Exception as exc:
             pretty.log(f"[yellow]AuctionStart failed: {exc}[/yellow]")
@@ -230,5 +268,7 @@ class Validator(EpochValidatorNeuron):
 if __name__ == "__main__":
     from metahash.bittensor_config import config
     with Validator(config=config(role="validator")) as v:
-        clog.info("Starting validator run loop…", color="gray")
-        v.run()
+        # Mantener vivo el proceso con un latido cada 120s
+        while True:
+            clog.info("Validator running…", color="gray")
+            time.sleep(120)

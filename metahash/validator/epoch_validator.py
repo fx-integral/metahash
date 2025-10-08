@@ -31,9 +31,11 @@ class EpochValidatorNeuron(BaseValidatorNeuron):
         self.epoch_end_block: Optional[int] = None
         self._override_active: bool = False
         self._bootstrapped: bool = False
+        self._running: bool = False  # <-- guard
 
-        # Strategy wiring
-        strategy_path = getattr(self.config, "strategy_path", "weights.yml")
+        # Strategy wiring — be robust if config sets strategy_path=None
+        raw_strategy_path = getattr(self.config, "strategy_path", None)
+        strategy_path = raw_strategy_path or "weights.yml"
         strategy_algo_path = getattr(self.config, "strategy_algo_path", None)
         self.strategy = Strategy(path=strategy_path, algorithm_path=strategy_algo_path)
         self.current_strategy_out: Any = None  # can be dict (subnet bps) or list
@@ -139,6 +141,11 @@ class EpochValidatorNeuron(BaseValidatorNeuron):
 
     # ----------------------- main loop -------------------------------- #
     def run(self):  # noqa: D401
+        if self._running:
+            bt.logging.warning("run() called while validator is already running; ignoring.")
+            return
+        self._running = True
+
         bt.logging.info(
             f"EpochValidator starting at block {self.block:,} (netuid {self.config.netuid})"
         )
@@ -205,7 +212,20 @@ class EpochValidatorNeuron(BaseValidatorNeuron):
                     self.step += 1
 
         try:
-            self.loop.run_until_complete(_loop())
-        except KeyboardInterrupt:
-            getattr(self, "axon", bt.logging).stop()
-            bt.logging.success("Validator stopped by keyboard interrupt.")
+            # Prefer asyncio.run() for a clean loop; it avoids the "already running" trap.
+            asyncio.run(_loop())
+        except RuntimeError as e:
+            # Fallback if already inside a running loop (rare in CLI, common in notebooks).
+            if "already running" in str(e):
+                bt.logging.warning("Detected an already-running event loop; scheduling background task.")
+                loop = asyncio.get_event_loop()
+                loop.create_task(_loop())
+            else:
+                raise
+        finally:
+            self._running = False
+            try:
+                getattr(self, "axon", bt.logging).stop()
+            except Exception:
+                pass
+            bt.logging.success("Validator main loop exited.")

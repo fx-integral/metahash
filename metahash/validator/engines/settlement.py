@@ -48,13 +48,7 @@ def _isatty() -> bool:
 
 
 def _pause(msg: str):
-    """Optional interactive pause."""
-    if not PAUSE_ON_CHECKPOINTS or not _isatty():
-        return
-    try:
-        input(f"\n[PAUSE] {msg} — press <enter> to continue...")
-    except Exception:
-        pass
+    return  
 
 
 def _j(obj) -> str:
@@ -214,7 +208,7 @@ class SettlementEngine:
         masters_treasuries: Set[str] = set(VALIDATOR_TREASURIES.values())
         snapshots: List[Dict] = []
 
-        pretty.kv_panel("Commitments fetched", [("#hotkeys_in_commit_map", len(commits or {}))], style="bold cyan")
+        pretty.kv_panel("📋 Commitments Fetched", [("hotkeys_in_commit_map", len(commits or {}))], style="bold cyan")
 
         def _decode_commit_entry(entry):
             if entry is None:
@@ -260,15 +254,15 @@ class SettlementEngine:
 
                             inv = payload.get("inv") or payload.get("i")
                             pretty.kv_panel(
-                                "Payload fetched (IPFS)",
+                                "📦 Payload Fetched (IPFS)",
                                 [
-                                    ("hk", hk_key[:10] + "…"),
+                                    ("hotkey", hk_key[:10] + "…"),
                                     ("cid", cid[:46] + ("…" if len(cid) > 46 else "")),
-                                    ("e", payload.get("e")),
-                                    ("pe", payload.get("pe")),
-                                    ("as", payload.get("as")),
-                                    ("de", payload.get("de")),
-                                    ("has_inv", str(bool(inv)).lower()),
+                                    ("epoch", payload.get("e")),
+                                    ("pay_epoch", payload.get("pe")),
+                                    ("start_block", payload.get("as")),
+                                    ("end_block", payload.get("de")),
+                                    ("has_invoices", "✅" if inv else "❌"),
                                 ],
                                 style="bold cyan",
                             )
@@ -283,14 +277,14 @@ class SettlementEngine:
                     chosen.setdefault("hk", hk_key)
                     chosen.setdefault("t", VALIDATOR_TREASURIES.get(hk_key, ""))
                     pretty.kv_panel(
-                        "Payload fetched (inline legacy)",
+                        "📦 Payload Fetched (Inline Legacy)",
                         [
-                            ("hk", hk_key[:10] + "…"),
-                            ("e", s.get("e")),
-                            ("pe", s.get("pe")),
-                            ("as", s.get("as")),
-                            ("de", s.get("de")),
-                            ("has_inv", str("inv" in s or "i" in s).lower()),
+                            ("hotkey", hk_key[:10] + "…"),
+                            ("epoch", s.get("e")),
+                            ("pay_epoch", s.get("pe")),
+                            ("start_block", s.get("as")),
+                            ("end_block", s.get("de")),
+                            ("has_invoices", "✅" if ("inv" in s or "i" in s) else "❌"),
                         ],
                         style="bold cyan",
                     )

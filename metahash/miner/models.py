@@ -2,6 +2,10 @@
 # neurons/miner_models.py — shared dataclasses for miner components
 
 from dataclasses import dataclass
+from metahash.miner.logging import (
+    MinerPhase, LogLevel, miner_logger, 
+    log_init, log_auction, log_commitments, log_settlement
+)
 
 
 @dataclass
@@ -9,6 +13,14 @@ class BidLine:
     subnet_id: int
     alpha: float
     discount_bps: int  # 0..10000
+    
+    def __post_init__(self):
+        """Log bid line creation for debugging purposes."""
+        log_auction(LogLevel.DEBUG, "BidLine created", "models", {
+            "subnet_id": self.subnet_id,
+            "alpha": self.alpha,
+            "discount_bps": self.discount_bps
+        })
 
 
 @dataclass
@@ -36,3 +48,14 @@ class WinInvoice:
     pay_attempts: int = 0
     last_attempt_ts: float = 0.0
     last_response: str = ""
+    
+    def __post_init__(self):
+        """Log win invoice creation for debugging purposes."""
+        log_commitments(LogLevel.DEBUG, "WinInvoice created", "models", {
+            "invoice_id": self.invoice_id,
+            "validator_key": self.validator_key[:8] + "…" if self.validator_key else "unknown",
+            "subnet_id": self.subnet_id,
+            "alpha": self.alpha,
+            "amount_rao": self.amount_rao,
+            "paid": self.paid
+        })

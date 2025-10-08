@@ -1,0 +1,13 @@
+async-substrate-interface==1.3.1
+bittensor==9.7.0
+substrate-interface
+pytest
+pytest-asyncio
+python-dotenv
+tqdm
+hypothesis
+filelock
+scalecodec
+pyotp==2.8.0
+loguru
+rich

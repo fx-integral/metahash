@@ -85,6 +85,17 @@ class CommitmentsEngine:
                 ],
                 style="bold cyan",
             )
+            
+            # Add structured payload inspection for debugging
+            try:
+                # Create a sanitized version for logging (remove sensitive data if any)
+                payload_copy = payload.copy()
+                
+                # Enhanced payload breakdown with human-readable explanations
+                self._display_enhanced_payload_breakdown(payload_copy, epoch_cleared)
+                
+            except Exception as e:
+                pretty.log(f"[yellow]Failed to serialize payload for inspection: {e}[/yellow]")
         except IPFSError as ie:
             pretty.log(f"[yellow]IPFS publish failed (no fallback): {ie}[/yellow]")
             self._touch_pending_meta(epoch_cleared, status="ipfs_error", last_error=str(ie))
@@ -198,6 +209,264 @@ class CommitmentsEngine:
         if last_exc:
             pretty.log(f"[yellow]On-chain commitment write failed after {max_retries} retries: {last_exc}[/yellow]")
         return False
+
+    # ---------- enhanced payload display ----------
+    def _display_enhanced_payload_breakdown(self, payload: dict, epoch_cleared: int):
+        """Display payload with human-readable field explanations and structured breakdown."""
+        
+        # Basic payload info
+        payload_size = len(json.dumps(payload, separators=(',', ':')))
+        pretty.kv_panel(
+            "📋 Payload Overview",
+            [
+                ("epoch_cleared", epoch_cleared),
+                ("payload_size_bytes", payload_size),
+                ("payload_version", payload.get("v", "unknown")),
+                ("total_fields", len(payload)),
+            ],
+            style="bold yellow",
+        )
+        
+        # Field mapping with explanations
+        field_explanations = {
+            "e": "epoch",
+            "pe": "payment_epoch", 
+            "as": "auction_start_block",
+            "de": "auction_end_block",
+            "hk": "validator_hotkey",
+            "t": "treasury_coldkey",
+            "v": "payload_version",
+            "b": "winner_bids",
+            "i": "all_bids", 
+            "inv": "invoices",
+            "rj": "rejected_bids",
+            "rep": "reputation_data",
+            "jail": "jailed_miners",
+            "wbps": "subnet_weights",
+            "ck_by_uid": "coldkey_mapping",
+            "bl_mu": "budget_leftover_mu",
+            "bl_tao": "budget_leftover_tao",
+            "bt_mu": "budget_total_mu", 
+            "bt_tao": "budget_total_tao",
+        }
+        
+        # Display field explanations
+        explained_fields = []
+        for key, explanation in field_explanations.items():
+            if key in payload:
+                explained_fields.append(f"{key} → {explanation}")
+        
+        if explained_fields:
+            pretty.kv_panel(
+                "🔍 Field Explanations",
+                [
+                    ("fields_present", len(explained_fields)),
+                    ("field_mapping", "; ".join(explained_fields[:5]) + ("..." if len(explained_fields) > 5 else "")),
+                ],
+                style="bold blue",
+            )
+        
+        # Detailed breakdown of key sections
+        self._display_bids_breakdown(payload)
+        self._display_reputation_breakdown(payload)
+        self._display_weights_breakdown(payload)
+        self._display_budget_breakdown(payload)
+        self._display_timeline_breakdown(payload)
+        
+        # Raw payload for reference (condensed)
+        try:
+            condensed_payload = self._condense_payload_for_display(payload)
+            pretty.kv_panel(
+                "📄 Raw Payload (Condensed)",
+                [
+                    ("full_payload", json.dumps(condensed_payload, indent=2, sort_keys=True)),
+                ],
+                style="bold magenta",
+            )
+        except Exception as e:
+            pretty.log(f"[yellow]Failed to display condensed payload: {e}[/yellow]")
+
+    def _display_bids_breakdown(self, payload: dict):
+        """Display detailed breakdown of bids data."""
+        winner_bids = payload.get("b", [])
+        all_bids = payload.get("i", [])
+        rejected_bids = payload.get("rj", [])
+        
+        if winner_bids or all_bids:
+            pretty.kv_panel(
+                "🎯 Bids Analysis",
+                [
+                    ("winner_bids_count", len(winner_bids) if isinstance(winner_bids, list) else 0),
+                    ("all_bids_count", len(all_bids) if isinstance(all_bids, list) else 0),
+                    ("rejected_bids_count", len(rejected_bids) if isinstance(rejected_bids, list) else 0),
+                    ("win_rate", f"{len(winner_bids) / max(1, len(all_bids)) * 100:.1f}%" if isinstance(all_bids, list) and all_bids else "0%"),
+                ],
+                style="bold green",
+            )
+            
+            # Show sample winner bids
+            if winner_bids and isinstance(winner_bids, list):
+                sample_winners = []
+                for i, bid_group in enumerate(winner_bids[:3]):  # Show first 3 winner groups
+                    if isinstance(bid_group, list) and len(bid_group) >= 2:
+                        uid = bid_group[0] if isinstance(bid_group[0], int) else "?"
+                        bids = bid_group[1] if isinstance(bid_group[1], list) else []
+                        if bids:
+                            for bid in bids[:2]:  # Show first 2 bids per winner
+                                if isinstance(bid, list) and len(bid) >= 5:
+                                    subnet_id, discount_bps, weight_bps, amount_rao, value_mu = bid[:5]
+                                    sample_winners.append(f"UID{uid}: SN-{subnet_id}, {amount_rao/1e9:.4f}α, {discount_bps}bps")
+                
+                if sample_winners:
+                    pretty.kv_panel(
+                        "🏆 Sample Winner Bids",
+                        [
+                            ("sample_winners", "; ".join(sample_winners[:3])),
+                        ],
+                        style="bold green",
+                    )
+
+    def _display_reputation_breakdown(self, payload: dict):
+        """Display detailed breakdown of reputation data."""
+        rep_data = payload.get("rep", {})
+        if rep_data and isinstance(rep_data, dict):
+            scores = rep_data.get("scores", {})
+            caps = rep_data.get("cap_tao_mu", {})
+            quotas = rep_data.get("quota_frac", {})
+            
+            pretty.kv_panel(
+                "🏆 Reputation System",
+                [
+                    ("enabled", "✅" if rep_data.get("enabled", False) else "❌"),
+                    ("baseline_score", rep_data.get("baseline", 0.0)),
+                    ("cap_max", rep_data.get("capmax", 0.0)),
+                    ("gamma", rep_data.get("gamma", 0.0)),
+                    ("miners_with_scores", len(scores) if isinstance(scores, dict) else 0),
+                    ("miners_with_caps", len(caps) if isinstance(caps, dict) else 0),
+                ],
+                style="bold cyan",
+            )
+            
+            # Show sample reputation data
+            if scores and isinstance(scores, dict):
+                sample_scores = []
+                for ck, score in list(scores.items())[:3]:
+                    ck_short = ck[:8] + "…" if len(ck) > 8 else ck
+                    sample_scores.append(f"{ck_short}: {score:.3f}")
+                
+                if sample_scores:
+                    pretty.kv_panel(
+                        "📊 Sample Reputation Scores",
+                        [
+                            ("sample_scores", "; ".join(sample_scores)),
+                        ],
+                        style="bold cyan",
+                    )
+
+    def _display_weights_breakdown(self, payload: dict):
+        """Display detailed breakdown of subnet weights."""
+        weights = payload.get("wbps", {})
+        if weights and isinstance(weights, dict):
+            weight_map = weights.get("map", {})
+            default_weight = weights.get("default", 10000)
+            
+            pretty.kv_panel(
+                "⚖️ Subnet Weights",
+                [
+                    ("default_weight", f"{default_weight} bps"),
+                    ("configured_subnets", len(weight_map) if isinstance(weight_map, dict) else 0),
+                ],
+                style="bold blue",
+            )
+            
+            # Show weight details
+            if weight_map and isinstance(weight_map, dict):
+                weight_details = []
+                for subnet_id, weight_bps in list(weight_map.items())[:5]:
+                    weight_details.append(f"SN-{subnet_id}: {weight_bps} bps")
+                
+                if weight_details:
+                    pretty.kv_panel(
+                        "📈 Weight Details",
+                        [
+                            ("weight_details", "; ".join(weight_details)),
+                        ],
+                        style="bold blue",
+                    )
+
+    def _display_budget_breakdown(self, payload: dict):
+        """Display detailed breakdown of budget information."""
+        bl_mu = payload.get("bl_mu", 0)
+        bl_tao = payload.get("bl_tao", 0.0)
+        bt_mu = payload.get("bt_mu", 0)
+        bt_tao = payload.get("bt_tao", 0.0)
+        
+        if bl_mu or bl_tao or bt_mu or bt_tao:
+            pretty.kv_panel(
+                "💰 Budget Information",
+                [
+                    ("budget_total_tao", f"{bt_tao:.6f}"),
+                    ("budget_leftover_tao", f"{bl_tao:.6f}"),
+                    ("budget_used_tao", f"{bt_tao - bl_tao:.6f}"),
+                    ("budget_utilization", f"{(bt_tao - bl_tao) / max(bt_tao, 1e-12) * 100:.1f}%"),
+                ],
+                style="bold yellow",
+            )
+
+    def _display_timeline_breakdown(self, payload: dict):
+        """Display detailed breakdown of timeline information."""
+        epoch = payload.get("e")
+        pay_epoch = payload.get("pe")
+        start_block = payload.get("as")
+        end_block = payload.get("de")
+        
+        if epoch is not None and pay_epoch is not None and start_block is not None and end_block is not None:
+            window_blocks = end_block - start_block
+            pretty.kv_panel(
+                "⏰ Timeline Information",
+                [
+                    ("epoch", epoch),
+                    ("payment_epoch", pay_epoch),
+                    ("auction_start_block", start_block),
+                    ("auction_end_block", end_block),
+                    ("payment_window_blocks", window_blocks),
+                    ("estimated_duration_minutes", f"{window_blocks * 12 / 60:.1f}"),
+                ],
+                style="bold magenta",
+            )
+
+    def _condense_payload_for_display(self, payload: dict) -> dict:
+        """Create a condensed version of the payload for display, with human-readable keys."""
+        condensed = {}
+        
+        # Map cryptic keys to readable ones
+        key_mapping = {
+            "e": "epoch",
+            "pe": "payment_epoch",
+            "as": "auction_start_block", 
+            "de": "auction_end_block",
+            "hk": "validator_hotkey",
+            "t": "treasury_coldkey",
+            "v": "version",
+            "b": "winner_bids",
+            "i": "all_bids",
+            "inv": "invoices",
+            "rj": "rejected_bids",
+            "rep": "reputation",
+            "jail": "jailed_miners",
+            "wbps": "subnet_weights",
+            "ck_by_uid": "coldkey_mapping",
+            "bl_mu": "budget_leftover_mu",
+            "bl_tao": "budget_leftover_tao",
+            "bt_mu": "budget_total_mu",
+            "bt_tao": "budget_total_tao",
+        }
+        
+        for old_key, new_key in key_mapping.items():
+            if old_key in payload:
+                condensed[new_key] = payload[old_key]
+        
+        return condensed
 
     # ---------- diagnostics helpers ----------
     def _touch_pending_meta(self, epoch: int, *, status: str, last_error: str | None = None):

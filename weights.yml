@@ -2,3 +2,4 @@ default: 1.0   # every subnet gets 1 unless listed below
 
 0: 0           # disable subnet 0
 73: 0          # disable subnet 73
+136: 1

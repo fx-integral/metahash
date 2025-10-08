@@ -13,6 +13,10 @@ from metahash.base.utils.logging import ColoredLogger as clog
 from metahash.utils.pretty_logs import pretty
 from metahash.config import PLANCK, LOG_TOP_N
 from metahash.miner.models import WinInvoice
+from metahash.miner.logging import (
+    MinerPhase, LogLevel, miner_logger, 
+    log_init, log_auction, log_commitments, log_settlement
+)
 
 
 class StateStore:
@@ -28,10 +32,16 @@ class StateStore:
         self.wins: List[WinInvoice] = []
 
         self._state_lock: threading.Lock = threading.Lock()
+        
 
     # ---------------------- I/O ----------------------
 
     def wipe(self):
+        log_init(LogLevel.MEDIUM, "Wiping state store", "state", {
+            "treasuries_count": len(self.treasuries),
+            "bids_count": sum(len(bids) for bids in self.already_bid.values()),
+            "wins_count": len(self.wins)
+        })
         self.treasuries.clear()
         self.already_bid.clear()
         self.wins.clear()
@@ -39,21 +49,26 @@ class StateStore:
             if self.path.exists():
                 self.path.unlink()
         except Exception as e:
-            clog.warning(f"[state] could not remove state file: {e}", color="yellow")
+            log_init(LogLevel.HIGH, "Could not remove state file", "state", {"error": str(e)})
 
     def load(self):
         if not self.path.exists():
             return
         try:
             data = json.loads(self.path.read_text())
+            log_init(LogLevel.MEDIUM, "State file loaded successfully", "state", {
+                "file_size": len(self.path.read_text())
+            })
         except Exception as e:
-            clog.warning(f"[state] could not load state (json): {e}", color="yellow")
+            log_init(LogLevel.HIGH, "Could not load state file", "state", {"error": str(e)})
             return
 
         self.treasuries = dict(data.get("treasuries", {}))
         self.already_bid = {k: [tuple(x) for x in v] for k, v in data.get("already_bid", {}).items()}
 
         self.wins = []
+        loaded_wins = 0
+        skipped_wins = 0
         for w in data.get("wins", []):
             try:
                 allowed = set(WinInvoice.__dataclass_fields__.keys())
@@ -76,8 +91,17 @@ class StateStore:
                 clean.setdefault("was_partial", False)
 
                 self.wins.append(WinInvoice(**clean))
+                loaded_wins += 1
             except Exception as e:
-                clog.warning(f"[state] skipping malformed win entry: {e}", color="yellow")
+                log_init(LogLevel.HIGH, "Skipping malformed win entry", "state", {"error": str(e)})
+                skipped_wins += 1
+        
+        log_init(LogLevel.MEDIUM, "State loading completed", "state", {
+            "treasuries_loaded": len(self.treasuries),
+            "bids_loaded": sum(len(bids) for bids in self.already_bid.values()),
+            "wins_loaded": loaded_wins,
+            "wins_skipped": skipped_wins
+        })
 
     def _save_sync(self):
         payload = {
@@ -158,14 +182,24 @@ class StateStore:
     def log_aggregate_summary(self):
         stats = self.aggregate_by_subnet()
         if not stats:
-            pretty.log("[grey]No aggregate data yet.[/grey]")
             return
         rows = [[sid, f"{b:.4f} α", f"{w:.4f} α", f"{p:.4f} α"] for sid, (b, w, p) in stats.items()]
-        pretty.table("Aggregate per Subnet (α bidded / won / paid)", ["Subnet", "Bidded", "Won", "Paid"], rows)
+        log_settlement(LogLevel.MEDIUM, "Aggregate summary generated", "state", {
+            "subnets_count": len(stats),
+            "total_bidded": sum(b for b, w, p in stats.values()),
+            "total_won": sum(w for b, w, p in stats.values()),
+            "total_paid": sum(p for b, w, p in stats.values())
+        })
+        miner_logger.phase_table(
+            MinerPhase.SETTLEMENT, "Aggregate per Subnet (α bidded / won / paid)", 
+            ["Subnet", "Bidded", "Won", "Paid"], rows,
+            LogLevel.MEDIUM
+        )
 
     def status_tables(self):
         pend = [w for w in self.wins if not w.paid]
         done = [w for w in self.wins if w.paid]
+
 
         rows_pend = [[
             (w.validator_key[:8] + "…"),
@@ -202,14 +236,16 @@ class StateStore:
         ] for w in sorted(done, key=lambda w: -float(getattr(w, "last_attempt_ts", 0.0) or 0.0))[:LOG_TOP_N]]
 
         if rows_pend:
-            pretty.table(
-                "Pending Wins (to pay)",
+            miner_logger.phase_table(
+                MinerPhase.SETTLEMENT, "Pending Wins (to pay)",
                 ["Validator", "E_seen", "Subnet", "Accepted", "Requested", "Fill", "Disc", "PayE", "WinStart", "WinEnd", "Amount", "Attempts", "InvID", "LastResp"],
                 rows_pend,
+                LogLevel.MEDIUM
             )
         if rows_done:
-            pretty.table(
-                "Paid Wins (recent)",
+            miner_logger.phase_table(
+                MinerPhase.SETTLEMENT, "Paid Wins (recent)",
                 ["Validator", "E_seen", "Subnet", "Accepted", "Requested", "Fill", "Disc", "PayE", "WinStart", "WinEnd", "Amount", "Attempts", "InvID", "LastResp"],
                 rows_done,
+                LogLevel.MEDIUM
             )

@@ -32,10 +32,91 @@ from metahash.utils.valuation import (
     effective_value_tao,
     encode_value_mu,
 )
+from typing import Any
 
 # Tolerances
 EPS_ALPHA = 1e-12   # unified with auction
 EPS_VALUE = 1e-12
+
+
+def _strip_internals_inplace(syn: Any) -> None:
+    """
+    Remove transient / non-serializable attributes that may be attached by the
+    inbound call context (e.g., dendrite with a `uids` slice). This prevents
+    Axon/Pydantic from walking into a Python `slice` and raising:
+      TypeError: unhashable type: 'slice'
+    """
+    def _recursive_clean(obj, visited=None, path=""):
+        if visited is None:
+            visited = set()
+
+        # Handle None objects early
+        if obj is None:
+            return
+
+        # Prevent infinite recursion
+        obj_id = id(obj)
+        if obj_id in visited:
+            return
+        visited.add(obj_id)
+
+        # Handle slice objects directly
+        if isinstance(obj, slice):
+            return None
+
+        # Handle dictionaries
+        if isinstance(obj, dict):
+            for key, value in list(obj.items()):
+                if isinstance(value, slice):
+                    obj[key] = None
+                elif value is not None and (hasattr(value, '__dict__') or isinstance(value, (dict, list, tuple))):
+                    _recursive_clean(value, visited, f"{path}[{key}]")
+
+        # Handle lists and tuples
+        elif isinstance(obj, (list, tuple)):
+            for i, item in enumerate(obj):
+                if isinstance(item, slice):
+                    if isinstance(obj, list):
+                        obj[i] = None
+                elif item is not None and (hasattr(item, '__dict__') or isinstance(item, (dict, list, tuple))):
+                    _recursive_clean(item, visited, f"{path}[{i}]")
+
+        # Handle objects with attributes
+        elif hasattr(obj, '__dict__'):
+            for attr_name in list(obj.__dict__.keys()):
+                try:
+                    attr_value = getattr(obj, attr_name)
+                    if isinstance(attr_value, slice):
+                        setattr(obj, attr_name, None)
+                    elif attr_value is not None and (hasattr(attr_value, '__dict__') or isinstance(attr_value, (dict, list, tuple))):
+                        _recursive_clean(attr_value, visited, f"{path}.{attr_name}")
+                except Exception:
+                    pass
+
+    # First, recursively clean any nested slice objects
+    _recursive_clean(syn)
+
+    # Most important: inbound context
+    for attr in ("dendrite", "_dendrite"):
+        if hasattr(syn, attr):
+            try:
+                setattr(syn, attr, None)
+            except Exception:
+                try:
+                    delattr(syn, attr)
+                except Exception:
+                    pass
+
+    # Extra caution: sometimes frameworks attach other transient handles
+    for attr in ("axon", "_axon", "server", "_server", "context", "_context"):
+        if hasattr(syn, attr):
+            try:
+                setattr(syn, attr, None)
+            except Exception:
+                try:
+                    delattr(syn, attr)
+                except Exception:
+                    pass
 
 
 class ClearingEngine:
@@ -235,8 +316,20 @@ class ClearingEngine:
 
         bid_map = self.parent.auction._bid_book.get(epoch_to_clear, {})
         if not bid_map:
+            # Enhanced logging for debugging - show available epochs and bid book state
+            available_epochs = list(self.parent.auction._bid_book.keys()) if hasattr(self.parent.auction, '_bid_book') else []
             pretty.log(
                 f"[grey]No bids to clear this epoch (master). epoch(e)={epoch_to_clear}[/grey]"
+            )
+            pretty.kv_panel(
+                "📚 Bid Book State (Debug)",
+                [
+                    ("epoch_to_clear", epoch_to_clear),
+                    ("available_epochs", ", ".join(map(str, sorted(available_epochs))) if available_epochs else "none"),
+                    ("bid_book_size", len(self.parent.auction._bid_book) if hasattr(self.parent.auction, '_bid_book') else 0),
+                    ("master_status", "✅ Active" if self.parent.auction._is_master_now() else "❌ Inactive"),
+                ],
+                style="bold red",
             )
             return False
 
@@ -258,17 +351,19 @@ class ClearingEngine:
             pretty.log("[yellow]TAO budget share is zero – skipping clear.[/yellow]")
             return False
 
-        pretty.kv_panel(
-            "Budget (VALUE in TAO) — base subnet",
-            [
-                ("epoch", epoch_to_clear),
-                ("base_sid", base_sid),
-                ("base_price_tao/α", f"{base_price_tao_per_alpha:.8f}"),
-                ("share", f"{share:.6f}"),
-                ("AUCTION_BUDGET_ALPHA(α)", f"{float(AUCTION_BUDGET_ALPHA):.6f}"),
-                ("my_budget_tao (VALUE)", f"{my_budget_tao:.6f}"),
-            ],
-            style="bold cyan",
+        # Format budget allocation as a rich table
+        budget_rows = [
+            ["Epoch", str(epoch_to_clear)],
+            ["Base Subnet", f"SN-{base_sid}"],
+            ["Base Price TAO/α", f"{base_price_tao_per_alpha:.8f}"],
+            ["Stake Share", f"{share:.6f}"],
+            ["Auction Budget α", f"{float(AUCTION_BUDGET_ALPHA):.6f}"],
+            ["My Budget TAO", f"{my_budget_tao:.6f}"],
+        ]
+        pretty.table(
+            "💰 Budget Allocation (VALUE in TAO)",
+            ["Parameter", "Value"],
+            budget_rows,
         )
 
         # 2) Build allocation inputs (subnet weights already snapped when accepting the bid)
@@ -324,7 +419,7 @@ class ClearingEngine:
             )
         if rows_bids:
             pretty.table(
-                "[yellow]Bids — ordered by VALUE (TAO)[/yellow]",
+                "📊 Bids Ordered by VALUE (TAO)",
                 ["UID", "CK", "Subnet", "W_bps", "Disc_bps", "Bid α", "Price(est) TAO/α", "Depth", "VALUE TAO"],
                 rows_bids,
             )
@@ -336,7 +431,7 @@ class ClearingEngine:
                 [ck[:8] + "…", f"{quota_frac.get(ck, 0.0):.3f}", f"{cap_tao_by_ck.get(ck, 0.0):.6f} TAO"]
                 for ck in sorted(cap_tao_by_ck.keys())
             ]
-            pretty.table("Reputation caps (TAO, per coldkey)",
+            pretty.table("🏆 Reputation Caps (TAO, per coldkey)",
                          ["Coldkey", "Quota frac", "Cap TAO"], cap_rows)
 
         # 4) TAO-budget greedy allocator honoring per-CK TAO caps — WITH PARTIALS
@@ -449,7 +544,7 @@ class ClearingEngine:
 
         if dbg_rows:
             pretty.table(
-                "Allocations — TAO Budget (caps enforced then relaxed)",
+                "🎯 Allocations — TAO Budget (caps enforced then relaxed)",
                 ["UID", "CK", "Subnet", "Req α", "Acc α (cum)", "TAO/α", "Spend TAO(VALUE)", "Disc_bps", "W_bps", "Pass"],
                 dbg_rows[: max(20, LOG_TOP_N)],
             )
@@ -512,7 +607,7 @@ class ClearingEngine:
                 ]
             )
         pretty.table(
-            "Winners — acceptances (VALUE)",
+            "🏆 Winners — Acceptances (VALUE)",
             ["UID", "CK", "Subnet", "Req α", "Acc α", "Disc_bps", "W_bps", "VALUE TAO", "Fill"],
             rows_w,
         )
@@ -771,22 +866,28 @@ class ClearingEngine:
                     f"win=[{win_start},{win_end}]"
                 )
 
+                # Create WinSynapse and clean it before sending
+                win_synapse = WinSynapse(
+                    subnet_id=w.subnet_id,
+                    alpha=w.alpha_accepted,  # ACCEPTED α to be paid by the miner
+                    clearing_discount_bps=w.discount_bps,
+                    pay_window_start_block=win_start,
+                    pay_window_end_block=win_end,
+                    pay_epoch_index=pay_epoch,
+                    validator_uid=v_uid,
+                    validator_hotkey=self.parent.hotkey_ss58,
+                    requested_alpha=float(req_alpha),
+                    accepted_alpha=float(w.alpha_accepted),
+                    was_partially_accepted=partial,
+                    accepted_amount_rao=amount_rao_full,
+                )
+                
+                # Clean the WinSynapse before sending to prevent slice errors
+                _strip_internals_inplace(win_synapse)
+                
                 resps = await self.parent.dendrite(
                     axons=[target_ax],
-                    synapse=WinSynapse(
-                        subnet_id=w.subnet_id,
-                        alpha=w.alpha_accepted,  # ACCEPTED α to be paid by the miner
-                        clearing_discount_bps=w.discount_bps,
-                        pay_window_start_block=win_start,
-                        pay_window_end_block=win_end,
-                        pay_epoch_index=pay_epoch,
-                        validator_uid=v_uid,
-                        validator_hotkey=self.parent.hotkey_ss58,
-                        requested_alpha=float(req_alpha),
-                        accepted_alpha=float(w.alpha_accepted),
-                        was_partially_accepted=partial,
-                        accepted_amount_rao=amount_rao_full,
-                    ),
+                    synapse=win_synapse,
                     deserialize=True,
                 )
                 calls_sent += 1

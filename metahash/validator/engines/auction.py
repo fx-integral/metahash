@@ -4,7 +4,7 @@ from __future__ import annotations
 import inspect
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from metahash.utils.pretty_logs import pretty
 from metahash.treasuries import VALIDATOR_TREASURIES
@@ -18,6 +18,86 @@ from metahash.protocol import AuctionStartSynapse
 
 # Use same α epsilon everywhere to avoid accept/clear inconsistencies
 EPS_ALPHA = 1e-12  # small epsilon for partial fill checks and gating
+
+
+def _strip_internals_inplace(syn: Any) -> None:
+    """
+    Remove transient / non-serializable attributes that may be attached by the
+    inbound call context (e.g., dendrite with a `uids` slice). This prevents
+    Axon/Pydantic from walking into a Python `slice` and raising:
+      TypeError: unhashable type: 'slice'
+    """
+    def _recursive_clean(obj, visited=None, path=""):
+        if visited is None:
+            visited = set()
+
+        # Handle None objects early
+        if obj is None:
+            return
+
+        # Prevent infinite recursion
+        obj_id = id(obj)
+        if obj_id in visited:
+            return
+        visited.add(obj_id)
+
+        # Handle slice objects directly
+        if isinstance(obj, slice):
+            return None
+
+        # Handle dictionaries
+        if isinstance(obj, dict):
+            for key, value in list(obj.items()):
+                if isinstance(value, slice):
+                    obj[key] = None
+                elif value is not None and (hasattr(value, '__dict__') or isinstance(value, (dict, list, tuple))):
+                    _recursive_clean(value, visited, f"{path}[{key}]")
+
+        # Handle lists and tuples
+        elif isinstance(obj, (list, tuple)):
+            for i, item in enumerate(obj):
+                if isinstance(item, slice):
+                    if isinstance(obj, list):
+                        obj[i] = None
+                elif item is not None and (hasattr(item, '__dict__') or isinstance(item, (dict, list, tuple))):
+                    _recursive_clean(item, visited, f"{path}[{i}]")
+
+        # Handle objects with attributes
+        elif hasattr(obj, '__dict__'):
+            for attr_name in list(obj.__dict__.keys()):
+                try:
+                    attr_value = getattr(obj, attr_name)
+                    if isinstance(attr_value, slice):
+                        setattr(obj, attr_name, None)
+                    elif attr_value is not None and (hasattr(attr_value, '__dict__') or isinstance(attr_value, (dict, list, tuple))):
+                        _recursive_clean(attr_value, visited, f"{path}.{attr_name}")
+                except Exception:
+                    pass
+
+    # First, recursively clean any nested slice objects
+    _recursive_clean(syn)
+
+    # Most important: inbound context
+    for attr in ("dendrite", "_dendrite"):
+        if hasattr(syn, attr):
+            try:
+                setattr(syn, attr, None)
+            except Exception:
+                try:
+                    delattr(syn, attr)
+                except Exception:
+                    pass
+
+    # Extra caution: sometimes frameworks attach other transient handles
+    for attr in ("axon", "_axon", "server", "_server", "context", "_context"):
+        if hasattr(syn, attr):
+            try:
+                setattr(syn, attr, None)
+            except Exception:
+                try:
+                    delattr(syn, attr)
+                except Exception:
+                    pass
 
 
 @dataclass(slots=True)
@@ -251,8 +331,6 @@ class AuctionEngine:
 
     def _accept_bid_from(self, *, uid: int, subnet_id: int, alpha: float, discount_bps: int) -> Tuple[bool, Optional[str]]:
         epoch = self.parent.epoch_index
-        if self.parent.block < START_V3_BLOCK:
-            return False, "auction not started (v3 gating)"
         if not self._is_master_now():
             return False, "bids disabled on non-master validator"
         if uid == 0:
@@ -344,12 +422,15 @@ class AuctionEngine:
             return
         if getattr(self, "_auction_start_sent_for", None) == self.parent.epoch_index:
             return
-        if self.parent.block < START_V3_BLOCK:
-            return
 
         pretty.kv_panel(
-            "2. AuctionStart",
-            [("epoch (e)", self.parent.epoch_index), ("action", "Starting auction…")],
+            "🎯 AuctionStart Phase",
+            [
+                ("epoch (e)", self.parent.epoch_index),
+                ("action", "Starting auction…"),
+                ("block", self.parent.block),
+                ("master_status", "✅ Active"),
+            ],
             style="bold cyan",
         )
 
@@ -380,6 +461,9 @@ class AuctionEngine:
             validator_hotkey=self.parent.hotkey_ss58,
         )
 
+        # Clean the AuctionStartSynapse before sending to prevent slice errors
+        _strip_internals_inplace(syn)
+
         try:
             pretty.log("[cyan]Broadcasting AuctionStart to miners…[/cyan]")
             resps = await self.parent.dendrite(axons=axons, synapse=syn, deserialize=True, timeout=AUCTION_START_TIMEOUT)
@@ -397,6 +481,8 @@ class AuctionEngine:
 
         for idx, ax in enumerate(axons):
             resp = resps[idx] if isinstance(resps, list) and idx < len(resps) else None
+            if resp is None:
+                continue
             if not isinstance(resp, AuctionStartSynapse):
                 continue
             if bool(getattr(resp, "ack", False)):
@@ -447,16 +533,18 @@ class AuctionEngine:
 
         self._auction_start_sent_for = self.parent.epoch_index
 
+        # Enhanced auction broadcast summary
         pretty.kv_panel(
-            "AuctionStart Broadcast (epoch e)",
+            "📡 AuctionStart Broadcast Summary",
             [
-                ("e (now)", e),
+                ("epoch (e)", e),
                 ("block", self.parent.block),
                 ("budget α", f"{my_budget:.3f}"),
-                ("treasury", VALIDATOR_TREASURIES.get(self.parent.hotkey_ss58, "")),
+                ("treasury", VALIDATOR_TREASURIES.get(self.parent.hotkey_ss58, "")[:8] + "…"),
                 ("acks_received", f"{ack_count}/{total}"),
                 ("bids_accepted", bids_accepted),
                 ("bids_rejected", bids_rejected),
+                ("success_rate", f"{(ack_count/total*100):.1f}%" if total > 0 else "0%"),
                 ("note", "miners pay for e in e+1; weights from e in e+2"),
             ],
             style="bold cyan",
@@ -465,10 +553,10 @@ class AuctionEngine:
         if bids_rejected > 0:
             pretty.log("[red]Some bids were rejected. See reasons below.[/red]")
             if reject_rows:
-                pretty.table("Rejected bids (why)", ["UID", "Subnet", "Alpha", "Discount", "Reason"], reject_rows)
+                pretty.table("❌ Rejected Bids", ["UID", "Subnet", "Alpha", "Discount", "Reason"], reject_rows)
             reason_rows = [[k, v] for k, v in sorted(reasons_counter.items(), key=lambda x: (-x[1], x[0]))[:max(6, LOG_TOP_N // 2)]]
             if reason_rows:
-                pretty.table("Rejection counts (top)", ["Reason", "Count"], reason_rows)
+                pretty.table("📊 Rejection Summary", ["Reason", "Count"], reason_rows)
 
         if self._wins_notified_for != self.parent.epoch_index:
             if self.clearer is not None:
@@ -479,13 +567,13 @@ class AuctionEngine:
                 except Exception:
                     keys = []
                 pretty.kv_panel(
-                    "Post-clear staging snapshot",
+                    "📋 Post-Clear Staging Snapshot",
                     [
                         ("epoch_cleared(e)", self.parent.epoch_index),
                         ("staged_key_expected", str(self.parent.epoch_index)),
-                        ("#pending_keys", len(keys)),
-                        ("keys(sample)", ", ".join(keys[:8])),
-                        ("clear_ok", str(bool(ok)).lower()),
+                        ("pending_keys", len(keys)),
+                        ("keys_sample", ", ".join(keys[:8])),
+                        ("clear_status", "✅ Success" if ok else "❌ Failed"),
                     ],
                     style="bold magenta",
                 )

@@ -11,6 +11,10 @@ import bittensor as bt
 from metahash.config import PLANCK, S_MIN_ALPHA_MINER
 from metahash.protocol import AuctionStartSynapse
 from metahash.utils.pretty_logs import pretty
+from metahash.miner.logging import (
+    MinerPhase, LogLevel, miner_logger, 
+    log_init, log_auction, log_commitments, log_settlement
+)
 
 from metahash.miner.models import BidLine
 from metahash.miner.state import StateStore
@@ -102,10 +106,16 @@ class Runtime:
         # Block cache
         self._blk_cache_height: int = 0
         self._blk_cache_ts: float = 0.0
+        
+        log_init(LogLevel.LOW, "Runtime component initialized", "runtime", {
+            "wallet_hotkey": getattr(wallet.hotkey, "ss58_address", "unknown"),
+            "metagraph_uid": getattr(metagraph, "uid", "unknown")
+        })
 
     # ---------------------- Config → Bid lines ----------------------
 
     def build_lines_from_config(self) -> List[BidLine]:
+        log_init(LogLevel.MEDIUM, "Building bid lines from configuration", "config")
         cfg_miner = getattr(self.config, "miner", None)
         cfg_bids = getattr(cfg_miner, "bids", cfg_miner)
 
@@ -119,43 +129,82 @@ class Runtime:
         except Exception:
             raw_flag = False
         self._bids_raw_discount = bool(raw_flag)
+        
+        log_init(LogLevel.LOW, "Discount mode configured", "config", {
+            "raw_discount": self._bids_raw_discount,
+            "mode": "RAW (pass-through)" if self._bids_raw_discount else "EFFECTIVE (weight-adjusted)"
+        })
 
         netuids = [int(x) for x in list(nets or [])]
         amounts = [float(x) for x in list(amts or [])]
         discounts = [parse_discount_token(str(x)) for x in list(discs or [])]
 
         if not (len(netuids) == len(amounts) == len(discounts)):
+            log_init(LogLevel.CRITICAL, "Configuration error: bid parameter lengths don't match", "config", {
+                "netuids_count": len(netuids),
+                "amounts_count": len(amounts), 
+                "discounts_count": len(discounts)
+            })
             raise ValueError("miner.bids.* lengths must match (netuids, amounts, discounts)")
 
         lines: List[BidLine] = []
+        skipped_count = 0
         for sid, amt, disc in zip(netuids, amounts, discounts):
             if amt <= 0:
-                pretty.log(f"[yellow]Skipping non-positive amount: {amt}[/yellow]")
+                log_init(LogLevel.HIGH, "Skipping non-positive amount", "config", {
+                    "subnet_id": sid,
+                    "amount": amt
+                })
+                skipped_count += 1
                 continue
             if disc < 0 or disc > 10_000:
-                pretty.log(f"[yellow]Skipping invalid discount: {disc} bps[/yellow]")
+                log_init(LogLevel.HIGH, "Skipping invalid discount", "config", {
+                    "subnet_id": sid,
+                    "discount_bps": disc
+                })
+                skipped_count += 1
                 continue
             lines.append(BidLine(subnet_id=int(sid), alpha=float(amt), discount_bps=int(disc)))
+        
+        log_init(LogLevel.MEDIUM, "Bid lines built successfully", "config", {
+            "total_lines": len(lines),
+            "skipped_lines": skipped_count,
+            "subnets": [line.subnet_id for line in lines]
+        })
         return lines
 
     def log_cfg_summary(self, lines: List[BidLine]):
         mode = "RAW (pass-through)" if self._bids_raw_discount else "EFFECTIVE (weight-adjusted)"
         rows = [[i, ln.subnet_id, f"{ln.alpha:.4f} α", f"{ln.discount_bps} bps"] for i, ln in enumerate(lines)]
         if rows:
-            pretty.table("Configured Bid Lines", ["#", "Subnet", "Alpha", "Discount (cfg)"], rows)
-            pretty.log(f"[cyan]Discount interpretation[/cyan]: {mode}")
+            miner_logger.phase_table(
+                MinerPhase.INITIALIZATION, "Configured Bid Lines", 
+                ["#", "Subnet", "Alpha", "Discount (cfg)"], rows,
+                LogLevel.MEDIUM
+            )
+            log_init(LogLevel.LOW, "Discount interpretation mode", "config", {"mode": mode})
 
     # ---------------------- Chain (lazy) ----------------------
 
     async def _ensure_async_subtensor(self):
         if self._async_subtensor is None:
-            stxn = bt.AsyncSubtensor(self.config)
+            log_init(LogLevel.MEDIUM, "Initializing async subtensor connection", "chain")
+            # Create with just network parameter to avoid config issues that cause slice attachment
+            try:
+                network = getattr(self.config.subtensor, 'network', 'finney')
+                stxn = bt.AsyncSubtensor(network=network)
+                log_init(LogLevel.LOW, "Async subtensor created with network config", "chain", {"network": network})
+            except Exception as e:
+                log_init(LogLevel.HIGH, "Failed to create async subtensor with network, using fallback", "chain", {"error": str(e)})
+                stxn = bt.AsyncSubtensor(self.config)
             init = getattr(stxn, "initialize", None)
             if callable(init):
                 await init()
+                log_init(LogLevel.LOW, "Async subtensor initialized successfully", "chain")
             self._async_subtensor = stxn
         if self._rpc_lock is None:
             self._rpc_lock = asyncio.Lock()
+            log_init(LogLevel.DEBUG, "RPC lock created", "chain")
 
     async def get_current_block(self) -> int:
         await self._ensure_async_subtensor()
@@ -360,17 +409,29 @@ class Runtime:
 
         weights_bps_in = getattr(synapse, "weights_bps", {}) or {}
         weights_bps: Dict[int, int] = self._normalize_weights_bps(weights_bps_in)
+        
+        log_auction(LogLevel.MEDIUM, "Processing auction start request", "auction", {
+            "validator": vkey,
+            "epoch": epoch,
+            "budget_alpha": budget_alpha,
+            "min_stake_alpha": min_stake_alpha,
+            "weights_count": len(weights_bps)
+        })
 
         # ---------------- Allowlist ----------------
         treasury_ck = self.state.treasuries.get(caller_hot) or self.state.treasuries.get(vkey)
         if not treasury_ck:
             note = f"validator not allowlisted: {caller_hot or vkey or '?'}"
-            pretty.kv_panel(
-                "[red]AuctionStart ignored[/red]",
+            log_auction(LogLevel.HIGH, "Auction start ignored - validator not allowlisted", "auction", {
+                "validator": f"{caller_hot or vkey} (uid={uid if uid is not None else '?'})",
+                "reason": "not allowlisted"
+            })
+            miner_logger.phase_panel(
+                MinerPhase.AUCTION, "AuctionStart Ignored",
                 [("validator", f"{caller_hot or vkey} (uid={uid if uid is not None else '?'})"),
                  ("reason", "not allowlisted"),
                  ("note", note)],
-                style="bold red",
+                LogLevel.HIGH
             )
             # Mutate response in-place with clean types
             synapse.ack = True
@@ -388,8 +449,13 @@ class Runtime:
             synapse.validator_hotkey = caller_hot or None
             return synapse
 
-        pretty.kv_panel(
-            "[cyan]AuctionStart[/cyan]",
+        # Enhanced auction start logging with structured information
+        log_auction(LogLevel.MEDIUM, "Auction start received from allowlisted validator", "auction", {
+            "validator": f"{caller_hot or vkey} (uid={uid if uid is not None else '?'})",
+            "treasury_coldkey": treasury_ck[:8] + "…"
+        })
+        miner_logger.phase_panel(
+            MinerPhase.AUCTION, "AuctionStart Received",
             [
                 ("validator", f"{caller_hot or vkey} (uid={uid if uid is not None else '?'})"),
                 ("epoch (e)", epoch),
@@ -400,34 +466,74 @@ class Runtime:
                 ("timeline", f"bid now (e) → pay in (e+1={epoch+1}) → weights from e in (e+2={epoch+2})"),
                 ("treasury_src", "LOCAL allowlist (pinned)"),
             ],
-            style="bold cyan",
+            LogLevel.MEDIUM
         )
+        
+        # Add detailed weights breakdown if available
+        if weights_bps:
+            weight_details = []
+            for sid, weight in sorted(weights_bps.items()):
+                weight_details.append(f"SN-{sid}: {weight} bps")
+            miner_logger.phase_panel(
+                MinerPhase.AUCTION, "Subnet Weights",
+                [
+                    ("weight_details", "; ".join(weight_details[:3]) + ("..." if len(weight_details) > 3 else "")),
+                    ("total_subnets", len(weights_bps)),
+                ],
+                LogLevel.LOW
+            )
 
         candidate_subnets = [int(ln.subnet_id) for ln in lines if isfinite(ln.alpha) and ln.alpha > 0 and 0 <= ln.discount_bps <= 10_000]
         stake_by_subnet: Dict[int, float] = {}
         if candidate_subnets and (caller_hot or vkey):
+            log_auction(LogLevel.MEDIUM, "Checking validator stakes for candidate subnets", "stake", {
+                "candidate_subnets": candidate_subnets,
+                "validator": caller_hot or vkey
+            })
             try:
                 stake_by_subnet = await self.get_validator_stakes_map(caller_hot or vkey, candidate_subnets)
-                rows = [[sid, f"{amt:.4f} α"] for sid, amt in sorted(stake_by_subnet.items())]
+                rows = [[f"SN-{sid}", f"{amt:.4f} α", "✅" if amt >= min_stake_alpha else "❌"] for sid, amt in sorted(stake_by_subnet.items())]
                 if rows:
-                    pretty.table("[blue]Available stake with validator (per subnet)[/blue]", ["Subnet", "α available"], rows)
+                    miner_logger.phase_table(
+                        MinerPhase.AUCTION, "Available Stake with Validator (per subnet)", 
+                        ["Subnet", "α available", "meets_min"], rows,
+                        LogLevel.MEDIUM
+                    )
+                    
+                    # Add summary statistics
+                    total_stake = sum(stake_by_subnet.values())
+                    eligible_subnets = sum(1 for amt in stake_by_subnet.values() if amt >= min_stake_alpha)
+                    miner_logger.phase_panel(
+                        MinerPhase.AUCTION, "Stake Summary",
+                        [
+                            ("total_stake", f"{total_stake:.4f} α"),
+                            ("eligible_subnets", f"{eligible_subnets}/{len(stake_by_subnet)}"),
+                            ("min_stake_required", f"{min_stake_alpha:.4f} α"),
+                        ],
+                        LogLevel.MEDIUM
+                    )
             except Exception as _e:
                 stake_by_subnet = {int(s): 0.0 for s in candidate_subnets}
-                pretty.log(f"[yellow]Stake check failed; defaulting to 0 availability.[/yellow] {_e}")
+                log_auction(LogLevel.HIGH, "Stake check failed, defaulting to 0 availability", "stake", {"error": str(_e)})
 
         if min_stake_alpha > 0:
             has_any = any(amt >= min_stake_alpha for amt in stake_by_subnet.values())
             if not has_any:
                 top3 = sorted(stake_by_subnet.items(), key=lambda kv: kv[1], reverse=True)[:3]
-                pretty.kv_panel(
-                    "[yellow]Stake gate (per-subnet)[/yellow]",
+                log_auction(LogLevel.HIGH, "Stake gate triggered - insufficient stake for any subnet", "stake", {
+                    "epoch": epoch,
+                    "min_stake_alpha": min_stake_alpha,
+                    "max_available": max(stake_by_subnet.values()) if stake_by_subnet else 0.0
+                })
+                miner_logger.phase_panel(
+                    MinerPhase.AUCTION, "Stake Gate (per-subnet)",
                     [
                         ("epoch", epoch),
                         ("min_stake_α", f"{min_stake_alpha:.4f}"),
                         ("max_available_α", f"{(max(stake_by_subnet.values()) if stake_by_subnet else 0.0):.4f}"),
                         *[(f"sid{sid}", f"{amt:.4f} α") for sid, amt in top3],
                     ],
-                    style="bold yellow",
+                    LogLevel.HIGH
                 )
                 self.state.status_tables()
 
@@ -452,12 +558,23 @@ class Runtime:
         out_bids: List[Tuple[int, float, int, str]] = []
         rows_sent = []
 
+        log_auction(LogLevel.MEDIUM, "Processing bid lines", "bidding", {
+            "total_lines": len(lines),
+            "available_subnets": len(remaining_by_subnet)
+        })
+        
         for ln in lines:
             if not isfinite(ln.alpha) or ln.alpha <= 0:
-                pretty.log(f"[yellow]Invalid alpha {ln.alpha} for subnet {ln.subnet_id} – skipping line.[/yellow]")
+                log_auction(LogLevel.HIGH, "Invalid alpha - skipping line", "bidding", {
+                    "subnet_id": ln.subnet_id,
+                    "alpha": ln.alpha
+                })
                 continue
             if not (0 <= ln.discount_bps <= 10_000):
-                pretty.log(f"[yellow]Invalid discount {ln.discount_bps} bps – skipping line.[/yellow]")
+                log_auction(LogLevel.HIGH, "Invalid discount - skipping line", "bidding", {
+                    "subnet_id": ln.subnet_id,
+                    "discount_bps": ln.discount_bps
+                })
                 continue
 
             subnet_id = int(ln.subnet_id)
@@ -465,10 +582,15 @@ class Runtime:
 
             available = float(remaining_by_subnet.get(subnet_id, 0.0))
             if available <= 0.0:
-                pretty.kv_panel(
-                    "[red]Bid skipped – insufficient delegated stake with validator[/red]",
+                log_auction(LogLevel.HIGH, "Bid skipped - insufficient delegated stake", "bidding", {
+                    "subnet_id": subnet_id,
+                    "cfg_alpha": ln.alpha,
+                    "available_alpha": available
+                })
+                miner_logger.phase_panel(
+                    MinerPhase.AUCTION, "Bid Skipped – Insufficient Delegated Stake",
                     [("subnet", subnet_id), ("cfg α", f"{ln.alpha:.4f}"), ("available α", f"{available:.4f}")],
-                    style="bold red",
+                    LogLevel.HIGH
                 )
                 continue
 
@@ -476,7 +598,10 @@ class Runtime:
             remaining_by_subnet[subnet_id] = max(0.0, available - send_alpha)
 
             if budget_alpha > 0 and send_alpha > budget_alpha:
-                pretty.log(f"[grey58]Note:[/grey58] line α {send_alpha:.4f} exceeds validator budget α {budget_alpha:.4f}; may be partially filled.")
+                log_auction(LogLevel.LOW, "Line alpha exceeds validator budget - may be partially filled", "bidding", {
+                    "line_alpha": send_alpha,
+                    "budget_alpha": budget_alpha
+                })
 
             if self._bids_raw_discount:
                 send_disc_bps = int(ln.discount_bps)
@@ -488,6 +613,11 @@ class Runtime:
                 mode_note = "effective→raw"
 
             if self.state.has_bid(vkey, epoch, subnet_id, send_alpha, send_disc_bps):
+                log_auction(LogLevel.LOW, "Duplicate bid detected - skipping", "bidding", {
+                    "subnet_id": subnet_id,
+                    "alpha": send_alpha,
+                    "discount_bps": send_disc_bps
+                })
                 continue
 
             bid_id = hashlib.sha1(f"{vkey}|{epoch}|{subnet_id}|{send_alpha:.12f}|{send_disc_bps}".encode("utf-8")).hexdigest()[:10]
@@ -495,6 +625,13 @@ class Runtime:
             out_bids.append((int(subnet_id), float(send_alpha), int(send_disc_bps), str(bid_id)))
 
             self.state.remember_bid(vkey, epoch, subnet_id, send_alpha, send_disc_bps)
+            
+            log_auction(LogLevel.LOW, "Bid added successfully", "bidding", {
+                "subnet_id": subnet_id,
+                "alpha": send_alpha,
+                "discount_bps": send_disc_bps,
+                "bid_id": bid_id
+            })
 
             rows_sent.append([
                 subnet_id,
@@ -509,12 +646,34 @@ class Runtime:
             ])
 
         if not out_bids:
-            pretty.log("[grey]No bids were added (invalid/duplicate/insufficient stake).[/grey]")
+            log_auction(LogLevel.HIGH, "No bids were added", "bidding", {
+                "reason": "invalid/duplicate/insufficient stake"
+            })
         else:
-            pretty.table(
-                "[yellow]Bids Sent[/yellow]",
+            # Enhanced bids sent table with better formatting
+            log_auction(LogLevel.MEDIUM, "Bids sent successfully", "bidding", {
+                "bid_count": len(out_bids)
+            })
+            miner_logger.phase_table(
+                MinerPhase.AUCTION, "Bids Sent",
                 ["Subnet", "Alpha", "Disc(cfg)", "Disc(send)", "Weight", "Eff", "BidID", "Epoch", "Mode"],
                 rows_sent,
+                LogLevel.MEDIUM
+            )
+            
+            # Add bid summary statistics
+            total_alpha_sent = sum(bid[1] for bid in out_bids)
+            unique_subnets = len(set(bid[0] for bid in out_bids))
+            miner_logger.phase_panel(
+                MinerPhase.AUCTION, "Bid Summary",
+                [
+                    ("total_bids", len(out_bids)),
+                    ("total_alpha", f"{total_alpha_sent:.4f} α"),
+                    ("unique_subnets", unique_subnets),
+                    ("avg_discount", f"{sum(bid[2] for bid in out_bids) / len(out_bids):.0f} bps"),
+                    ("epoch", epoch),
+                ],
+                LogLevel.MEDIUM
             )
 
         await self.state.save_async()
@@ -523,7 +682,8 @@ class Runtime:
         # Mutate the same inbound synapse with clean types
         synapse.ack = True
         synapse.retries_attempted = 0
-        synapse.bids = list(out_bids)           # pydantic will accept list[tuple[...]]
+        # Convert tuples to dictionaries as expected by protocol
+        synapse.bids = [{"subnet_id": bid[0], "alpha": bid[1], "discount_bps": bid[2], "bid_id": bid[3]} for bid in out_bids]
         synapse.bids_sent = int(len(out_bids))
         synapse.note = None
 
@@ -536,4 +696,8 @@ class Runtime:
         synapse.validator_uid = uid
         synapse.validator_hotkey = caller_hot or None
 
+        log_auction(LogLevel.MEDIUM, "Auction start processing completed", "auction", {
+            "bids_sent": len(out_bids),
+            "ack": True
+        })
         return synapse

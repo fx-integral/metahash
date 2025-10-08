@@ -13,6 +13,10 @@ from bittensor import BLOCKTIME
 from metahash.config import PLANCK
 from metahash.utils.pretty_logs import pretty
 from metahash.utils.wallet_utils import transfer_alpha
+from metahash.miner.logging import (
+    MinerPhase, LogLevel, miner_logger, 
+    log_init, log_auction, log_commitments, log_settlement
+)
 
 from metahash.protocol import WinSynapse
 from metahash.miner.models import WinInvoice
@@ -75,6 +79,7 @@ class Payments:
         self._pay_start_safety_blocks: int = 0
         self._retry_every_blocks: int = 2
         self._retry_max_attempts: int = 12
+        
 
     # ---------------------- Background loop ----------------------
 
@@ -88,11 +93,13 @@ class Payments:
             import threading
             self._bg_thread = threading.Thread(target=self._run_bg_loop, name="miner-payments-loop", daemon=True)
             self._bg_thread.start()
+            log_init(LogLevel.MEDIUM, "Background payment thread started", "payments")
         # resume unpaid + watchdog
         self.submit(self._resume_pending_payments())
         self.submit(self._pending_payments_watchdog())
 
     def shutdown_background(self):
+        log_init(LogLevel.MEDIUM, "Shutting down background payment tasks", "payments")
         for fut in list(self._tasks.values()):
             try:
                 fut.cancel()
@@ -103,8 +110,9 @@ class Payments:
                 self._bg_loop.call_soon_threadsafe(self._bg_loop.stop)
             if self._bg_thread and self._bg_thread.is_alive():
                 self._bg_thread.join(timeout=2)
-        except Exception:
-            pass
+            log_init(LogLevel.LOW, "Background payment tasks shutdown completed", "payments")
+        except Exception as e:
+            log_init(LogLevel.HIGH, "Error during background task shutdown", "payments", {"error": str(e)})
 
     def submit(self, coro: Coroutine[Any, Any, Any]) -> Future[Any]:
         if not asyncio.iscoroutine(coro):
@@ -126,6 +134,7 @@ class Payments:
     def ensure_payment_config(self):
         if self._pay_cfg_initialized:
             return
+        log_init(LogLevel.MEDIUM, "Loading payment configuration", "payments")
         pay_cfg = getattr(self.config, "payment", None)
 
         # --payment.validators hk1 hk2 ...
@@ -133,9 +142,13 @@ class Payments:
             pool = list(getattr(pay_cfg, "validators", [])) if pay_cfg is not None else []
             self._pay_pool = [hk.strip() for hk in pool if isinstance(hk, str) and hk.strip()]
             if self._pay_pool:
-                pretty.log(f"[green]Payment pool loaded[/green]: {len(self._pay_pool)} round-robin origin hotkey(s).")
-        except Exception:
+                log_init(LogLevel.LOW, "Payment pool loaded", "payments", {
+                    "pool_size": len(self._pay_pool),
+                    "type": "round-robin origin hotkeys"
+                })
+        except Exception as e:
             self._pay_pool = []
+            log_init(LogLevel.HIGH, "Failed to load payment pool", "payments", {"error": str(e)})
 
         # --payment.map sid:hk sid:hk ...
         try:
@@ -150,17 +163,24 @@ class Payments:
                     continue
                 self._pay_map[sid] = hk.strip()
             if self._pay_map:
-                pretty.log(f"[green]Payment map loaded[/green]: {len(self._pay_map)} subnet-specific origin hotkey(s).")
-        except Exception:
+                log_init(LogLevel.LOW, "Payment map loaded", "payments", {
+                    "map_size": len(self._pay_map),
+                    "type": "subnet-specific origin hotkeys"
+                })
+        except Exception as e:
             self._pay_map = {}
+            log_init(LogLevel.HIGH, "Failed to load payment map", "payments", {"error": str(e)})
 
         # Start safety / retry knobs
         try:
             self._pay_start_safety_blocks = max(0, int(getattr(pay_cfg, "start_safety_blocks", 0) or 0))
             if self._pay_start_safety_blocks:
-                pretty.log(f"[green]Payment start safety[/green]: +{self._pay_start_safety_blocks} block(s) after window start.")
-        except Exception:
+                log_init(LogLevel.LOW, "Payment start safety configured", "payments", {
+                    "safety_blocks": self._pay_start_safety_blocks
+                })
+        except Exception as e:
             self._pay_start_safety_blocks = 0
+            log_init(LogLevel.HIGH, "Failed to load payment start safety", "payments", {"error": str(e)})
 
         try:
             self._retry_every_blocks = max(1, int(getattr(pay_cfg, "retry_every_blocks", 2) or 2))
@@ -173,9 +193,16 @@ class Payments:
             self._retry_max_attempts = 12
 
         if not self._pay_map and not self._pay_pool and not self._pay_start_safety_blocks:
-            pretty.log("[yellow]No --payment.map / --payment.validators / --payment.start_safety_blocks; defaults in effect.[/yellow]")
+            log_init(LogLevel.HIGH, "No payment configuration found - using defaults", "payments")
 
         self._pay_cfg_initialized = True
+        log_init(LogLevel.MEDIUM, "Payment configuration loaded successfully", "payments", {
+            "pool_size": len(self._pay_pool),
+            "map_size": len(self._pay_map),
+            "safety_blocks": self._pay_start_safety_blocks,
+            "retry_every_blocks": self._retry_every_blocks,
+            "retry_max_attempts": self._retry_max_attempts
+        })
 
     def _pick_rr_hotkey(self) -> str:
         if not self._pay_pool:
@@ -196,9 +223,9 @@ class Payments:
         try:
             self.ensure_payment_config()
             self.schedule_unpaid_pending()
-            pretty.log("[green]Startup: resumed scheduling of unpaid invoices.[/green]")
+            log_init(LogLevel.LOW, "Startup: resumed scheduling of unpaid invoices", "payments")
         except Exception as e:
-            pretty.log(f"[yellow]Startup resume failed:[/yellow] {e}")
+            log_init(LogLevel.HIGH, "Startup resume failed", "payments", {"error": str(e)})
 
     async def _pending_payments_watchdog(self):
         try:
@@ -208,29 +235,46 @@ class Payments:
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            pretty.log(f"[yellow]Payments watchdog error:[/yellow] {e}")
+            log_settlement(LogLevel.HIGH, "Payments watchdog error", "payments", {"error": str(e)})
 
     def schedule_unpaid_pending(self):
         """Idempotent: schedules only invoices that are not paid and not expired."""
+        scheduled_count = 0
+        skipped_count = 0
         for w in self.state.wins:
             if bool(getattr(w, "paid", False) or getattr(w, "expired", False)):
                 continue
             treasury_ck = self.state.treasuries.get(w.validator_key) or self.state.treasuries.get(getattr(w, "validator_key", ""))
             if not treasury_ck:
-                pretty.kv_panel(
-                    "[yellow]Skipping pending invoice[/yellow]",
+                log_settlement(LogLevel.HIGH, "Skipping pending invoice - validator not allowlisted", "scheduling", {
+                    "invoice_id": getattr(w, "invoice_id", "?"),
+                    "validator_key": w.validator_key
+                })
+                miner_logger.phase_panel(
+                    MinerPhase.SETTLEMENT, "Skipping Pending Invoice",
                     [("inv", getattr(w, "invoice_id", "?")), ("reason", "validator not allowlisted")],
-                    style="bold yellow",
+                    LogLevel.HIGH
                 )
+                skipped_count += 1
                 continue
             if w.treasury_coldkey != treasury_ck:
                 w.treasury_coldkey = treasury_ck
             self._schedule_payment(w)
+            scheduled_count += 1
+        
+        if scheduled_count > 0 or skipped_count > 0:
+            log_settlement(LogLevel.LOW, "Payment scheduling completed", "scheduling", {
+                "scheduled": scheduled_count,
+                "skipped": skipped_count
+            })
 
     def _schedule_payment(self, inv: WinInvoice):
         tid = inv.invoice_id
         t = self._tasks.get(tid)
         if t and not t.done():
+            log_settlement(LogLevel.DEBUG, "Payment already scheduled - skipping", "scheduling", {
+                "invoice_id": inv.invoice_id
+            })
             return
 
         inv.last_response = f"scheduled (wait ≥{self._pay_start_safety_blocks} blk)"
@@ -239,17 +283,24 @@ class Payments:
         fut = self.submit(self._payment_worker(inv))
         self._tasks[tid] = fut
 
-        pretty.kv_panel(
-            "[cyan]Payment scheduled[/cyan]",
+        # Enhanced payment scheduling information
+        log_settlement(LogLevel.MEDIUM, "Payment scheduled successfully", "scheduling", {
+            "invoice_id": inv.invoice_id,
+            "subnet_id": inv.subnet_id,
+            "amount_alpha": inv.amount_rao/PLANCK
+        })
+        miner_logger.phase_panel(
+            MinerPhase.SETTLEMENT, "Payment Scheduled",
             [
                 ("invoice", inv.invoice_id),
-                ("subnet", inv.subnet_id),
+                ("subnet", f"SN-{inv.subnet_id}"),
                 ("α", f"{inv.amount_rao/PLANCK:.4f}"),
                 ("window", f"[{inv.pay_window_start_block},{inv.pay_window_end_block or '?'}]"),
                 ("safety", f"+{self._pay_start_safety_blocks} blk"),
                 ("retry", f"every {self._retry_every_blocks} blk × {self._retry_max_attempts}"),
+                ("treasury", inv.treasury_coldkey[:8] + "…"),
             ],
-            style="bold cyan",
+            LogLevel.MEDIUM
         )
 
     # ---------------------- Worker ----------------------
@@ -271,6 +322,15 @@ class Payments:
             end = int(inv.pay_window_end_block or 0)
             allowed_start = start + int(self._pay_start_safety_blocks or 0)
 
+            log_settlement(LogLevel.MEDIUM, "Payment worker started", "worker", {
+                "invoice_id": inv.invoice_id,
+                "subnet_id": inv.subnet_id,
+                "amount_alpha": inv.amount_rao/PLANCK,
+                "window_start": start,
+                "window_end": end,
+                "allowed_start": allowed_start
+            })
+
             attempt = 0
             while True:
                 blk = await self.runtime.get_current_block()
@@ -280,10 +340,24 @@ class Payments:
                     await self.state.save_async()
                     sleep_blocks = max(1, allowed_start - blk)
                     sleep_s = max(0.5, min(10 * float(BLOCKTIME), sleep_blocks * float(BLOCKTIME)))
-                    pretty.kv_panel(
-                        "[blue]PAY wait[/blue]",
-                        [("inv", inv.invoice_id), ("blk", blk), ("allowed_start", allowed_start), ("sleep", f"{sleep_s:.1f}s")],
-                        style="bold blue",
+                    log_settlement(LogLevel.LOW, "Payment waiting for window start", "worker", {
+                        "invoice_id": inv.invoice_id,
+                        "current_block": blk,
+                        "allowed_start": allowed_start,
+                        "blocks_remaining": allowed_start - blk,
+                        "sleep_duration": sleep_s
+                    })
+                    miner_logger.phase_panel(
+                        MinerPhase.SETTLEMENT, "PAY Wait",
+                        [
+                            ("invoice", inv.invoice_id),
+                            ("current_block", blk),
+                            ("allowed_start", allowed_start),
+                            ("blocks_remaining", allowed_start - blk),
+                            ("sleep_duration", f"{sleep_s:.1f}s"),
+                            ("subnet", f"SN-{inv.subnet_id}"),
+                        ],
+                        LogLevel.LOW
                     )
                     await asyncio.sleep(sleep_s)
                     continue
@@ -292,10 +366,15 @@ class Payments:
                     inv.last_response = f"window over (blk {blk} > end {end})"
                     inv.expired = True
                     await self.state.save_async()
-                    pretty.kv_panel(
-                        "[yellow]PAY exit[/yellow]",
+                    log_settlement(LogLevel.HIGH, "Payment window expired", "worker", {
+                        "invoice_id": inv.invoice_id,
+                        "current_block": blk,
+                        "window_end": end
+                    })
+                    miner_logger.phase_panel(
+                        MinerPhase.SETTLEMENT, "PAY Exit",
                         [("inv", inv.invoice_id), ("reason", "window over"), ("blk", blk), ("end", end)],
-                        style="bold yellow",
+                        LogLevel.HIGH
                     )
                     self.state.status_tables()
                     break
@@ -303,10 +382,23 @@ class Payments:
                 attempt += 1
                 inv.last_attempt_ts = time.time()
                 await self.state.save_async()
-                pretty.kv_panel(
-                    "[white]PAY attempt[/white]",
-                    [("inv", inv.invoice_id), ("try", f"{attempt}/{self._retry_max_attempts}"), ("blk", blk), ("win", f"[{start},{end}]")],
-                    style="bold white",
+                log_settlement(LogLevel.MEDIUM, "Payment attempt started", "worker", {
+                    "invoice_id": inv.invoice_id,
+                    "attempt": f"{attempt}/{self._retry_max_attempts}",
+                    "current_block": blk,
+                    "amount_alpha": inv.amount_rao/PLANCK
+                })
+                miner_logger.phase_panel(
+                    MinerPhase.SETTLEMENT, "PAY Attempt",
+                    [
+                        ("invoice", inv.invoice_id),
+                        ("attempt", f"{attempt}/{self._retry_max_attempts}"),
+                        ("current_block", blk),
+                        ("window", f"[{start},{end}]"),
+                        ("subnet", f"SN-{inv.subnet_id}"),
+                        ("amount", f"{inv.amount_rao/PLANCK:.4f} α"),
+                    ],
+                    LogLevel.MEDIUM
                 )
 
                 ok = False
@@ -320,10 +412,24 @@ class Payments:
                 if bal_alpha is not None and bal_alpha + 1e-12 < need_alpha:
                     inv.last_response = f"insufficient α on subnet {inv.subnet_id}: have {bal_alpha:.6f}, need {need_alpha:.6f}"
                     await self.state.save_async()
-                    pretty.kv_panel(
-                        "[red]PAY wait (insufficient α)[/red]",
-                        [("inv", inv.invoice_id), ("subnet", inv.subnet_id), ("have α", f"{bal_alpha:.6f}"), ("need α", f"{need_alpha:.6f}")],
-                        style="bold red",
+                    log_settlement(LogLevel.HIGH, "Insufficient balance for payment", "worker", {
+                        "invoice_id": inv.invoice_id,
+                        "subnet_id": inv.subnet_id,
+                        "current_balance": bal_alpha,
+                        "required_amount": need_alpha,
+                        "deficit": need_alpha - bal_alpha
+                    })
+                    miner_logger.phase_panel(
+                        MinerPhase.SETTLEMENT, "Insufficient Balance",
+                        [
+                            ("invoice", inv.invoice_id),
+                            ("subnet", f"SN-{inv.subnet_id}"),
+                            ("current_balance", f"{bal_alpha:.6f} α"),
+                            ("required_amount", f"{need_alpha:.6f} α"),
+                            ("deficit", f"{need_alpha - bal_alpha:.6f} α"),
+                            ("hotkey", origin_hotkey[:8] + "…"),
+                        ],
+                        LogLevel.HIGH
                     )
                     await asyncio.sleep(max(0.5, float(BLOCKTIME) * float(self._retry_every_blocks)))
                     continue
@@ -378,38 +484,64 @@ class Payments:
                     if paid_block:
                         inv.paid_at_block = int(paid_block)
                     await self.state.save_async()
-                    pretty.kv_panel(
-                        "[green]Payment OK[/green]",
+                    log_settlement(LogLevel.MEDIUM, "Payment successful", "worker", {
+                        "invoice_id": inv.invoice_id,
+                        "amount_alpha": inv.amount_rao/PLANCK,
+                        "subnet_id": inv.subnet_id,
+                        "attempts": inv.pay_attempts,
+                        "tx_hash": tx_hash[:10] + "…" if tx_hash else None
+                    })
+                    miner_logger.phase_panel(
+                        MinerPhase.SETTLEMENT, "Payment Success",
                         [
-                            ("inv", inv.invoice_id),
-                            ("α", f"{inv.amount_rao/PLANCK:.4f}"),
-                            ("dst_treasury", inv.treasury_coldkey[:8] + "…"),
-                            ("src_hotkey", origin_hotkey[:8] + "…"),
-                            ("sid", inv.subnet_id),
-                            ("pay_e", inv.pay_epoch_index),
-                            *([("tx", inv.tx_hash[:10] + "…")] if getattr(inv, "tx_hash", None) else []),
-                            *([("in_block", inv.paid_at_block)] if getattr(inv, "paid_at_block", None) else []),
+                            ("invoice", inv.invoice_id),
+                            ("amount", f"{inv.amount_rao/PLANCK:.4f} α"),
+                            ("destination", f"Treasury {inv.treasury_coldkey[:8]}…"),
+                            ("source", f"Hotkey {origin_hotkey[:8]}…"),
+                            ("subnet", f"SN-{inv.subnet_id}"),
+                            ("pay_epoch", inv.pay_epoch_index),
+                            *([("tx_hash", inv.tx_hash[:10] + "…")] if getattr(inv, "tx_hash", None) else []),
+                            *([("block", inv.paid_at_block)] if getattr(inv, "paid_at_block", None) else []),
+                            ("attempts", inv.pay_attempts),
                         ],
-                        style="bold green",
+                        LogLevel.MEDIUM
                     )
                     self.state.status_tables()
                     self.state.log_aggregate_summary()
                     break
                 else:
                     await self.state.save_async()
-                    pretty.kv_panel(
-                        "[red]Payment FAILED[/red]",
-                        [("inv", inv.invoice_id), ("resp", inv.last_response[:80]), ("sid", inv.subnet_id), ("attempts", inv.pay_attempts)],
-                        style="bold red",
+                    log_settlement(LogLevel.HIGH, "Payment failed", "worker", {
+                        "invoice_id": inv.invoice_id,
+                        "response": inv.last_response[:80],
+                        "subnet_id": inv.subnet_id,
+                        "attempts": f"{inv.pay_attempts}/{self._retry_max_attempts}",
+                        "amount_alpha": inv.amount_rao/PLANCK
+                    })
+                    miner_logger.phase_panel(
+                        MinerPhase.SETTLEMENT, "Payment Failed",
+                        [
+                            ("invoice", inv.invoice_id),
+                            ("response", inv.last_response[:80]),
+                            ("subnet", f"SN-{inv.subnet_id}"),
+                            ("attempts", f"{inv.pay_attempts}/{self._retry_max_attempts}"),
+                            ("amount", f"{inv.amount_rao/PLANCK:.4f} α"),
+                            ("current_block", blk),
+                        ],
+                        LogLevel.HIGH
                     )
 
                 if attempt >= int(self._retry_max_attempts or 1):
                     inv.last_response = f"max attempts ({attempt})"
                     await self.state.save_async()
-                    pretty.kv_panel(
-                        "[yellow]PAY exit[/yellow]",
+                    log_settlement(LogLevel.HIGH, "Payment max attempts reached", "worker", {
+                        "invoice_id": inv.invoice_id,
+                        "attempts": attempt
+                    })
+                    miner_logger.phase_panel(
+                        MinerPhase.SETTLEMENT, "PAY Exit",
                         [("inv", inv.invoice_id), ("reason", "max attempts"), ("attempts", attempt)],
-                        style="bold yellow",
+                        LogLevel.HIGH
                     )
                     break
 
@@ -418,15 +550,26 @@ class Payments:
         except asyncio.CancelledError:
             inv.last_response = "cancelled"
             await self.state.save_async()
-            pretty.kv_panel("[grey]PAY cancelled[/grey]", [("inv", inv.invoice_id)], style="bold magenta")
+            log_settlement(LogLevel.MEDIUM, "Payment worker cancelled", "worker", {
+                "invoice_id": inv.invoice_id
+            })
+            miner_logger.phase_panel(
+                MinerPhase.SETTLEMENT, "PAY Cancelled",
+                [("inv", inv.invoice_id)],
+                LogLevel.MEDIUM
+            )
             raise
         except Exception as e:
             inv.last_response = f"error: {e}"
             await self.state.save_async()
-            pretty.kv_panel(
-                "[yellow]PAY worker error[/yellow]",
+            log_settlement(LogLevel.HIGH, "Payment worker error", "worker", {
+                "invoice_id": getattr(inv, "invoice_id", "?"),
+                "error": str(e)[:120]
+            })
+            miner_logger.phase_panel(
+                MinerPhase.SETTLEMENT, "PAY Worker Error",
                 [("inv", getattr(inv, "invoice_id", "?")), ("err", str(e)[:120])],
-                style="bold yellow",
+                LogLevel.HIGH
             )
             return
         finally:
@@ -476,15 +619,26 @@ class Payments:
                 caller_hot = getattr(self.runtime.metagraph.axons[uid], "hotkey", None)
         vkey = caller_hot or (f"uid:{uid}" if uid is not None else "<unknown>")
 
+        log_commitments(LogLevel.MEDIUM, "Processing win notification", "win_handler", {
+            "validator": vkey,
+            "uid": uid,
+            "subnet_id": getattr(synapse, "subnet_id", "unknown"),
+            "accepted_alpha": getattr(synapse, "accepted_alpha", "unknown")
+        })
+
         treasury_ck = self.state.treasuries.get(caller_hot or "") or self.state.treasuries.get(vkey)
         if not treasury_ck:
             note = f"validator not allowlisted: {caller_hot or vkey or '?'}"
-            pretty.kv_panel(
-                "[red]Win ignored[/red]",
+            log_commitments(LogLevel.HIGH, "Win ignored - validator not allowlisted", "win_handler", {
+                "validator": f"{caller_hot or vkey} (uid={uid if uid is not None else '?'})",
+                "reason": "not allowlisted"
+            })
+            miner_logger.phase_panel(
+                MinerPhase.COMMITMENTS, "Win Ignored",
                 [("validator", f"{caller_hot or vkey} (uid={uid if uid is not None else '?'})"),
                  ("reason", "not allowlisted"),
                  ("note", note)],
-                style="bold red",
+                LogLevel.HIGH
             )
             synapse.ack = False
             synapse.payment_attempted = False
@@ -498,7 +652,11 @@ class Payments:
         was_partial = bool(getattr(synapse, "was_partially_accepted", accepted_alpha < requested_alpha - 1e-12))
 
         amount_rao = int(round(accepted_alpha * PLANCK))
-        epoch_now = int(getattr(self.runtime, "epoch_index", 0) or getattr(self, "epoch_index", 0) or 0)
+        # Get current epoch from metagraph or use 0 as fallback
+        try:
+            epoch_now = int(getattr(self.runtime.metagraph, "current_epoch", 0) or 0)
+        except Exception:
+            epoch_now = 0
 
         pay_start = _as_int(getattr(synapse, "pay_window_start_block", 0))
         pay_end = _as_int(getattr(synapse, "pay_window_end_block", 0))
@@ -548,15 +706,22 @@ class Payments:
 
         await self.state.save_async()
 
-        pretty.kv_panel(
-            "[green]Win received[/green]",
+        # Enhanced win notification with structured information
+        log_commitments(LogLevel.MEDIUM, "Win received from allowlisted validator", "win_handler", {
+            "validator": f"{caller_hot or vkey} (uid={uid if uid is not None else '?'})",
+            "subnet_id": inv.subnet_id,
+            "accepted_alpha": inv.alpha,
+            "invoice_id": inv.invoice_id
+        })
+        miner_logger.phase_panel(
+            MinerPhase.COMMITMENTS, "Win Received",
             [
                 ("validator", f"{caller_hot or vkey} (uid={uid if uid is not None else '?'})"),
                 ("epoch_now (e)", epoch_now),
-                ("subnet", inv.subnet_id),
+                ("subnet", f"SN-{inv.subnet_id}"),
                 ("accepted α", f"{inv.alpha:.4f}"),
                 ("requested α", f"{inv.alpha_requested:.4f}"),
-                ("partial", inv.was_partial),
+                ("partial", "✅" if inv.was_partial else "❌"),
                 ("discount", f"{inv.discount_bps} bps"),
                 ("pay_epoch (e+1)", inv.pay_epoch_index or (epoch_now + 1)),
                 ("window", f"[{inv.pay_window_start_block}, {inv.pay_window_end_block or '?'}]"),
@@ -564,8 +729,23 @@ class Payments:
                 ("invoice_id", inv.invoice_id),
                 ("treasury_src", "LOCAL allowlist (pinned)"),
             ],
-            style="bold green",
+            LogLevel.MEDIUM
         )
+        
+        # Add payment timeline information
+        if inv.pay_window_start_block and inv.pay_window_end_block:
+            window_blocks = inv.pay_window_end_block - inv.pay_window_start_block
+            miner_logger.phase_panel(
+                MinerPhase.COMMITMENTS, "Payment Timeline",
+                [
+                    ("window_start", f"Block {inv.pay_window_start_block}"),
+                    ("window_end", f"Block {inv.pay_window_end_block}"),
+                    ("window_duration", f"{window_blocks} blocks"),
+                    ("estimated_duration", f"{window_blocks * 12:.1f} seconds"),
+                    ("safety_margin", f"+{getattr(self, '_pay_start_safety_blocks', 0)} blocks"),
+                ],
+                LogLevel.LOW
+            )
 
         self._schedule_payment(inv)
         self.state.status_tables()
@@ -575,4 +755,10 @@ class Payments:
         synapse.payment_ok = bool(inv.paid)
         synapse.attempts = int(inv.pay_attempts)
         synapse.last_response = inv.last_response[:300] if inv.last_response else ""
+        
+        log_commitments(LogLevel.MEDIUM, "Win processing completed", "win_handler", {
+            "invoice_id": inv.invoice_id,
+            "ack": True,
+            "payment_scheduled": True
+        })
         return synapse

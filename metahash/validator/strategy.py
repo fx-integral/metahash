@@ -73,7 +73,7 @@ def load_subnet_weights(path: str | Path = "weights.yml") -> Tuple[defaultdict[i
 
 class Strategy:
     """
-    Subnet weighting strategy that hot‑reloads YAML on change.
+    Subnet weighting strategy that hot-reloads YAML on change.
 
     Exposes:
       • weight_for(netuid) -> float
@@ -81,12 +81,58 @@ class Strategy:
       • default_value -> float
     """
 
-    def __init__(self, path: str | Path = "weights.yml", algorithm_path: str | None = None):
+    def __init__(self, path: str | Path | None = "weights.yml", algorithm_path: str | None = None):
         # algorithm_path is accepted for compatibility; not used here.
-        self.path = Path(path)
+        self.path = self._resolve_path(path)
         self._weights, self._default_val = load_subnet_weights(self.path)
         self._mtime: Optional[float] = self._get_mtime()
 
+    # ---------- path resolution ----------
+    def _resolve_path(self, path: str | Path | None) -> Path:
+        """
+        Resolve the weights.yml path with the following preference order:
+          1) explicit parameter (if provided)
+          2) $METAHASH_STRATEGY_PATH
+          3) repo root:   <repo>/weights.yml            (parent of 'metahash' package)
+          4) package dir: <repo>/metahash/weights.yml
+          5) CWD:         ./weights.yml
+          6) literal:     "weights.yml" (will warn if missing)
+        """
+        import os
+
+        candidates: list[Path] = []
+
+        # 1) explicit param
+        if path:
+            candidates.append(Path(path).expanduser())
+
+        # 2) environment variable
+        envp = os.getenv("METAHASH_STRATEGY_PATH")
+        if envp:
+            candidates.append(Path(envp).expanduser())
+
+        # 3/4/5/6) common locations relative to this file / CWD
+        here = Path(__file__).resolve()
+        pkg_dir = here.parent                # metahash/validator
+        repo_root = pkg_dir.parent.parent    # .../ (parent of 'metahash')
+        candidates += [
+            repo_root / "weights.yml",       # <repo>/weights.yml  ← DEFAULT WE RECOMMEND
+            pkg_dir.parent / "weights.yml",  # <repo>/metahash/weights.yml
+            Path.cwd() / "weights.yml",      # ./weights.yml
+            Path("weights.yml"),             # fallback literal
+        ]
+
+        for c in candidates:
+            try:
+                if c.exists():
+                    return c
+            except Exception:
+                pass
+
+        # If none exist, return the first candidate; loader will warn and default to 1.0
+        return candidates[0]
+
+    # ---------- hot reload ----------
     def _get_mtime(self) -> Optional[float]:
         try:
             return self.path.stat().st_mtime
@@ -100,6 +146,7 @@ class Strategy:
             self._mtime = mtime
             bt.logging.info(f"[strategy] reloaded: {self.path} (mtime={mtime})")
 
+    # ---------- API ----------
     def weight_for(self, netuid: int) -> float:
         """Return the current float weight for a given subnet id (>=0)."""
         self._reload_if_changed()
@@ -114,14 +161,10 @@ class Strategy:
         Compute subnet weights in basis points (0..10_000) from YAML.
 
         Notes:
-          - We only emit explicit mappings found in YAML (plus any
-            subnets that have a non-default explicitly listed).
-          - Consumers may use `default_value` separately as a fallback.
+          - We materialize all explicit keys from YAML so operators can see them in diagnostics.
         """
         self._reload_if_changed()
         out: Dict[int, int] = {}
-        # Materialize all explicitly defined keys in the table (including those equal to default)
-        # so operators can see them in diagnostics.
         for sid, fval in self._weights.items():
             try:
                 bp = int(round(max(0.0, float(fval)) * 10_000.0))
