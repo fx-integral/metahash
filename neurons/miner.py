@@ -190,8 +190,7 @@ class Miner(BaseMinerNeuron):
                 ("state_file", str(self.state.path)),
                 ("fresh_start", getattr(self.config, "fresh", False)),
                 ("config_loaded", "✅" if hasattr(self.config, "miner") else "❌"),
-            ],
-            LogLevel.MEDIUM
+            ]
         )
         
         # Enhanced treasury information
@@ -202,8 +201,7 @@ class Miner(BaseMinerNeuron):
                 ("allowlisted_validators", len(self.state.treasuries)),
                 ("treasury_hotkeys", ", ".join([hk[:8] + "…" for hk in treasury_list[:3]]) + ("..." if len(treasury_list) > 3 else "")),
                 ("treasury_source", "LOCAL allowlist (pinned)"),
-            ],
-            LogLevel.MEDIUM
+            ]
         )
         
         # Enhanced bid lines summary
@@ -217,8 +215,7 @@ class Miner(BaseMinerNeuron):
                     ("total_alpha", f"{total_alpha:.4f} α"),
                     ("target_subnets", ", ".join(subnets)),
                     ("discount_mode", "RAW (pass-through)" if getattr(self.runtime, "_bids_raw_discount", False) else "EFFECTIVE (weight-adjusted)"),
-                ],
-                LogLevel.MEDIUM
+                ]
             )
 
         # Eager schedule unpaid invoices + watchdog

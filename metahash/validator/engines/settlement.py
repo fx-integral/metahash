@@ -10,6 +10,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from bittensor import BLOCKTIME
 from metahash.utils.pretty_logs import pretty
+from metahash.utils.phase_logs import set_phase, phase_start, phase_end, phase_table, phase_summary, compact_status, log as phase_log, grouped_info
 from metahash.utils.ipfs import aget_json
 from metahash.utils.commitments import read_all_plain_commitments
 from metahash.validator.alpha_transfers import AlphaTransfersScanner, TransferEvent
@@ -123,15 +124,8 @@ class SettlementEngine:
         if epoch_to_settle < 0 or epoch_to_settle in self.state.validated_epochs:
             return
 
-        pretty.rule("[bold cyan]SETTLEMENT — BEGIN[/bold cyan]")
-        pretty.kv_panel(
-            "Settlement kickoff",
-            [("epoch_to_settle (e−2)", epoch_to_settle),
-             ("testing", str(TESTING).lower()),
-             ("force_burn", str(bool(FORCE_BURN_WEIGHTS)).lower()),
-             ("strict_per_subnet", str(bool(STRICT_PER_SUBNET)).lower())],
-            style="bold cyan",
-        )
+        set_phase('settlement')
+        phase_start('settlement', f"epoch_to_settle (e−2): {epoch_to_settle} | testing: {str(TESTING).lower()} | force_burn: {str(bool(FORCE_BURN_WEIGHTS)).lower()} | strict_per_subnet: {str(bool(STRICT_PER_SUBNET)).lower()}")
 
         # 1) Load snapshots (payloads) from commitments (IPFS v4 or legacy inline)
         snapshots = await self._load_snapshots_from_commitments(epoch_to_settle)
@@ -147,7 +141,8 @@ class SettlementEngine:
         # 3) Scan α transfers in [as, de]
         events = await self._scan_alpha_transfers(start_block, end_block)
         if events is None:
-            pretty.kv_panel("Settlement postponed", [("epoch", epoch_to_settle), ("reason", "scanner failed")], style="bold yellow")
+            set_phase('settlement')
+            phase_summary('settlement', {"epoch": epoch_to_settle, "reason": "scanner failed"})
             return
 
         # 4) Build paid α pools (by coldkey, treasury, subnet)
@@ -178,22 +173,23 @@ class SettlementEngine:
         if burn_deficit_tao > 0 and 0 in uid_to_idx:
             final_scores[uid_to_idx[0]] += burn_deficit_tao
 
-        pretty.kv_panel(
-            "Budget Accounting — settlement",
-            [
-                ("spent_from_payload (TAO)", f"{spent_tao:.6f}"),
-                ("leftover_from_payload (TAO)", f"{leftover_tao:.6f}"),
-                ("target_budget (TAO)", f"{target_budget_tao:.6f}"),
-                ("credited_value (TAO)", f"{credited_total_tao:.6f}"),
-                ("burn_deficit → UID0 (TAO)", f"{burn_deficit_tao:.6f}"),
-            ],
-            style="bold magenta",
+        set_phase('settlement')
+        phase_summary(
+            'settlement',
+            {
+                "spent_from_payload (TAO)": f"{spent_tao:.6f}",
+                "leftover_from_payload (TAO)": f"{leftover_tao:.6f}",
+                "target_budget (TAO)": f"{target_budget_tao:.6f}",
+                "credited_value (TAO)": f"{credited_total_tao:.6f}",
+                "burn_deficit → UID0 (TAO)": f"{burn_deficit_tao:.6f}",
+            }
         )
 
         # 7) Apply weights (or preview in TESTING)
         self._apply_weights_or_preview(epoch_to_settle, final_scores)
 
-        pretty.rule("[bold cyan]SETTLEMENT — END[/bold cyan]")
+        set_phase('settlement')
+        phase_end('settlement')
 
     # ──────────────────────── Step 1: snapshots ────────────────────────
     async def _load_snapshots_from_commitments(self, epoch_to_settle: int) -> List[Dict]:
@@ -208,7 +204,7 @@ class SettlementEngine:
         masters_treasuries: Set[str] = set(VALIDATOR_TREASURIES.values())
         snapshots: List[Dict] = []
 
-        pretty.kv_panel("📋 Commitments Fetched", [("hotkeys_in_commit_map", len(commits or {}))], style="bold cyan")
+        pretty.kv_panel("Commitments Fetched", [("hotkeys_in_commit_map", len(commits or {}))], style="bold cyan")
 
         def _decode_commit_entry(entry):
             if entry is None:
@@ -254,7 +250,7 @@ class SettlementEngine:
 
                             inv = payload.get("inv") or payload.get("i")
                             pretty.kv_panel(
-                                "📦 Payload Fetched (IPFS)",
+                                "Payload Fetched (IPFS)",
                                 [
                                     ("hotkey", hk_key[:10] + "…"),
                                     ("cid", cid[:46] + ("…" if len(cid) > 46 else "")),
@@ -262,7 +258,7 @@ class SettlementEngine:
                                     ("pay_epoch", payload.get("pe")),
                                     ("start_block", payload.get("as")),
                                     ("end_block", payload.get("de")),
-                                    ("has_invoices", "✅" if inv else "❌"),
+                                    ("has_invoices", str(bool(inv)).lower()),
                                 ],
                                 style="bold cyan",
                             )
@@ -277,14 +273,14 @@ class SettlementEngine:
                     chosen.setdefault("hk", hk_key)
                     chosen.setdefault("t", VALIDATOR_TREASURIES.get(hk_key, ""))
                     pretty.kv_panel(
-                        "📦 Payload Fetched (Inline Legacy)",
+                        "Payload Fetched (Inline Legacy)",
                         [
                             ("hotkey", hk_key[:10] + "…"),
                             ("epoch", s.get("e")),
                             ("pay_epoch", s.get("pe")),
                             ("start_block", s.get("as")),
                             ("end_block", s.get("de")),
-                            ("has_invoices", "✅" if ("inv" in s or "i" in s) else "❌"),
+                            ("has_invoices", str(bool(("inv" in s or "i" in s))).lower()),
                         ],
                         style="bold cyan",
                     )

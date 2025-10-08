@@ -107,10 +107,6 @@ class Runtime:
         self._blk_cache_height: int = 0
         self._blk_cache_ts: float = 0.0
         
-        log_init(LogLevel.LOW, "Runtime component initialized", "runtime", {
-            "wallet_hotkey": getattr(wallet.hotkey, "ss58_address", "unknown"),
-            "metagraph_uid": getattr(metagraph, "uid", "unknown")
-        })
 
     # ---------------------- Config → Bid lines ----------------------
 
@@ -130,10 +126,6 @@ class Runtime:
             raw_flag = False
         self._bids_raw_discount = bool(raw_flag)
         
-        log_init(LogLevel.LOW, "Discount mode configured", "config", {
-            "raw_discount": self._bids_raw_discount,
-            "mode": "RAW (pass-through)" if self._bids_raw_discount else "EFFECTIVE (weight-adjusted)"
-        })
 
         netuids = [int(x) for x in list(nets or [])]
         amounts = [float(x) for x in list(amts or [])]
@@ -179,10 +171,8 @@ class Runtime:
         if rows:
             miner_logger.phase_table(
                 MinerPhase.INITIALIZATION, "Configured Bid Lines", 
-                ["#", "Subnet", "Alpha", "Discount (cfg)"], rows,
-                LogLevel.MEDIUM
+                ["#", "Subnet", "Alpha", "Discount (cfg)"], rows
             )
-            log_init(LogLevel.LOW, "Discount interpretation mode", "config", {"mode": mode})
 
     # ---------------------- Chain (lazy) ----------------------
 
@@ -193,18 +183,15 @@ class Runtime:
             try:
                 network = getattr(self.config.subtensor, 'network', 'finney')
                 stxn = bt.AsyncSubtensor(network=network)
-                log_init(LogLevel.LOW, "Async subtensor created with network config", "chain", {"network": network})
             except Exception as e:
                 log_init(LogLevel.HIGH, "Failed to create async subtensor with network, using fallback", "chain", {"error": str(e)})
                 stxn = bt.AsyncSubtensor(self.config)
             init = getattr(stxn, "initialize", None)
             if callable(init):
                 await init()
-                log_init(LogLevel.LOW, "Async subtensor initialized successfully", "chain")
             self._async_subtensor = stxn
         if self._rpc_lock is None:
             self._rpc_lock = asyncio.Lock()
-            log_init(LogLevel.DEBUG, "RPC lock created", "chain")
 
     async def get_current_block(self) -> int:
         await self._ensure_async_subtensor()
@@ -454,34 +441,19 @@ class Runtime:
             "validator": f"{caller_hot or vkey} (uid={uid if uid is not None else '?'})",
             "treasury_coldkey": treasury_ck[:8] + "…"
         })
-        miner_logger.phase_panel(
-            MinerPhase.AUCTION, "AuctionStart Received",
-            [
-                ("validator", f"{caller_hot or vkey} (uid={uid if uid is not None else '?'})"),
-                ("epoch (e)", epoch),
-                ("budget α", f"{budget_alpha:.3f}"),
-                ("min_stake", f"{min_stake_alpha:.3f} α"),
-                ("weights", f"{len(weights_bps)} subnet(s)"),
-                ("discount_mode", "RAW (pass-through)" if self._bids_raw_discount else "EFFECTIVE (weight-adjusted)"),
-                ("timeline", f"bid now (e) → pay in (e+1={epoch+1}) → weights from e in (e+2={epoch+2})"),
-                ("treasury_src", "LOCAL allowlist (pinned)"),
-            ],
-            LogLevel.MEDIUM
+        
+        # Use the new clean auction summary method
+        miner_logger.auction_summary(
+            validator=f"{caller_hot or vkey} (uid={uid if uid is not None else '?'})",
+            epoch=epoch,
+            budget_alpha=budget_alpha,
+            min_stake_alpha=min_stake_alpha,
+            weights_count=len(weights_bps),
+            discount_mode="RAW (pass-through)" if self._bids_raw_discount else "EFFECTIVE (weight-adjusted)",
+            timeline=f"bid now (e) → pay in (e+1={epoch+1}) → weights from e in (e+2={epoch+2})",
+            treasury_src="LOCAL allowlist (pinned)"
         )
         
-        # Add detailed weights breakdown if available
-        if weights_bps:
-            weight_details = []
-            for sid, weight in sorted(weights_bps.items()):
-                weight_details.append(f"SN-{sid}: {weight} bps")
-            miner_logger.phase_panel(
-                MinerPhase.AUCTION, "Subnet Weights",
-                [
-                    ("weight_details", "; ".join(weight_details[:3]) + ("..." if len(weight_details) > 3 else "")),
-                    ("total_subnets", len(weights_bps)),
-                ],
-                LogLevel.LOW
-            )
 
         candidate_subnets = [int(ln.subnet_id) for ln in lines if isfinite(ln.alpha) and ln.alpha > 0 and 0 <= ln.discount_bps <= 10_000]
         stake_by_subnet: Dict[int, float] = {}
@@ -492,26 +464,8 @@ class Runtime:
             })
             try:
                 stake_by_subnet = await self.get_validator_stakes_map(caller_hot or vkey, candidate_subnets)
-                rows = [[f"SN-{sid}", f"{amt:.4f} α", "✅" if amt >= min_stake_alpha else "❌"] for sid, amt in sorted(stake_by_subnet.items())]
-                if rows:
-                    miner_logger.phase_table(
-                        MinerPhase.AUCTION, "Available Stake with Validator (per subnet)", 
-                        ["Subnet", "α available", "meets_min"], rows,
-                        LogLevel.MEDIUM
-                    )
-                    
-                    # Add summary statistics
-                    total_stake = sum(stake_by_subnet.values())
-                    eligible_subnets = sum(1 for amt in stake_by_subnet.values() if amt >= min_stake_alpha)
-                    miner_logger.phase_panel(
-                        MinerPhase.AUCTION, "Stake Summary",
-                        [
-                            ("total_stake", f"{total_stake:.4f} α"),
-                            ("eligible_subnets", f"{eligible_subnets}/{len(stake_by_subnet)}"),
-                            ("min_stake_required", f"{min_stake_alpha:.4f} α"),
-                        ],
-                        LogLevel.MEDIUM
-                    )
+                # Use the new clean stake summary method
+                miner_logger.stake_summary(stake_by_subnet, min_stake_alpha)
             except Exception as _e:
                 stake_by_subnet = {int(s): 0.0 for s in candidate_subnets}
                 log_auction(LogLevel.HIGH, "Stake check failed, defaulting to 0 availability", "stake", {"error": str(_e)})
@@ -597,11 +551,6 @@ class Runtime:
             send_alpha = min(float(ln.alpha), available)
             remaining_by_subnet[subnet_id] = max(0.0, available - send_alpha)
 
-            if budget_alpha > 0 and send_alpha > budget_alpha:
-                log_auction(LogLevel.LOW, "Line alpha exceeds validator budget - may be partially filled", "bidding", {
-                    "line_alpha": send_alpha,
-                    "budget_alpha": budget_alpha
-                })
 
             if self._bids_raw_discount:
                 send_disc_bps = int(ln.discount_bps)
@@ -613,11 +562,6 @@ class Runtime:
                 mode_note = "effective→raw"
 
             if self.state.has_bid(vkey, epoch, subnet_id, send_alpha, send_disc_bps):
-                log_auction(LogLevel.LOW, "Duplicate bid detected - skipping", "bidding", {
-                    "subnet_id": subnet_id,
-                    "alpha": send_alpha,
-                    "discount_bps": send_disc_bps
-                })
                 continue
 
             bid_id = hashlib.sha1(f"{vkey}|{epoch}|{subnet_id}|{send_alpha:.12f}|{send_disc_bps}".encode("utf-8")).hexdigest()[:10]
@@ -625,13 +569,6 @@ class Runtime:
             out_bids.append((int(subnet_id), float(send_alpha), int(send_disc_bps), str(bid_id)))
 
             self.state.remember_bid(vkey, epoch, subnet_id, send_alpha, send_disc_bps)
-            
-            log_auction(LogLevel.LOW, "Bid added successfully", "bidding", {
-                "subnet_id": subnet_id,
-                "alpha": send_alpha,
-                "discount_bps": send_disc_bps,
-                "bid_id": bid_id
-            })
 
             rows_sent.append([
                 subnet_id,
@@ -654,27 +591,9 @@ class Runtime:
             log_auction(LogLevel.MEDIUM, "Bids sent successfully", "bidding", {
                 "bid_count": len(out_bids)
             })
-            miner_logger.phase_table(
-                MinerPhase.AUCTION, "Bids Sent",
-                ["Subnet", "Alpha", "Disc(cfg)", "Disc(send)", "Weight", "Eff", "BidID", "Epoch", "Mode"],
-                rows_sent,
-                LogLevel.MEDIUM
-            )
             
-            # Add bid summary statistics
-            total_alpha_sent = sum(bid[1] for bid in out_bids)
-            unique_subnets = len(set(bid[0] for bid in out_bids))
-            miner_logger.phase_panel(
-                MinerPhase.AUCTION, "Bid Summary",
-                [
-                    ("total_bids", len(out_bids)),
-                    ("total_alpha", f"{total_alpha_sent:.4f} α"),
-                    ("unique_subnets", unique_subnets),
-                    ("avg_discount", f"{sum(bid[2] for bid in out_bids) / len(out_bids):.0f} bps"),
-                    ("epoch", epoch),
-                ],
-                LogLevel.MEDIUM
-            )
+            # Use the new clean bid summary method
+            miner_logger.bid_summary(rows_sent, epoch)
 
         await self.state.save_async()
         self.state.status_tables()

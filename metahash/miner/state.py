@@ -192,8 +192,7 @@ class StateStore:
         })
         miner_logger.phase_table(
             MinerPhase.SETTLEMENT, "Aggregate per Subnet (α bidded / won / paid)", 
-            ["Subnet", "Bidded", "Won", "Paid"], rows,
-            LogLevel.MEDIUM
+            ["Subnet", "Bidded", "Won", "Paid"], rows
         )
 
     def status_tables(self):
@@ -239,13 +238,11 @@ class StateStore:
             miner_logger.phase_table(
                 MinerPhase.SETTLEMENT, "Pending Wins (to pay)",
                 ["Validator", "E_seen", "Subnet", "Accepted", "Requested", "Fill", "Disc", "PayE", "WinStart", "WinEnd", "Amount", "Attempts", "InvID", "LastResp"],
-                rows_pend,
-                LogLevel.MEDIUM
+                rows_pend
             )
         if rows_done:
             miner_logger.phase_table(
                 MinerPhase.SETTLEMENT, "Paid Wins (recent)",
                 ["Validator", "E_seen", "Subnet", "Accepted", "Requested", "Fill", "Disc", "PayE", "WinStart", "WinEnd", "Amount", "Attempts", "InvID", "LastResp"],
-                rows_done,
-                LogLevel.MEDIUM
+                rows_done
             )

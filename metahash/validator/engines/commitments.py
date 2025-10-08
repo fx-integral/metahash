@@ -8,6 +8,7 @@ from typing import Dict
 from bittensor import BLOCKTIME
 from metahash.utils.ipfs import aadd_json, minidumps as ipfs_minidumps, IPFSError
 from metahash.utils.pretty_logs import pretty
+from metahash.utils.phase_logs import set_phase, phase_start, phase_end, phase_table, phase_summary, compact_status, log as phase_log, grouped_info
 from metahash.utils.commitments import write_plain_commitment_json
 from metahash.validator.state import StateStore
 from metahash.treasuries import VALIDATOR_TREASURIES  # only used by _is_master_now()
@@ -49,7 +50,7 @@ class CommitmentsEngine:
         key = str(epoch_cleared)
         payload = self.state.pending_commits.get(key) if isinstance(self.state.pending_commits, dict) else None
         if not isinstance(payload, dict):
-            pretty.log(f"[grey]No pending winners to publish for epoch {epoch_cleared}.[/grey]")
+            phase_log(f"No pending winners to publish for epoch {epoch_cleared}.", 'commitments')
             return
 
         # diagnostics: record attempt
@@ -69,21 +70,22 @@ class CommitmentsEngine:
             has_rep = bool(payload.get("rep"))
             has_jail = bool(payload.get("jail"))
             has_wbps = bool(payload.get("wbps") or payload.get("weights_bps"))
-            pretty.kv_panel(
-                "Commit Payload (preview)",
-                [
-                    ("epoch", payload.get("e")),
-                    ("pay_epoch(pe)", payload.get("pe")),
-                    ("as", payload.get("as")),
-                    ("de", payload.get("de")),
-                    ("has_inv", str(bool(preview_inv)).lower()),
-                    ("has_bids", str(has_bids).lower()),
-                    ("has_rejected", str(has_rej).lower()),
-                    ("has_rep", str(has_rep).lower()),
-                    ("has_jail", str(has_jail).lower()),
-                    ("has_weights", str(has_wbps).lower()),
-                ],
-                style="bold cyan",
+            set_phase('commitments')
+            phase_start('commitments', f"Publishing commitment for epoch {epoch_cleared}")
+            phase_summary(
+                'commitments',
+                {
+                    "epoch": payload.get("e"),
+                    "pay_epoch(pe)": payload.get("pe"),
+                    "as": payload.get("as"),
+                    "de": payload.get("de"),
+                    "has_inv": str(bool(preview_inv)).lower(),
+                    "has_bids": str(has_bids).lower(),
+                    "has_rejected": str(has_rej).lower(),
+                    "has_rep": str(has_rep).lower(),
+                    "has_jail": str(has_jail).lower(),
+                    "has_weights": str(has_wbps).lower(),
+                }
             )
             
             # Add structured payload inspection for debugging
@@ -95,13 +97,13 @@ class CommitmentsEngine:
                 self._display_enhanced_payload_breakdown(payload_copy, epoch_cleared)
                 
             except Exception as e:
-                pretty.log(f"[yellow]Failed to serialize payload for inspection: {e}[/yellow]")
+                phase_log(f"Failed to serialize payload for inspection: {e}", 'commitments', 'warning')
         except IPFSError as ie:
-            pretty.log(f"[yellow]IPFS publish failed (no fallback): {ie}[/yellow]")
+            phase_log(f"IPFS publish failed (no fallback): {ie}", 'commitments', 'warning')
             self._touch_pending_meta(epoch_cleared, status="ipfs_error", last_error=str(ie))
             return
         except Exception as e:
-            pretty.log(f"[yellow]IPFS publish failed (no fallback): {e}[/yellow]")
+            phase_log(f"IPFS publish failed (no fallback): {e}", 'commitments', 'warning')
             self._touch_pending_meta(epoch_cleared, status="ipfs_error", last_error=str(e))
             return
 
@@ -116,24 +118,25 @@ class CommitmentsEngine:
 
         ok = await self._write_commitment_with_retry(commit_str, max_retries=max_retries)
         if ok:
-            pretty.kv_panel(
-                "Commitment Published (v4 CID-only, full payload in IPFS)",
-                [
-                    ("epoch_cleared", epoch_cleared),
-                    ("payment_epoch (pe)", epoch_cleared + 1),
-                    ("cid", str(cid)),
-                    ("json_bytes@ipfs", byte_len),
-                    ("sha256", sha_hex),
-                ],
-                style="bold green",
+            set_phase('commitments')
+            phase_summary(
+                'commitments',
+                {
+                    "epoch_cleared": epoch_cleared,
+                    "payment_epoch (pe)": epoch_cleared + 1,
+                    "cid": str(cid),
+                    "json_bytes@ipfs": byte_len,
+                    "sha256": sha_hex,
+                }
             )
+            phase_end('commitments', f"Published epoch {epoch_cleared}")
             # Clear pending payload after successful publish
             if isinstance(self.state.pending_commits, dict):
                 self.state.pending_commits.pop(key, None)
             self.state.save_pending_commits()
             self._mark_committed(epoch_cleared, cid)
         else:
-            pretty.log("[yellow]Commitment publish failed after retries (no fallback).[/yellow]")
+            phase_log("Commitment publish failed after retries (no fallback).", 'commitments', 'warning')
             self._touch_pending_meta(epoch_cleared, status="onchain_error")
 
     async def publish_exact(self, epoch_cleared: int, *, max_retries: int = 3):
@@ -192,14 +195,14 @@ class CommitmentsEngine:
                     )
                 if ok:
                     return True
-                pretty.log(f"[yellow]Commitment write returned False (attempt {attempt}/{max_retries}). Retrying…[/yellow]")
+                phase_log(f"Commitment write returned False (attempt {attempt}/{max_retries}). Retrying…", 'commitments', 'warning')
             except Exception as e:
                 last_exc = e
                 msg = str(e) if e else ""
                 if "Priority is too low" in msg or "Transaction is outdated" in msg or "already imported" in msg:
-                    pretty.log(f"[yellow]Commitment write pool conflict (attempt {attempt}/{max_retries}): {msg} — waiting ~1 block…[/yellow]")
+                    phase_log(f"Commitment write pool conflict (attempt {attempt}/{max_retries}): {msg} — waiting ~1 block…", 'commitments', 'warning')
                 else:
-                    pretty.log(f"[yellow]Commitment write exception (attempt {attempt}/{max_retries}): {msg} — waiting ~1 block…[/yellow]")
+                    phase_log(f"Commitment write exception (attempt {attempt}/{max_retries}): {msg} — waiting ~1 block…", 'commitments', 'warning')
 
             try:
                 await asyncio.sleep(max(1.0, float(BLOCKTIME)))
@@ -207,7 +210,7 @@ class CommitmentsEngine:
                 await asyncio.sleep(2.0)
 
         if last_exc:
-            pretty.log(f"[yellow]On-chain commitment write failed after {max_retries} retries: {last_exc}[/yellow]")
+            phase_log(f"On-chain commitment write failed after {max_retries} retries: {last_exc}", 'commitments', 'warning')
         return False
 
     # ---------- enhanced payload display ----------
@@ -216,15 +219,16 @@ class CommitmentsEngine:
         
         # Basic payload info
         payload_size = len(json.dumps(payload, separators=(',', ':')))
-        pretty.kv_panel(
-            "📋 Payload Overview",
+        phase_table(
+            'commitments',
+            "Payload Overview",
+            ["Key", "Value"],
             [
-                ("epoch_cleared", epoch_cleared),
-                ("payload_size_bytes", payload_size),
-                ("payload_version", payload.get("v", "unknown")),
-                ("total_fields", len(payload)),
+                ["epoch_cleared", epoch_cleared],
+                ["payload_size_bytes", payload_size],
+                ["payload_version", payload.get("v", "unknown")],
+                ["total_fields", len(payload)],
             ],
-            style="bold yellow",
         )
         
         # Field mapping with explanations
@@ -257,13 +261,14 @@ class CommitmentsEngine:
                 explained_fields.append(f"{key} → {explanation}")
         
         if explained_fields:
-            pretty.kv_panel(
-                "🔍 Field Explanations",
+            phase_table(
+                'commitments',
+                "Field Explanations",
+                ["Key", "Value"],
                 [
-                    ("fields_present", len(explained_fields)),
-                    ("field_mapping", "; ".join(explained_fields[:5]) + ("..." if len(explained_fields) > 5 else "")),
+                    ["fields_present", len(explained_fields)],
+                    ["field_mapping", "; ".join(explained_fields[:5]) + ("..." if len(explained_fields) > 5 else "")],
                 ],
-                style="bold blue",
             )
         
         # Detailed breakdown of key sections
@@ -276,12 +281,11 @@ class CommitmentsEngine:
         # Raw payload for reference (condensed)
         try:
             condensed_payload = self._condense_payload_for_display(payload)
-            pretty.kv_panel(
-                "📄 Raw Payload (Condensed)",
-                [
-                    ("full_payload", json.dumps(condensed_payload, indent=2, sort_keys=True)),
-                ],
-                style="bold magenta",
+            phase_table(
+                'commitments',
+                "Raw Payload (Condensed)",
+                ["Key", "Value"],
+                [["full_payload", json.dumps(condensed_payload, indent=2, sort_keys=True)]],
             )
         except Exception as e:
             pretty.log(f"[yellow]Failed to display condensed payload: {e}[/yellow]")
@@ -293,15 +297,16 @@ class CommitmentsEngine:
         rejected_bids = payload.get("rj", [])
         
         if winner_bids or all_bids:
-            pretty.kv_panel(
-                "🎯 Bids Analysis",
+            phase_table(
+                'commitments',
+                "Bids Analysis",
+                ["Metric", "Value"],
                 [
-                    ("winner_bids_count", len(winner_bids) if isinstance(winner_bids, list) else 0),
-                    ("all_bids_count", len(all_bids) if isinstance(all_bids, list) else 0),
-                    ("rejected_bids_count", len(rejected_bids) if isinstance(rejected_bids, list) else 0),
-                    ("win_rate", f"{len(winner_bids) / max(1, len(all_bids)) * 100:.1f}%" if isinstance(all_bids, list) and all_bids else "0%"),
+                    ["winner_bids_count", len(winner_bids) if isinstance(winner_bids, list) else 0],
+                    ["all_bids_count", len(all_bids) if isinstance(all_bids, list) else 0],
+                    ["rejected_bids_count", len(rejected_bids) if isinstance(rejected_bids, list) else 0],
+                    ["win_rate", f"{len(winner_bids) / max(1, len(all_bids)) * 100:.1f}%" if isinstance(all_bids, list) and all_bids else "0%"],
                 ],
-                style="bold green",
             )
             
             # Show sample winner bids
@@ -318,12 +323,11 @@ class CommitmentsEngine:
                                     sample_winners.append(f"UID{uid}: SN-{subnet_id}, {amount_rao/1e9:.4f}α, {discount_bps}bps")
                 
                 if sample_winners:
-                    pretty.kv_panel(
-                        "🏆 Sample Winner Bids",
-                        [
-                            ("sample_winners", "; ".join(sample_winners[:3])),
-                        ],
-                        style="bold green",
+                    phase_table(
+                        'commitments',
+                        "Sample Winner Bids",
+                        ["Key", "Value"],
+                        [["sample_winners", "; ".join(sample_winners[:3])]],
                     )
 
     def _display_reputation_breakdown(self, payload: dict):
@@ -334,17 +338,18 @@ class CommitmentsEngine:
             caps = rep_data.get("cap_tao_mu", {})
             quotas = rep_data.get("quota_frac", {})
             
-            pretty.kv_panel(
-                "🏆 Reputation System",
+            phase_table(
+                'commitments',
+                "Reputation System",
+                ["Metric", "Value"],
                 [
-                    ("enabled", "✅" if rep_data.get("enabled", False) else "❌"),
-                    ("baseline_score", rep_data.get("baseline", 0.0)),
-                    ("cap_max", rep_data.get("capmax", 0.0)),
-                    ("gamma", rep_data.get("gamma", 0.0)),
-                    ("miners_with_scores", len(scores) if isinstance(scores, dict) else 0),
-                    ("miners_with_caps", len(caps) if isinstance(caps, dict) else 0),
+                    ["enabled", str(bool(rep_data.get("enabled", False))).lower()],
+                    ["baseline_score", rep_data.get("baseline", 0.0)],
+                    ["cap_max", rep_data.get("capmax", 0.0)],
+                    ["gamma", rep_data.get("gamma", 0.0)],
+                    ["miners_with_scores", len(scores) if isinstance(scores, dict) else 0],
+                    ["miners_with_caps", len(caps) if isinstance(caps, dict) else 0],
                 ],
-                style="bold cyan",
             )
             
             # Show sample reputation data
@@ -355,12 +360,11 @@ class CommitmentsEngine:
                     sample_scores.append(f"{ck_short}: {score:.3f}")
                 
                 if sample_scores:
-                    pretty.kv_panel(
-                        "📊 Sample Reputation Scores",
-                        [
-                            ("sample_scores", "; ".join(sample_scores)),
-                        ],
-                        style="bold cyan",
+                    phase_table(
+                        'commitments',
+                        "Sample Reputation Scores",
+                        ["Key", "Value"],
+                        [["sample_scores", "; ".join(sample_scores)]],
                     )
 
     def _display_weights_breakdown(self, payload: dict):
@@ -370,13 +374,14 @@ class CommitmentsEngine:
             weight_map = weights.get("map", {})
             default_weight = weights.get("default", 10000)
             
-            pretty.kv_panel(
-                "⚖️ Subnet Weights",
+            phase_table(
+                'commitments',
+                "Subnet Weights",
+                ["Metric", "Value"],
                 [
-                    ("default_weight", f"{default_weight} bps"),
-                    ("configured_subnets", len(weight_map) if isinstance(weight_map, dict) else 0),
+                    ["default_weight", f"{default_weight} bps"],
+                    ["configured_subnets", len(weight_map) if isinstance(weight_map, dict) else 0],
                 ],
-                style="bold blue",
             )
             
             # Show weight details
@@ -386,12 +391,11 @@ class CommitmentsEngine:
                     weight_details.append(f"SN-{subnet_id}: {weight_bps} bps")
                 
                 if weight_details:
-                    pretty.kv_panel(
-                        "📈 Weight Details",
-                        [
-                            ("weight_details", "; ".join(weight_details)),
-                        ],
-                        style="bold blue",
+                    phase_table(
+                        'commitments',
+                        "Weight Details",
+                        ["Key", "Value"],
+                        [["weight_details", "; ".join(weight_details)]],
                     )
 
     def _display_budget_breakdown(self, payload: dict):
@@ -402,15 +406,16 @@ class CommitmentsEngine:
         bt_tao = payload.get("bt_tao", 0.0)
         
         if bl_mu or bl_tao or bt_mu or bt_tao:
-            pretty.kv_panel(
-                "💰 Budget Information",
+            phase_table(
+                'commitments',
+                "Budget Information",
+                ["Metric", "Value"],
                 [
-                    ("budget_total_tao", f"{bt_tao:.6f}"),
-                    ("budget_leftover_tao", f"{bl_tao:.6f}"),
-                    ("budget_used_tao", f"{bt_tao - bl_tao:.6f}"),
-                    ("budget_utilization", f"{(bt_tao - bl_tao) / max(bt_tao, 1e-12) * 100:.1f}%"),
+                    ["budget_total_tao", f"{bt_tao:.6f}"],
+                    ["budget_leftover_tao", f"{bl_tao:.6f}"],
+                    ["budget_used_tao", f"{bt_tao - bl_tao:.6f}"],
+                    ["budget_utilization", f"{(bt_tao - bl_tao) / max(bt_tao, 1e-12) * 100:.1f}%"],
                 ],
-                style="bold yellow",
             )
 
     def _display_timeline_breakdown(self, payload: dict):
@@ -422,17 +427,18 @@ class CommitmentsEngine:
         
         if epoch is not None and pay_epoch is not None and start_block is not None and end_block is not None:
             window_blocks = end_block - start_block
-            pretty.kv_panel(
-                "⏰ Timeline Information",
+            phase_table(
+                'commitments',
+                "Timeline Information",
+                ["Metric", "Value"],
                 [
-                    ("epoch", epoch),
-                    ("payment_epoch", pay_epoch),
-                    ("auction_start_block", start_block),
-                    ("auction_end_block", end_block),
-                    ("payment_window_blocks", window_blocks),
-                    ("estimated_duration_minutes", f"{window_blocks * 12 / 60:.1f}"),
+                    ["epoch", epoch],
+                    ["payment_epoch", pay_epoch],
+                    ["auction_start_block", start_block],
+                    ["auction_end_block", end_block],
+                    ["payment_window_blocks", window_blocks],
+                    ["estimated_duration_minutes", f"{window_blocks * 12 / 60:.1f}"],
                 ],
-                style="bold magenta",
             )
 
     def _condense_payload_for_display(self, payload: dict) -> dict:

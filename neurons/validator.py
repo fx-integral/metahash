@@ -7,6 +7,7 @@ import bittensor as bt
 from metahash.base.utils.logging import ColoredLogger as clog
 from metahash import __version__
 from metahash.utils.pretty_logs import pretty
+from metahash.utils.phase_logs import set_phase, phase_banner, phase_summary, compact_status, log as phase_log
 
 # Config
 from metahash.config import (
@@ -56,8 +57,10 @@ class Validator(EpochValidatorNeuron):
         self.active_axons: list[object] = []
 
         # Enhanced validator initialization logging
-        pretty.banner(
-            f"🏛️ Validator v{__version__} Initialized",
+        set_phase('general')
+        phase_banner(
+            'general',
+            f"Validator v{__version__} Initialized",
             " | ".join(
                 filter(
                     None,
@@ -69,22 +72,20 @@ class Validator(EpochValidatorNeuron):
                         "Testing" if TESTING else "",
                     ],
                 )
-            ),
-            style="bold magenta",
+            )
         )
         
         # Add validator configuration summary
-        pretty.kv_panel(
-            "⚙️ Validator Configuration",
-            [
-                ("version", __version__),
-                ("hotkey", self.hotkey_ss58[:8] + "…"),
-                ("netuid", self.config.netuid),
-                ("fresh_start", getattr(self.config, "fresh", False)),
-                ("testing_mode", TESTING),
-                ("strategy_path", STRATEGY_PATH or "weights.yml"),
-            ],
-            style="bold magenta",
+        phase_summary(
+            'general',
+            {
+                "version": __version__,
+                "hotkey": self.hotkey_ss58[:8] + "…",
+                "netuid": self.config.netuid,
+                "fresh_start": getattr(self.config, "fresh", False),
+                "testing_mode": TESTING,
+                "strategy_path": STRATEGY_PATH or "weights.yml",
+            }
         )
 
     # ---------------------- AsyncSubtensor helpers ----------------------
@@ -195,15 +196,15 @@ class Validator(EpochValidatorNeuron):
 
             nonzero = sum(1 for x in self.weights_bps.values() if x > 0)
             total_bps = sum(self.weights_bps.values())
-            pretty.kv_panel(
-                "⚖️ Subnet Weights Updated",
-                [
-                    ("nonzero_subnets", nonzero),
-                    ("total_bps", total_bps),
-                    ("avg_weight", f"{total_bps / max(1, len(self.weights_bps)):.0f} bps" if self.weights_bps else "0 bps"),
-                    ("strategy", "YAML-based"),
-                ],
-                style="bold cyan",
+            set_phase('general')
+            phase_summary(
+                'general',
+                {
+                    "nonzero_subnets": nonzero,
+                    "total_bps": total_bps,
+                    "avg_weight": f"{total_bps / max(1, len(self.weights_bps)):.0f} bps" if self.weights_bps else "0 bps",
+                    "strategy": "YAML-based",
+                }
             )
         except Exception as e:
             pretty.log(f"[yellow]Weights recompute failed:[/yellow] {e}")
@@ -217,14 +218,15 @@ class Validator(EpochValidatorNeuron):
         self._recompute_weights()
 
         e = int(getattr(self, "epoch_index", 0))
-        pretty.banner(
-            f"🔄 Epoch {e} Processing",
+        set_phase('general')
+        phase_banner(
+            'general',
+            f"Epoch {e} Processing",
             f"head_block={self.block} | start={self.epoch_start_block} | end={self.epoch_end_block}\n"
             f"• PHASE 1/3: settle e−2 → {e-2} (scan pe={e-1})\n"
             f"• PHASE 2/3: auction & clear e={e} (miners pay in e+1={e+1})\n"
             f"• PHASE 3/3: publish commitment for e−1={e-1} (strict; post-settlement)\n"
-            f"• Weights applied from e in e+2={e+2}",
-            style="bold white",
+            f"• Weights applied from e in e+2={e+2}"
         )
 
         # Settlement first
@@ -232,15 +234,15 @@ class Validator(EpochValidatorNeuron):
 
         # Only master broadcasts/clears
         if not self.auction._is_master_now() and getattr(self.auction, "_not_master_log_epoch", None) != e:
-            pretty.kv_panel(
-                "👑 Master Status",
-                [
-                    ("status", "❌ Not Master"),
-                    ("epoch", e),
-                    ("action", "Skipping broadcast/clear"),
-                    ("reason", "Insufficient stake or not in treasury"),
-                ],
-                style="bold yellow",
+            set_phase('general')
+            phase_summary(
+                'general',
+                {
+                    "status": "Not Master",
+                    "epoch": e,
+                    "action": "Skipping broadcast/clear",
+                    "reason": "Insufficient stake or not in treasury",
+                }
             )
             self.auction._not_master_log_epoch = e
 
@@ -249,9 +251,9 @@ class Validator(EpochValidatorNeuron):
             await self.auction.broadcast_auction_start()
         except asyncio.CancelledError as ce:
             # do not return; continue the epoch so commitments still have a chance to publish
-            pretty.log(f"[yellow]AuctionStart cancelled by RPC: {ce}. Will retry next epoch.[/yellow]")
+            phase_log(f"AuctionStart cancelled by RPC: {ce}. Will retry next epoch.", 'auction', 'warning')
         except Exception as exc:
-            pretty.log(f"[yellow]AuctionStart failed: {exc}[/yellow]")
+            phase_log(f"AuctionStart failed: {exc}", 'auction', 'warning')
 
         # Housekeeping
         self.auction.cleanup_old_epoch_books(before_epoch=e - 2)
@@ -260,9 +262,9 @@ class Validator(EpochValidatorNeuron):
         try:
             await self.commitments.publish_exact(epoch_cleared=e - 1, max_retries=6)
         except asyncio.CancelledError as ce:
-            pretty.log(f"[yellow]Publish e−1 cancelled by RPC: {ce}[/yellow]")
+            phase_log(f"Publish e−1 cancelled by RPC: {ce}", 'commitments', 'warning')
         except Exception as exc:
-            pretty.log(f"[yellow]Publish e−1 failed: {exc}[/yellow]")
+            phase_log(f"Publish e−1 failed: {exc}", 'commitments', 'warning')
 
 
 if __name__ == "__main__":

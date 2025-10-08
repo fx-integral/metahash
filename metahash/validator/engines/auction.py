@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from metahash.utils.pretty_logs import pretty
+from metahash.utils.phase_logs import set_phase, phase_start, phase_end, phase_table, phase_summary, compact_status, log as phase_log, grouped_info
 from metahash.treasuries import VALIDATOR_TREASURIES
 
 from metahash.validator.state import StateStore
@@ -230,10 +231,13 @@ class AuctionEngine:
         return max(0.0, min(1.0, raw))
 
     def _snapshot_master_stakes_for_epoch(self, epoch: int) -> float:
-        pretty.kv_panel(
-            "Master Stakes => Budget",
-            [("epoch (e)", epoch), ("action", "Calculating master validators’ stakes to compute personal budget share…")],
-            style="bold cyan",
+        set_phase('auction')
+        phase_summary(
+            'auction',
+            {
+                "epoch (e)": epoch,
+                "action": "Calculating master validators' stakes to compute personal budget share…"
+            }
         )
         hk2uid = self._hotkey_to_uid()
         stakes: Dict[str, float] = {}
@@ -319,11 +323,16 @@ class AuctionEngine:
                 if len(bad_rows) < max(10, LOG_TOP_N):
                     bad_rows.append([hk, str(ip), str(port), why])
         if bad_rows:
-            pretty.table("Filtered unreachable axons", ["Hotkey", "IP", "Port", "Reason"], bad_rows)
-        pretty.kv_panel(
-            "Axon filter",
-            [("received", len(axons)), ("usable", len(good)), ("filtered_out", len(axons) - len(good))],
-            style="bold cyan",
+            set_phase('auction')
+            phase_table('auction', "Filtered unreachable axons", ["Hotkey", "IP", "Port", "Reason"], bad_rows)
+        set_phase('auction')
+        phase_summary(
+            'auction',
+            {
+                "received": len(axons),
+                "usable": len(good),
+                "filtered_out": len(axons) - len(good)
+            }
         )
         return good
 
@@ -423,28 +432,20 @@ class AuctionEngine:
         if getattr(self, "_auction_start_sent_for", None) == self.parent.epoch_index:
             return
 
-        pretty.kv_panel(
-            "🎯 AuctionStart Phase",
-            [
-                ("epoch (e)", self.parent.epoch_index),
-                ("action", "Starting auction…"),
-                ("block", self.parent.block),
-                ("master_status", "✅ Active"),
-            ],
-            style="bold cyan",
-        )
+        set_phase('auction')
+        phase_start('auction', f"epoch (e): {self.parent.epoch_index} | block: {self.parent.block} | master_status: Active")
 
         share = self._snapshot_master_stakes_for_epoch(self.parent.epoch_index)
         my_budget = budget_from_share(share=share, auction_budget_alpha=AUCTION_BUDGET_ALPHA)
         if my_budget <= 0:
-            pretty.log("[yellow]Budget share is zero – not broadcasting AuctionStart (no stake share this epoch).[/yellow]")
+            phase_log("Budget share is zero – not broadcasting AuctionStart (no stake share this epoch).", 'auction', 'warning')
             self._auction_start_sent_for = self.parent.epoch_index
             return
 
         raw_axons = list(self.parent.metagraph.axons or [])
         axons = self._filter_reachable_axons(raw_axons)
         if not axons:
-            pretty.log("[yellow]No usable axons after filtering; skipping AuctionStart broadcast.[/yellow]")
+            phase_log("No usable axons after filtering; skipping AuctionStart broadcast.", 'auction', 'warning')
             self._auction_start_sent_for = self.parent.epoch_index
             return
 
@@ -465,11 +466,11 @@ class AuctionEngine:
         _strip_internals_inplace(syn)
 
         try:
-            pretty.log("[cyan]Broadcasting AuctionStart to miners…[/cyan]")
+            phase_log("Broadcasting AuctionStart to miners…", 'auction')
             resps = await self.parent.dendrite(axons=axons, synapse=syn, deserialize=True, timeout=AUCTION_START_TIMEOUT)
         except Exception as e_exc:
             resps = []
-            pretty.log(f"[yellow]AuctionStart broadcast exceptions: {e_exc}[/yellow]")
+            phase_log(f"AuctionStart broadcast exceptions: {e_exc}", 'auction', 'warning')
 
         hk2uid = self._hotkey_to_uid()
         ack_count = 0
@@ -534,52 +535,57 @@ class AuctionEngine:
         self._auction_start_sent_for = self.parent.epoch_index
 
         # Enhanced auction broadcast summary
-        pretty.kv_panel(
-            "📡 AuctionStart Broadcast Summary",
-            [
-                ("epoch (e)", e),
-                ("block", self.parent.block),
-                ("budget α", f"{my_budget:.3f}"),
-                ("treasury", VALIDATOR_TREASURIES.get(self.parent.hotkey_ss58, "")[:8] + "…"),
-                ("acks_received", f"{ack_count}/{total}"),
-                ("bids_accepted", bids_accepted),
-                ("bids_rejected", bids_rejected),
-                ("success_rate", f"{(ack_count/total*100):.1f}%" if total > 0 else "0%"),
-                ("note", "miners pay for e in e+1; weights from e in e+2"),
-            ],
-            style="bold cyan",
+        set_phase('auction')
+        phase_summary(
+            'auction',
+            {
+                "epoch (e)": e,
+                "block": self.parent.block,
+                "budget α": f"{my_budget:.3f}",
+                "treasury": VALIDATOR_TREASURIES.get(self.parent.hotkey_ss58, "")[:8] + "…",
+                "acks_received": f"{ack_count}/{total}",
+                "bids_accepted": bids_accepted,
+                "bids_rejected": bids_rejected,
+                "success_rate": f"{(ack_count/total*100):.1f}%" if total > 0 else "0%",
+                "note": "miners pay for e in e+1; weights from e in e+2",
+            }
         )
 
         if bids_rejected > 0:
-            pretty.log("[red]Some bids were rejected. See reasons below.[/red]")
+            phase_log("Some bids were rejected. See reasons below.", 'auction', 'warning')
             if reject_rows:
-                pretty.table("❌ Rejected Bids", ["UID", "Subnet", "Alpha", "Discount", "Reason"], reject_rows)
+                set_phase('auction')
+                phase_table('auction', "Rejected Bids", ["UID", "Subnet", "Alpha", "Discount", "Reason"], reject_rows)
             reason_rows = [[k, v] for k, v in sorted(reasons_counter.items(), key=lambda x: (-x[1], x[0]))[:max(6, LOG_TOP_N // 2)]]
             if reason_rows:
-                pretty.table("📊 Rejection Summary", ["Reason", "Count"], reason_rows)
+                set_phase('auction')
+                phase_table('auction', "Rejection Summary", ["Reason", "Count"], reason_rows)
 
         if self._wins_notified_for != self.parent.epoch_index:
             if self.clearer is not None:
                 ok = await self.clearer.clear_now_and_notify(epoch_to_clear=self.parent.epoch_index)
-
-                try:
-                    keys = list(self.state.pending_commits.keys()) if isinstance(self.state.pending_commits, dict) else []
-                except Exception:
-                    keys = []
-                pretty.kv_panel(
-                    "📋 Post-Clear Staging Snapshot",
-                    [
-                        ("epoch_cleared(e)", self.parent.epoch_index),
-                        ("staged_key_expected", str(self.parent.epoch_index)),
-                        ("pending_keys", len(keys)),
-                        ("keys_sample", ", ".join(keys[:8])),
-                        ("clear_status", "✅ Success" if ok else "❌ Failed"),
-                    ],
-                    style="bold magenta",
-                )
+                if ok:
+                    try:
+                        keys = list(self.state.pending_commits.keys()) if isinstance(self.state.pending_commits, dict) else []
+                    except Exception:
+                        keys = []
+                    set_phase('clearing')
+                    phase_summary(
+                        'clearing',
+                        {
+                            "epoch_cleared(e)": self.parent.epoch_index,
+                            "staged_key_expected": str(self.parent.epoch_index),
+                            "pending_keys": len(keys),
+                            "keys_sample": ", ".join(keys[:8]),
+                            "clear_status": "Success",
+                        }
+                    )
             else:
-                pretty.log("[yellow]Clearing engine not configured; skipping clear_now_and_notify.[/yellow]")
+                phase_log("Clearing engine not configured; skipping clear_now_and_notify.", 'clearing', 'warning')
             self._wins_notified_for = self.parent.epoch_index
+
+        # End of AUCTION phase
+        phase_end('auction')
 
     def cleanup_old_epoch_books(self, before_epoch: int):
         """Cleanup old bid state **older than** the given epoch."""

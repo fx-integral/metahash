@@ -110,7 +110,6 @@ class Payments:
                 self._bg_loop.call_soon_threadsafe(self._bg_loop.stop)
             if self._bg_thread and self._bg_thread.is_alive():
                 self._bg_thread.join(timeout=2)
-            log_init(LogLevel.LOW, "Background payment tasks shutdown completed", "payments")
         except Exception as e:
             log_init(LogLevel.HIGH, "Error during background task shutdown", "payments", {"error": str(e)})
 
@@ -141,11 +140,6 @@ class Payments:
         try:
             pool = list(getattr(pay_cfg, "validators", [])) if pay_cfg is not None else []
             self._pay_pool = [hk.strip() for hk in pool if isinstance(hk, str) and hk.strip()]
-            if self._pay_pool:
-                log_init(LogLevel.LOW, "Payment pool loaded", "payments", {
-                    "pool_size": len(self._pay_pool),
-                    "type": "round-robin origin hotkeys"
-                })
         except Exception as e:
             self._pay_pool = []
             log_init(LogLevel.HIGH, "Failed to load payment pool", "payments", {"error": str(e)})
@@ -162,11 +156,6 @@ class Payments:
                 except Exception:
                     continue
                 self._pay_map[sid] = hk.strip()
-            if self._pay_map:
-                log_init(LogLevel.LOW, "Payment map loaded", "payments", {
-                    "map_size": len(self._pay_map),
-                    "type": "subnet-specific origin hotkeys"
-                })
         except Exception as e:
             self._pay_map = {}
             log_init(LogLevel.HIGH, "Failed to load payment map", "payments", {"error": str(e)})
@@ -174,10 +163,6 @@ class Payments:
         # Start safety / retry knobs
         try:
             self._pay_start_safety_blocks = max(0, int(getattr(pay_cfg, "start_safety_blocks", 0) or 0))
-            if self._pay_start_safety_blocks:
-                log_init(LogLevel.LOW, "Payment start safety configured", "payments", {
-                    "safety_blocks": self._pay_start_safety_blocks
-                })
         except Exception as e:
             self._pay_start_safety_blocks = 0
             log_init(LogLevel.HIGH, "Failed to load payment start safety", "payments", {"error": str(e)})
@@ -223,7 +208,6 @@ class Payments:
         try:
             self.ensure_payment_config()
             self.schedule_unpaid_pending()
-            log_init(LogLevel.LOW, "Startup: resumed scheduling of unpaid invoices", "payments")
         except Exception as e:
             log_init(LogLevel.HIGH, "Startup resume failed", "payments", {"error": str(e)})
 
@@ -262,19 +246,11 @@ class Payments:
             self._schedule_payment(w)
             scheduled_count += 1
         
-        if scheduled_count > 0 or skipped_count > 0:
-            log_settlement(LogLevel.LOW, "Payment scheduling completed", "scheduling", {
-                "scheduled": scheduled_count,
-                "skipped": skipped_count
-            })
 
     def _schedule_payment(self, inv: WinInvoice):
         tid = inv.invoice_id
         t = self._tasks.get(tid)
         if t and not t.done():
-            log_settlement(LogLevel.DEBUG, "Payment already scheduled - skipping", "scheduling", {
-                "invoice_id": inv.invoice_id
-            })
             return
 
         inv.last_response = f"scheduled (wait ≥{self._pay_start_safety_blocks} blk)"
@@ -289,18 +265,17 @@ class Payments:
             "subnet_id": inv.subnet_id,
             "amount_alpha": inv.amount_rao/PLANCK
         })
-        miner_logger.phase_panel(
-            MinerPhase.SETTLEMENT, "Payment Scheduled",
-            [
-                ("invoice", inv.invoice_id),
-                ("subnet", f"SN-{inv.subnet_id}"),
-                ("α", f"{inv.amount_rao/PLANCK:.4f}"),
-                ("window", f"[{inv.pay_window_start_block},{inv.pay_window_end_block or '?'}]"),
-                ("safety", f"+{self._pay_start_safety_blocks} blk"),
-                ("retry", f"every {self._retry_every_blocks} blk × {self._retry_max_attempts}"),
-                ("treasury", inv.treasury_coldkey[:8] + "…"),
-            ],
-            LogLevel.MEDIUM
+        
+        # Use the new clean payment summary method
+        miner_logger.payment_summary(
+            invoice_id=inv.invoice_id,
+            subnet_id=inv.subnet_id,
+            amount_alpha=inv.amount_rao/PLANCK,
+            window=f"[{inv.pay_window_start_block},{inv.pay_window_end_block or '?'}]",
+            safety_blocks=self._pay_start_safety_blocks,
+            retry_every=self._retry_every_blocks,
+            retry_max=self._retry_max_attempts,
+            treasury=inv.treasury_coldkey
         )
 
     # ---------------------- Worker ----------------------
@@ -340,25 +315,6 @@ class Payments:
                     await self.state.save_async()
                     sleep_blocks = max(1, allowed_start - blk)
                     sleep_s = max(0.5, min(10 * float(BLOCKTIME), sleep_blocks * float(BLOCKTIME)))
-                    log_settlement(LogLevel.LOW, "Payment waiting for window start", "worker", {
-                        "invoice_id": inv.invoice_id,
-                        "current_block": blk,
-                        "allowed_start": allowed_start,
-                        "blocks_remaining": allowed_start - blk,
-                        "sleep_duration": sleep_s
-                    })
-                    miner_logger.phase_panel(
-                        MinerPhase.SETTLEMENT, "PAY Wait",
-                        [
-                            ("invoice", inv.invoice_id),
-                            ("current_block", blk),
-                            ("allowed_start", allowed_start),
-                            ("blocks_remaining", allowed_start - blk),
-                            ("sleep_duration", f"{sleep_s:.1f}s"),
-                            ("subnet", f"SN-{inv.subnet_id}"),
-                        ],
-                        LogLevel.LOW
-                    )
                     await asyncio.sleep(sleep_s)
                     continue
 
@@ -491,20 +447,17 @@ class Payments:
                         "attempts": inv.pay_attempts,
                         "tx_hash": tx_hash[:10] + "…" if tx_hash else None
                     })
-                    miner_logger.phase_panel(
-                        MinerPhase.SETTLEMENT, "Payment Success",
-                        [
-                            ("invoice", inv.invoice_id),
-                            ("amount", f"{inv.amount_rao/PLANCK:.4f} α"),
-                            ("destination", f"Treasury {inv.treasury_coldkey[:8]}…"),
-                            ("source", f"Hotkey {origin_hotkey[:8]}…"),
-                            ("subnet", f"SN-{inv.subnet_id}"),
-                            ("pay_epoch", inv.pay_epoch_index),
-                            *([("tx_hash", inv.tx_hash[:10] + "…")] if getattr(inv, "tx_hash", None) else []),
-                            *([("block", inv.paid_at_block)] if getattr(inv, "paid_at_block", None) else []),
-                            ("attempts", inv.pay_attempts),
-                        ],
-                        LogLevel.MEDIUM
+                    # Use the new payment success summary method with green color
+                    miner_logger.payment_success_summary(
+                        invoice_id=inv.invoice_id,
+                        amount_alpha=inv.amount_rao/PLANCK,
+                        destination=inv.treasury_coldkey,
+                        source=origin_hotkey,
+                        subnet_id=inv.subnet_id,
+                        pay_epoch=inv.pay_epoch_index,
+                        tx_hash=getattr(inv, "tx_hash", None),
+                        block=getattr(inv, "paid_at_block", None),
+                        attempts=inv.pay_attempts
                     )
                     self.state.status_tables()
                     self.state.log_aggregate_summary()
@@ -518,17 +471,15 @@ class Payments:
                         "attempts": f"{inv.pay_attempts}/{self._retry_max_attempts}",
                         "amount_alpha": inv.amount_rao/PLANCK
                     })
-                    miner_logger.phase_panel(
-                        MinerPhase.SETTLEMENT, "Payment Failed",
-                        [
-                            ("invoice", inv.invoice_id),
-                            ("response", inv.last_response[:80]),
-                            ("subnet", f"SN-{inv.subnet_id}"),
-                            ("attempts", f"{inv.pay_attempts}/{self._retry_max_attempts}"),
-                            ("amount", f"{inv.amount_rao/PLANCK:.4f} α"),
-                            ("current_block", blk),
-                        ],
-                        LogLevel.HIGH
+                    # Use the new payment failed summary method with red color and cross icon
+                    miner_logger.payment_failed_summary(
+                        invoice_id=inv.invoice_id,
+                        response=inv.last_response,
+                        subnet_id=inv.subnet_id,
+                        attempts=inv.pay_attempts,
+                        max_attempts=self._retry_max_attempts,
+                        amount_alpha=inv.amount_rao/PLANCK,
+                        current_block=blk
                     )
 
                 if attempt >= int(self._retry_max_attempts or 1):
@@ -713,39 +664,23 @@ class Payments:
             "accepted_alpha": inv.alpha,
             "invoice_id": inv.invoice_id
         })
-        miner_logger.phase_panel(
-            MinerPhase.COMMITMENTS, "Win Received",
-            [
-                ("validator", f"{caller_hot or vkey} (uid={uid if uid is not None else '?'})"),
-                ("epoch_now (e)", epoch_now),
-                ("subnet", f"SN-{inv.subnet_id}"),
-                ("accepted α", f"{inv.alpha:.4f}"),
-                ("requested α", f"{inv.alpha_requested:.4f}"),
-                ("partial", "✅" if inv.was_partial else "❌"),
-                ("discount", f"{inv.discount_bps} bps"),
-                ("pay_epoch (e+1)", inv.pay_epoch_index or (epoch_now + 1)),
-                ("window", f"[{inv.pay_window_start_block}, {inv.pay_window_end_block or '?'}]"),
-                ("amount_to_pay", f"{inv.amount_rao/PLANCK:.4f} α"),
-                ("invoice_id", inv.invoice_id),
-                ("treasury_src", "LOCAL allowlist (pinned)"),
-            ],
-            LogLevel.MEDIUM
+        
+        # Use the new clean win summary method
+        miner_logger.win_summary(
+            validator=f"{caller_hot or vkey} (uid={uid if uid is not None else '?'})",
+            epoch_now=epoch_now,
+            subnet_id=inv.subnet_id,
+            accepted_alpha=inv.alpha,
+            requested_alpha=inv.alpha_requested,
+            was_partial=inv.was_partial,
+            discount_bps=inv.discount_bps,
+            pay_epoch=inv.pay_epoch_index or (epoch_now + 1),
+            window=f"[{inv.pay_window_start_block}, {inv.pay_window_end_block or '?'}]",
+            amount_to_pay=inv.amount_rao/PLANCK,
+            invoice_id=inv.invoice_id,
+            treasury_src="LOCAL allowlist (pinned)"
         )
         
-        # Add payment timeline information
-        if inv.pay_window_start_block and inv.pay_window_end_block:
-            window_blocks = inv.pay_window_end_block - inv.pay_window_start_block
-            miner_logger.phase_panel(
-                MinerPhase.COMMITMENTS, "Payment Timeline",
-                [
-                    ("window_start", f"Block {inv.pay_window_start_block}"),
-                    ("window_end", f"Block {inv.pay_window_end_block}"),
-                    ("window_duration", f"{window_blocks} blocks"),
-                    ("estimated_duration", f"{window_blocks * 12:.1f} seconds"),
-                    ("safety_margin", f"+{getattr(self, '_pay_start_safety_blocks', 0)} blocks"),
-                ],
-                LogLevel.LOW
-            )
 
         self._schedule_payment(inv)
         self.state.status_tables()

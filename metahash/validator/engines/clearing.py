@@ -8,6 +8,7 @@ from collections import defaultdict
 from typing import Dict, List, Tuple
 
 from metahash.utils.pretty_logs import pretty
+from metahash.utils.phase_logs import set_phase, phase_start, phase_end, phase_table, phase_summary, compact_status, log as phase_log, grouped_info
 from metahash.validator.state import StateStore
 
 # Config & utilities
@@ -314,23 +315,26 @@ class ClearingEngine:
         if not getattr(self.parent, "auction", None) or not self.parent.auction._is_master_now():
             return False
 
+        # Begin CLEARING phase
+        set_phase('clearing')
+        phase_start('clearing', f"epoch_to_clear: {epoch_to_clear}")
+
         bid_map = self.parent.auction._bid_book.get(epoch_to_clear, {})
         if not bid_map:
-            # Enhanced logging for debugging - show available epochs and bid book state
+            # Structured debug without icons
             available_epochs = list(self.parent.auction._bid_book.keys()) if hasattr(self.parent.auction, '_bid_book') else []
-            pretty.log(
-                f"[grey]No bids to clear this epoch (master). epoch(e)={epoch_to_clear}[/grey]"
-            )
-            pretty.kv_panel(
-                "📚 Bid Book State (Debug)",
+            phase_table(
+                'clearing',
+                "Bid Book State (Debug)",
+                ["Key", "Value"],
                 [
-                    ("epoch_to_clear", epoch_to_clear),
-                    ("available_epochs", ", ".join(map(str, sorted(available_epochs))) if available_epochs else "none"),
-                    ("bid_book_size", len(self.parent.auction._bid_book) if hasattr(self.parent.auction, '_bid_book') else 0),
-                    ("master_status", "✅ Active" if self.parent.auction._is_master_now() else "❌ Inactive"),
+                    ["epoch_to_clear", epoch_to_clear],
+                    ["available_epochs", ", ".join(map(str, sorted(available_epochs))) if available_epochs else "none"],
+                    ["bid_book_size", len(self.parent.auction._bid_book) if hasattr(self.parent.auction, '_bid_book') else 0],
+                    ["master_active", str(bool(self.parent.auction._is_master_now())).lower()],
                 ],
-                style="bold red",
             )
+            phase_end('clearing', "No bids to clear")
             return False
 
         # 1) Compute share and TAO budget for this epoch from master share snapshot
@@ -349,6 +353,7 @@ class ClearingEngine:
         )
         if my_budget_tao <= EPS_VALUE:
             pretty.log("[yellow]TAO budget share is zero – skipping clear.[/yellow]")
+            phase_end('clearing', "Budget TAO is zero; skipping clear")
             return False
 
         # Format budget allocation as a rich table
@@ -360,8 +365,10 @@ class ClearingEngine:
             ["Auction Budget α", f"{float(AUCTION_BUDGET_ALPHA):.6f}"],
             ["My Budget TAO", f"{my_budget_tao:.6f}"],
         ]
-        pretty.table(
-            "💰 Budget Allocation (VALUE in TAO)",
+        set_phase('clearing')
+        phase_table(
+            'clearing',
+            "Budget Allocation (VALUE in TAO)",
             ["Parameter", "Value"],
             budget_rows,
         )
@@ -374,9 +381,11 @@ class ClearingEngine:
             b for b in bids_in_all if b.subnet_id not in FORBIDDEN_ALPHA_SUBNETS
         ]
         if not bids_in:
-            pretty.log(
-                "[yellow]All bids filtered out by forbidden subnet policy; nothing to clear.[/yellow]"
+            phase_log(
+                "All bids filtered out by forbidden subnet policy; nothing to clear.",
+                'clearing', 'warning'
             )
+            phase_end('clearing', "All bids filtered out by forbidden subnet policy")
             return False
 
         # 2.a Estimate prices & depths for **ordering + valuation with slippage**
@@ -418,8 +427,10 @@ class ClearingEngine:
                 ]
             )
         if rows_bids:
-            pretty.table(
-                "📊 Bids Ordered by VALUE (TAO)",
+            set_phase('clearing')
+            phase_table(
+                'clearing',
+                "Bids Ordered by VALUE (TAO)",
                 ["UID", "CK", "Subnet", "W_bps", "Disc_bps", "Bid α", "Price(est) TAO/α", "Depth", "VALUE TAO"],
                 rows_bids,
             )
@@ -431,7 +442,8 @@ class ClearingEngine:
                 [ck[:8] + "…", f"{quota_frac.get(ck, 0.0):.3f}", f"{cap_tao_by_ck.get(ck, 0.0):.6f} TAO"]
                 for ck in sorted(cap_tao_by_ck.keys())
             ]
-            pretty.table("🏆 Reputation Caps (TAO, per coldkey)",
+            set_phase('clearing')
+            phase_table('clearing', "Reputation Caps (TAO, per coldkey)",
                          ["Coldkey", "Quota frac", "Cap TAO"], cap_rows)
 
         # 4) TAO-budget greedy allocator honoring per-CK TAO caps — WITH PARTIALS
@@ -543,14 +555,16 @@ class ClearingEngine:
                 _consider_bid(b, remaining_budget_tao, "relaxed")
 
         if dbg_rows:
-            pretty.table(
-                "🎯 Allocations — TAO Budget (caps enforced then relaxed)",
+            set_phase('clearing')
+            phase_table(
+                'clearing',
+                "Allocations — TAO Budget (caps enforced then relaxed)",
                 ["UID", "CK", "Subnet", "Req α", "Acc α (cum)", "TAO/α", "Spend TAO(VALUE)", "Disc_bps", "W_bps", "Pass"],
                 dbg_rows[: max(20, LOG_TOP_N)],
             )
 
         if remaining_budget_tao > EPS_VALUE:
-            pretty.log(f"[yellow]Budget leftover (TAO) after allocation: {remaining_budget_tao:.12f} (dust or not enough bids).[/yellow]")
+            phase_log(f"Budget leftover (TAO) after allocation: {remaining_budget_tao:.12f} (dust or not enough bids).", 'clearing', 'warning')
 
         # Build winners from aggregated accepts
         winners: List[WinAllocation] = []
@@ -572,7 +586,8 @@ class ClearingEngine:
             winners.append(WinAllocation(**kwargs))
 
         if not winners:
-            pretty.log("[red]No winners after applying VALUE (TAO) budget and reputation caps.[/red]")
+            phase_log("No winners after applying VALUE (TAO) budget and reputation caps.", 'clearing', 'error')
+            phase_end('clearing', "No winners after allocation")
             return False
 
         # Winners detail computed at accepted α
@@ -606,8 +621,10 @@ class ClearingEngine:
                     ("P" if acc_alpha + 1e-12 < req_alpha else "F"),
                 ]
             )
-        pretty.table(
-            "🏆 Winners — Acceptances (VALUE)",
+        set_phase('clearing')
+        phase_table(
+            'clearing',
+            "Winners — Acceptances (VALUE)",
             ["UID", "CK", "Subnet", "Req α", "Acc α", "Disc_bps", "W_bps", "VALUE TAO", "Fill"],
             rows_w,
         )
@@ -777,23 +794,23 @@ class ClearingEngine:
         if hasattr(self.state, "save_pending_commits"):
             self.state.save_pending_commits()
 
-        pretty.kv_panel(
-            "Staged commit payload",
-            [
-                ("key", key),
-                ("e", payload["e"]),
-                ("pe", payload["pe"]),
-                ("as", payload["as"]),
-                ("de", payload["de"]),
-                ("#miners", len(payload["inv"])),
-                ("#lines_total", sum(len(v) for _, v in inv_i.items())),
-                ("#bidders_all", len(bids_lines_by_uid)),
-                ("#rejected", len(rejected_compact)),
-                ("#rep_keys", len(rep_snapshot)),
-                ("#jail_keys", len(jail_snapshot)),
-                ("#wbps_sids", len(wbps)),
-            ],
-            style="bold magenta",
+        set_phase('clearing')
+        phase_summary(
+            'clearing',
+            {
+                "key": key,
+                "e": payload["e"],
+                "pe": payload["pe"],
+                "as": payload["as"],
+                "de": payload["de"],
+                "#miners": len(payload["inv"]),
+                "#lines_total": sum(len(v) for _, v in inv_i.items()),
+                "#bidders_all": len(bids_lines_by_uid),
+                "#rejected": len(rejected_compact),
+                "#rep_keys": len(rep_snapshot),
+                "#jail_keys": len(jail_snapshot),
+                "#wbps_sids": len(wbps),
+            }
         )
 
         # 6) Human-friendly invoice preview (α to pay = accepted α)
@@ -824,7 +841,9 @@ class ClearingEngine:
                     inv_id[:12],
                 ]
             )
-        pretty.table(
+        set_phase('clearing')
+        phase_table(
+            'clearing',
             "Invoices — α to pay (ACCEPTED)",
             ["UID", "CK", "Subnet", "α to pay", "TAO/α", "Total VALUE (TAO)", "Window", "InvoiceID"],
             preview_rows[: max(20, LOG_TOP_N)],
@@ -857,13 +876,13 @@ class ClearingEngine:
                 per_alpha = val_tao / max(EPS_ALPHA, float(w.alpha_accepted))
                 partial = (w.alpha_accepted + 1e-12) < float(req_alpha)
 
-                pretty.log(
-                    "[cyan]WIN[/cyan] "
-                    f"e={epoch_to_clear}→pay_e={pay_epoch} uid={uid} subnet={w.subnet_id} "
+                phase_log(
+                    f"WIN e={epoch_to_clear}→pay_e={pay_epoch} uid={uid} subnet={w.subnet_id} "
                     f"req={float(req_alpha):.4f} α acc={float(w.alpha_accepted):.4f} α "
                     f"TAO/α={per_alpha:.10f} value={val_tao:.6f} TAO "
                     f"disc={w.discount_bps}bps w_bps={w.weight_bps} partial={partial} "
-                    f"win=[{win_start},{win_end}]"
+                    f"win=[{win_start},{win_end}]",
+                    'clearing', 'success'
                 )
 
                 # Create WinSynapse and clean it before sending
@@ -895,24 +914,25 @@ class ClearingEngine:
                 if isinstance(resp, WinSynapse) and bool(getattr(resp, "ack", False)):
                     ack_ok += 1
             except asyncio.CancelledError as e_exc:
-                pretty.log(f"[yellow]WinSynapse to uid={w.miner_uid} cancelled by RPC: {e_exc}[/yellow]")
+                phase_log(f"WinSynapse to uid={w.miner_uid} cancelled by RPC: {e_exc}", 'clearing', 'warning')
             except Exception as e_exc:
-                pretty.log(f"[yellow]WinSynapse to uid={w.miner_uid} failed: {e_exc}[/yellow]")
+                phase_log(f"WinSynapse to uid={w.miner_uid} failed: {e_exc}", 'clearing', 'warning')
 
-        pretty.kv_panel(
-            "Early Clear & Notify (epoch e)",
-            [
-                ("epoch_cleared (e)", epoch_to_clear),
-                ("pay_epoch (e+1)", pay_epoch),
-                ("winners", len(winners)),
-                ("budget_left VALUE (TAO)", f"{remaining_budget_tao:.6f}"),
-                ("treasury", VALIDATOR_TREASURIES.get(self.parent.hotkey_ss58, "")),
-                ("attempts", attempts),
-                ("targets_resolved", targets_resolved),
-                ("calls_sent", calls_sent),
-                ("win_acks", f"{ack_ok}/{calls_sent}"),
-            ],
-            style="bold green",
+        set_phase('clearing')
+        phase_summary(
+            'clearing',
+            {
+                "epoch_cleared (e)": epoch_to_clear,
+                "pay_epoch (e+1)": pay_epoch,
+                "winners": len(winners),
+                "budget_left VALUE (TAO)": f"{remaining_budget_tao:.6f}",
+                "treasury": VALIDATOR_TREASURIES.get(self.parent.hotkey_ss58, ""),
+                "attempts": attempts,
+                "targets_resolved": targets_resolved,
+                "calls_sent": calls_sent,
+                "win_acks": f"{ack_ok}/{calls_sent}",
+            }
         )
 
+        phase_end('clearing')
         return calls_sent > 0
