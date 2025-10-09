@@ -383,8 +383,6 @@ class AuctionEngine:
             alpha_val = 0.0
         if not (alpha_val > 0):
             return False, "invalid α"
-        if alpha_val > AUCTION_BUDGET_ALPHA:
-            return False, "α exceeds max per bid"
         if not (0 <= int(discount_bps) <= 10_000):
             return False, "discount out of range"
 
