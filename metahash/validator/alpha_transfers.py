@@ -27,6 +27,7 @@ from substrateinterface.utils.ss58 import (
     ss58_decode as _ss58_decode_generic,
     ss58_encode as _ss58_encode_generic,
 )
+from async_substrate_interface.errors import SubstrateRequestException
 
 from metahash.config import MAX_CONCURRENCY
 
@@ -271,34 +272,42 @@ class AlphaTransfersScanner:
 
     async def _get_block(self, bn: int):
         """Return *(events, extrinsics_list)* for block *bn* with strict normalization."""
-        bh = await self._rpc(self.st.substrate.get_block_hash, block_id=int(bn))
-        # Guard block hash type
-        if not isinstance(bh, (str, bytes)):
-            bh = str(bh)
+        try:
+            bh = await self._rpc(self.st.substrate.get_block_hash, block_id=int(bn))
+            # Guard block hash type and validate it's not None/empty
+            if not bh or not isinstance(bh, (str, bytes)):
+                raise ValueError(f"Invalid block hash for block {bn}: {bh}")
+            
+            # Keep block hash in its original format - don't convert bytes to string
+            # as this corrupts the hex encoding needed for RPC calls
+            # The substrate interface expects the hash in its original format
 
-        # Fetch events / block
-        events = await self._rpc(self.st.substrate.get_events, block_hash=bh)
-        blk = await self._rpc(self.st.substrate.get_block, block_hash=bh)
+            # Fetch events / block
+            events = await self._rpc(self.st.substrate.get_events, block_hash=bh)
+            blk = await self._rpc(self.st.substrate.get_block, block_hash=bh)
 
-        # Normalize events to a list of dict-ish items
-        if not isinstance(events, list):
-            events = []
+            # Normalize events to a list of dict-ish items
+            if not isinstance(events, list):
+                events = []
 
-        # Normalize extrinsics shape
-        if isinstance(blk, dict):
-            extrinsics = (
-                blk.get("block", {}).get("extrinsics")  # v1.7+ deep
-                or blk.get("extrinsics")                 # shallow
-                or []
-            )
-        else:
-            extrinsics = getattr(blk, "extrinsics", None) or []
+            # Normalize extrinsics shape
+            if isinstance(blk, dict):
+                extrinsics = (
+                    blk.get("block", {}).get("extrinsics")  # v1.7+ deep
+                    or blk.get("extrinsics")                 # shallow
+                    or []
+                )
+            else:
+                extrinsics = getattr(blk, "extrinsics", None) or []
 
-        # Ensure list
-        if not isinstance(extrinsics, list):
-            extrinsics = []
+            # Ensure list
+            if not isinstance(extrinsics, list):
+                extrinsics = []
 
-        return events, extrinsics
+            return events, extrinsics
+        except Exception as e:
+            # Re-raise with context for the worker to handle
+            raise Exception(f"Failed to get block {bn}: {e}") from e
 
     async def scan(self, frm: int, to: int) -> List[TransferEvent]:
         if frm > to:
@@ -339,6 +348,11 @@ class AlphaTransfersScanner:
                             cleaned.append(ev)
                     raw_events = cleaned
                 except websockets.exceptions.WebSocketException as err:
+                    bt.logging.error(f"RPC error at block {bn}: {err}; skipping block.")
+                    # Skip this block, continue scanning
+                    blk_cnt += 1
+                    continue
+                except (SubstrateRequestException, ValueError) as err:
                     bt.logging.error(f"RPC error at block {bn}: {err}; skipping block.")
                     # Skip this block, continue scanning
                     blk_cnt += 1
