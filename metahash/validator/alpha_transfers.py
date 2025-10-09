@@ -274,15 +274,12 @@ class AlphaTransfersScanner:
         """Return *(events, extrinsics_list)* for block *bn* with strict normalization."""
         try:
             bh = await self._rpc(self.st.substrate.get_block_hash, block_id=int(bn))
-            # Guard block hash type and validate it's not None/empty
-            if not bh or not isinstance(bh, (str, bytes)):
-                raise ValueError(f"Invalid block hash for block {bn}: {bh}")
-            
-            # Keep block hash in its original format - don't convert bytes to string
-            # as this corrupts the hex encoding needed for RPC calls
-            # The substrate interface expects the hash in its original format
+            # Guard block hash - but use it as-is without conversion
+            # (matching the pattern in subnet_utils.py which works correctly)
+            if not bh:
+                raise ValueError(f"Got empty block hash for block {bn}")
 
-            # Fetch events / block
+            # Fetch events / block - use bh directly without any conversion
             events = await self._rpc(self.st.substrate.get_events, block_hash=bh)
             blk = await self._rpc(self.st.substrate.get_block, block_hash=bh)
 
