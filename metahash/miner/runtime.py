@@ -188,7 +188,11 @@ class Runtime:
                 stxn = bt.AsyncSubtensor(self.config)
             init = getattr(stxn, "initialize", None)
             if callable(init):
-                await init()
+                try:
+                    await init()
+                except Exception as e:
+                    log_init(LogLevel.HIGH, "Failed to initialize async subtensor", "chain", {"error": str(e)})
+                    # Don't fail completely, try to continue with uninitialized subtensor
             self._async_subtensor = stxn
         if self._rpc_lock is None:
             self._rpc_lock = asyncio.Lock()
@@ -202,6 +206,9 @@ class Runtime:
             return self._blk_cache_height
 
         height = 0
+        last_error = None
+        
+        # Try AsyncSubtensor methods first
         for name in ("get_current_block", "current_block", "block", "get_block_number"):
             try:
                 attr = getattr(st, name, None)
@@ -214,24 +221,46 @@ class Runtime:
                 if b > 0:
                     height = b
                     break
-            except Exception:
+            except Exception as e:
+                last_error = e
                 continue
 
-        if height > 0:
-            self._blk_cache_height = height
-            self._blk_cache_ts = now
-            return height
+        # Try substrate method if AsyncSubtensor methods failed
+        if height <= 0:
+            try:
+                substrate = getattr(st, "substrate", None)
+                if substrate is not None:
+                    meth = getattr(substrate, "get_block_number", None)
+                    if callable(meth):
+                        b = int(meth(None) or 0)
+                        if b > 0:
+                            height = b
+            except Exception as e:
+                last_error = e
 
-        try:
-            substrate = getattr(st, "substrate", None)
-            if substrate is not None:
-                meth = getattr(substrate, "get_block_number", None)
-                if callable(meth):
-                    b = int(meth(None) or 0)
-                    if b > 0:
-                        height = b
-        except Exception:
-            height = 0
+        # If all methods failed, try to use metagraph block as fallback
+        if height <= 0:
+            try:
+                metagraph_block = getattr(self.metagraph, "block", None)
+                if metagraph_block and int(metagraph_block) > 0:
+                    height = int(metagraph_block)
+                    log_init(LogLevel.MEDIUM, "Using metagraph block as fallback", "chain", {
+                        "block": height
+                    })
+                else:
+                    log_init(LogLevel.HIGH, "Failed to get current block", "chain", {
+                        "error": str(last_error) if last_error else "unknown",
+                        "async_subtensor": str(type(st)),
+                        "has_substrate": hasattr(st, "substrate"),
+                        "metagraph_block": metagraph_block
+                    })
+            except Exception as e:
+                log_init(LogLevel.HIGH, "Failed to get current block", "chain", {
+                    "error": str(last_error) if last_error else "unknown",
+                    "metagraph_fallback_error": str(e),
+                    "async_subtensor": str(type(st)),
+                    "has_substrate": hasattr(st, "substrate")
+                })
 
         if height > 0:
             self._blk_cache_height = height

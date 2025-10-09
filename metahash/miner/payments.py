@@ -318,10 +318,61 @@ class Payments:
             })
 
             attempt = 0
+            block_fetch_failures = 0
+            max_block_fetch_failures = 10
+            worker_start_time = time.time()
+            max_worker_runtime = 3600  # 1 hour max runtime per worker
+            
             while True:
+                # Check if worker has been running too long
+                if time.time() - worker_start_time > max_worker_runtime:
+                    inv.last_response = f"worker timeout after {max_worker_runtime}s"
+                    inv.expired = True
+                    await self.state.save_async()
+                    log_settlement(LogLevel.HIGH, "Payment worker timeout", "worker", {
+                        "invoice_id": inv.invoice_id,
+                        "runtime_seconds": time.time() - worker_start_time
+                    })
+                    miner_logger.phase_panel(
+                        MinerPhase.SETTLEMENT, "PAY Exit",
+                        [("inv", inv.invoice_id), ("reason", "worker timeout"), ("runtime", f"{time.time() - worker_start_time:.1f}s")],
+                        LogLevel.HIGH
+                    )
+                    break
                 blk = await self.runtime.get_current_block()
+                
+                # Handle block fetch failures
+                if blk <= 0:
+                    block_fetch_failures += 1
+                    if block_fetch_failures >= max_block_fetch_failures:
+                        inv.last_response = f"failed to fetch current block after {max_block_fetch_failures} attempts"
+                        inv.expired = True
+                        await self.state.save_async()
+                        log_settlement(LogLevel.HIGH, "Payment failed - cannot fetch current block", "worker", {
+                            "invoice_id": inv.invoice_id,
+                            "failures": block_fetch_failures
+                        })
+                        miner_logger.phase_panel(
+                            MinerPhase.SETTLEMENT, "PAY Exit",
+                            [("inv", inv.invoice_id), ("reason", "block fetch failed"), ("failures", block_fetch_failures)],
+                            LogLevel.HIGH
+                        )
+                        break
+                    
+                    inv.last_response = f"block fetch failed ({block_fetch_failures}/{max_block_fetch_failures}), retrying..."
+                    await self.state.save_async()
+                    log_settlement(LogLevel.HIGH, "Block fetch failed, retrying", "worker", {
+                        "invoice_id": inv.invoice_id,
+                        "current_block": blk,
+                        "failures": block_fetch_failures
+                    })
+                    await asyncio.sleep(max(0.5, float(BLOCKTIME) * 2))
+                    continue
+                
+                # Reset block fetch failure counter on success
+                block_fetch_failures = 0
 
-                if start and (blk <= 0 or blk < allowed_start):
+                if start and blk < allowed_start:
                     inv.last_response = f"waiting (blk {blk} < start {allowed_start})"
                     await self.state.save_async()
                     sleep_blocks = max(1, allowed_start - blk)
