@@ -359,6 +359,7 @@ class SettlementEngine:
     # ─────────────────── Step 3: scan α transfers ─────────────────────
     async def _scan_alpha_transfers(self, start_block: int, end_block: int) -> Optional[List[TransferEvent]]:
         pretty.rule("[bold cyan]SCAN α TRANSFERS[/bold cyan]")
+        bt.logging.info(f"[SETTLEMENT] Scanning α transfers: blocks {start_block} to {end_block} (range: {end_block - start_block + 1} blocks)")
 
         if self._scanner is None:
             self._scanner = AlphaTransfersScanner(await self.parent._stxn(), dest_coldkey=None, rpc_lock=self._rpc_lock)
@@ -366,6 +367,7 @@ class SettlementEngine:
         try:
             events_raw = await self._scanner.scan(start_block, end_block)
         except Exception as scan_exc:
+            bt.logging.error(f"[SETTLEMENT] Scanner failed for blocks {start_block}-{end_block}: {str(scan_exc)[:200]}")
             pretty.log(f"[yellow]Scanner failed: {scan_exc}[/yellow]")
             return None
 

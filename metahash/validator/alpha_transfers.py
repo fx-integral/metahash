@@ -273,13 +273,17 @@ class AlphaTransfersScanner:
     async def _get_block(self, bn: int):
         """Return *(events, extrinsics_list)* for block *bn* with strict normalization."""
         try:
+            # Get block hash and log its format for debugging
             bh = await self._rpc(self.st.substrate.get_block_hash, block_id=int(bn))
+            bt.logging.debug(f"[DEBUG] Block {bn} hash: type={type(bh)}, value={repr(bh)[:50]}...")
+            
             # Guard block hash - but use it as-is without conversion
             # (matching the pattern in subnet_utils.py which works correctly)
             if not bh:
                 raise ValueError(f"Got empty block hash for block {bn}")
 
             # Fetch events / block - use bh directly without any conversion
+            bt.logging.debug(f"[DEBUG] Fetching events for block {bn} with hash {repr(bh)[:20]}...")
             events = await self._rpc(self.st.substrate.get_events, block_hash=bh)
             blk = await self._rpc(self.st.substrate.get_block, block_hash=bh)
 
@@ -310,7 +314,8 @@ class AlphaTransfersScanner:
         if frm > to:
             return []
         total = to - frm + 1
-        bt.logging.info(f"Scanner: frm={frm} to={to} ({total} blocks)")
+        bt.logging.info(f"[SCANNER] Starting scan: blocks {frm} to {to} ({total} blocks)")
+        bt.logging.debug(f"[SCANNER] Block range: frm={frm}, to={to}, total={total}")
 
         q: asyncio.Queue[int | None] = asyncio.Queue()
         events_by_block: Dict[int, list[TransferEvent]] = {}
@@ -345,23 +350,28 @@ class AlphaTransfersScanner:
                             cleaned.append(ev)
                     raw_events = cleaned
                 except websockets.exceptions.WebSocketException as err:
-                    bt.logging.error(f"RPC error at block {bn}: {err}; skipping block.")
-                    # Skip this block, continue scanning
+                    bt.logging.warning(f"[SCANNER] WebSocket error at block {bn}: {str(err)[:100]}; skipping block.")
                     blk_cnt += 1
                     continue
-                except (SubstrateRequestException, ValueError) as err:
-                    bt.logging.error(f"RPC error at block {bn}: {err}; skipping block.")
-                    # Skip this block, continue scanning
+                except SubstrateRequestException as err:
+                    # This is the main error we're trying to fix - log with context
+                    bt.logging.warning(f"[SCANNER] Substrate RPC error at block {bn}: {str(err)[:100]}; skipping block.")
+                    bt.logging.debug(f"[SCANNER] Full SubstrateRequestException for block {bn}: {err}")
+                    blk_cnt += 1
+                    continue
+                except ValueError as err:
+                    bt.logging.warning(f"[SCANNER] Invalid data at block {bn}: {str(err)[:100]}; skipping block.")
                     blk_cnt += 1
                     continue
                 except TypeError as terr:
-                    # Typical after ws task blows up and returns a bad shape;
-                    # avoid aborting the whole scan.
-                    bt.logging.error(f"Type error at block {bn}: {terr}; skipping block.")
+                    # Typical after ws task blows up and returns a bad shape
+                    bt.logging.warning(f"[SCANNER] Type error at block {bn}: {str(terr)[:100]}; skipping block.")
                     blk_cnt += 1
                     continue
                 except Exception as err:
-                    bt.logging.error(f"Unexpected error at block {bn}: {err}; skipping block.")
+                    # Catch-all for unexpected errors - log briefly but don't spam
+                    bt.logging.warning(f"[SCANNER] Unexpected error at block {bn}: {str(err)[:100]}; skipping block.")
+                    bt.logging.debug(f"[SCANNER] Full exception for block {bn}: {err}")
                     blk_cnt += 1
                     continue
 
@@ -385,7 +395,9 @@ class AlphaTransfersScanner:
             *[asyncio.create_task(worker()) for _ in range(self.max_conc)],
         )
 
-        bt.logging.info(f"✓ scan finished: {blk_cnt} blk, {ev_cnt} ev, {keep_cnt} kept")
+        bt.logging.info(f"[SCANNER] ✓ Scan finished: {blk_cnt}/{total} blocks processed, {ev_cnt} events found, {keep_cnt} kept")
+        if blk_cnt < total:
+            bt.logging.warning(f"[SCANNER] ⚠️  Only processed {blk_cnt}/{total} blocks - some blocks were skipped due to errors")
         await _flush_progress()
 
         ordered_events: List[TransferEvent] = []
