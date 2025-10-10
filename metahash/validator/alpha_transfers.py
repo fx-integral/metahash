@@ -227,7 +227,13 @@ def _event_fields(ev) -> Sequence:  # noqa: ANN001
 
 def _f(params, idx, default=None):  # noqa: ANN001
     try:
-        val = params[idx]
+        # Support both list/tuple and dict-like event params
+        if isinstance(params, dict):
+            # Preserve insertion order from dict.values() (Python 3.7+)
+            vals = list(params.values())
+            val = vals[idx]
+        else:
+            val = params[idx]
         return val["value"] if isinstance(val, dict) and "value" in val else val
     except (IndexError, TypeError):
         return default
@@ -240,6 +246,7 @@ def _mask(ck: Optional[str]) -> str:
 # ── parser helpers ──────────────────────────────────────────────────────
 def _parse_stake_transferred(params, fmt: int) -> TransferEvent:  # noqa: ANN001
     """Parse StakeTransferred event parameters (chain v9 & v10)."""
+    # Try positional indices first (list/tuple or dict coerced by _f)
     from_coldkey_raw = _account_id(_f(params, 0))
     dest_coldkey_raw = _account_id(_f(params, 1))
     subnet_id = int(_f(params, 3, -1))  # destination netuid
@@ -546,13 +553,50 @@ class AlphaTransfersScanner:
                     )
                 except Exception:
                     pass
+                # Normalize dict-like fields to a list of values for downstream helpers
+                if isinstance(fields, dict):
+                    try:
+                        fields = list(fields.values())
+                    except Exception:
+                        fields = ()
 
             if name == "StakeRemoved":
                 bucket["src_amt"] = _amount_from_stake_removed(fields)
                 bucket["src_net"] = _subnet_from_stake_removed(fields)
+                # Try to capture source coldkey raw from any AccountId-like field
+                if "src_raw" not in bucket:
+                    try:
+                        # scan both normalized list and original mapping
+                        candidates = []
+                        if isinstance(fields, (list, tuple)):
+                            candidates.extend(fields)
+                        elif isinstance(fields, dict):
+                            candidates.extend(fields.values())
+                        for v in candidates:
+                            raw = _account_id(v)
+                            if raw is not None:
+                                bucket["src_raw"] = raw
+                                break
+                    except Exception:
+                        pass
             elif name == "StakeAdded":
                 bucket["dst_amt"] = _amount_from_stake_added(fields)
                 bucket["dst_net"] = _subnet_from_stake_added(fields)
+                # Try to capture destination coldkey raw from any AccountId-like field
+                if "dst_raw" not in bucket:
+                    try:
+                        candidates = []
+                        if isinstance(fields, (list, tuple)):
+                            candidates.extend(fields)
+                        elif isinstance(fields, dict):
+                            candidates.extend(fields.values())
+                        for v in candidates:
+                            raw = _account_id(v)
+                            if raw is not None:
+                                bucket["dst_raw"] = raw
+                                break
+                    except Exception:
+                        pass
             elif name == "StakeTransferred":
                 seen += 1
                 bucket["te"] = _parse_stake_transferred(fields, self.ss58_format)
@@ -565,6 +609,13 @@ class AlphaTransfersScanner:
                 te = replace(te, amount_rao=bucket["dst_amt"])
             if "src_net" in bucket:
                 te = replace(te, src_subnet_id=bucket["src_net"])
+            # Enrich with captured raw account ids if missing from parsed TE
+            if getattr(te, "src_coldkey_raw", None) is None and "src_raw" in bucket:
+                raw = bucket.get("src_raw")
+                te = replace(te, src_coldkey_raw=raw, src_coldkey=_encode_ss58(raw, self.ss58_format))
+            if getattr(te, "dest_coldkey_raw", None) is None and "dst_raw" in bucket:
+                raw = bucket.get("dst_raw")
+                te = replace(te, dest_coldkey_raw=raw, dest_coldkey=_encode_ss58(raw, self.ss58_format))
 
             # SECURITY: drop cross-subnet
             if te.src_subnet_id is not None and te.src_subnet_id != te.subnet_id:
