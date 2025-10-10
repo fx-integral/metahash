@@ -279,9 +279,8 @@ class AlphaTransfersScanner:
     async def _get_block(self, bn: int):
         """Return *(events, extrinsics_list)* for block *bn* with strict normalization."""
         try:
-            # Get block hash and log its format for debugging
+            # Get block hash
             bh = await self._rpc(self.st.substrate.get_block_hash, block_id=int(bn))
-            bt.logging.debug(f"[DEBUG] Block {bn} hash: type={type(bh)}, value={repr(bh)[:50]}...")
             
             # Guard block hash - but use it as-is without conversion
             # (matching the pattern in subnet_utils.py which works correctly)
@@ -289,7 +288,6 @@ class AlphaTransfersScanner:
                 raise ValueError(f"Got empty block hash for block {bn}")
 
             # Fetch events / block - use bh directly without any conversion
-            bt.logging.debug(f"[DEBUG] Fetching events for block {bn} with hash {repr(bh)[:20]}...")
             events = await self._rpc(self.st.substrate.get_events, block_hash=bh)
             blk = await self._rpc(self.st.substrate.get_block, block_hash=bh)
 
