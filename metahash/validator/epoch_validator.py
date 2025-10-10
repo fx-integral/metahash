@@ -210,7 +210,7 @@ class EpochValidatorNeuron(BaseValidatorNeuron):
                     # FIX: don't 'raise e' (undefined). Log and continue.
                     bt.logging.error(f"forward() raised: {err}")
                     bt.logging.debug("forward() traceback:", exc_info=True)
-                    rasie err
+                    raise err
                 finally:
                     try:
                         self.sync()

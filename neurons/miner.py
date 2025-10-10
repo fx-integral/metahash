@@ -257,9 +257,9 @@ class Miner(BaseMinerNeuron):
             "subnet_id": getattr(synapse, "subnet_id", "unknown"),
             "accepted_alpha": getattr(synapse, "accepted_alpha", "unknown")
         })
-        out = await self.payments.handle_win(synapse)
-        _strip_internals_inplace(out)
-        return out
+        synapse = await self.payments.handle_win(synapse)
+        _strip_internals_inplace(synapse)
+        return synapse
 
     async def forward(self, synapse: Synapse):
         """
