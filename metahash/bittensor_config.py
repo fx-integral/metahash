@@ -82,6 +82,8 @@ def add_validator_args(parser: argparse.ArgumentParser) -> None:
     # Validator-specific testing args
     parser.add_argument("--no_epoch", action="store_true", default=False,
                         help="Enable mock mode (no real chain calls).")
+    parser.add_argument("--force_epoch", action="store_true", default=False,
+                        help="Force running the current epoch immediately (no waiting). Use when recovering from crashes or missed heads.")
     parser.add_argument("--neuron.moving_average_alpha", type=float, default=1.0,
                         help="Moving average alpha parameter for validator rewards blending.")
 

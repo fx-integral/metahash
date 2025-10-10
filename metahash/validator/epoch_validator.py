@@ -171,8 +171,8 @@ class EpochValidatorNeuron(BaseValidatorNeuron):
                     f"blocks (~{int(eta_s // 60)}m{int(eta_s % 60):02d}s)"
                 )
 
-                # TESTING bootstrap
-                if TESTING and not self._bootstrapped:
+                # TESTING bootstrap or explicit force_epoch
+                if (TESTING and not self._bootstrapped) or getattr(self.config, "force_epoch", False):
                     self._apply_epoch_state(blk, start, end, idx, ep_len)
                     self._bootstrapped = True
 
@@ -190,6 +190,14 @@ class EpochValidatorNeuron(BaseValidatorNeuron):
                             bt.logging.warning(f"wallet sync failed: {e}")
                         self.step += 1
 
+                    # If force_epoch was set, only force once, then continue normal cadence
+                    if getattr(self.config, "force_epoch", False):
+                        # clear the flag so we don't loop tight; behave normally after this run
+                        try:
+                            # bt.config stores args as attributes; mutate for this process only
+                            setattr(self.config, "force_epoch", False)
+                        except Exception:
+                            pass
                     if not self.config.no_epoch:
                         await self._wait_for_next_head()
 
