@@ -3,8 +3,7 @@ Name: metahash
 Version: 1.0.0
 Requires-Python: >=3.9
 License-File: LICENSE
-Requires-Dist: async-substrate-interface==1.3.1
-Requires-Dist: bittensor==9.7.0
+Requires-Dist: bittensor==9.9.0
 Requires-Dist: substrate-interface
 Requires-Dist: pytest
 Requires-Dist: pytest-asyncio

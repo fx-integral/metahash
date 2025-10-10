@@ -64,37 +64,6 @@ def _name(obj) -> str | None:
     return str(obj)
 
 
-def _allowed_extrinsic_indices(  # noqa: PLR0911
-    self,
-    extrinsics,
-    block_num: int,
-) -> set[int]:
-    """Whitelist extrinsic indices inside *extrinsics* that are allowed to produce α-stake events.
-
-    • Always allow SubtensorModule.transfer_stake.
-    • Allow Utility.{batch,force_batch,batch_all} only when self.allow_batch is True.
-    """
-    allowed: set[int] = set()
-    for idx, ex in enumerate(extrinsics):
-        try:
-            pallet = _name(ex["call"]["call_module"])
-            func = _name(ex["call"]["call_function"])
-            if self.debug_extr:
-                bt.logging.debug(f"[blk {block_num}] ex#{idx} {pallet}.{func}")
-            # 1️⃣ direct α-stake transfer
-            if (pallet, func) == ("SubtensorModule", "transfer_stake"):
-                allowed.add(idx)
-            # 2️⃣ optional Utility batches
-            elif (
-                pallet == "Utility"
-                and func in UTILITY_FUNS
-                and getattr(self, "allow_batch", False)
-            ):
-                allowed.add(idx)
-        except Exception as err:
-            if self.debug_extr:
-                bt.logging.debug(f"[blk {block_num}] ex#{idx} unreadable – {err!s}")
-    return allowed
 
 
 # ── constants ───────────────────────────────────────────────────────────
@@ -253,6 +222,38 @@ class AlphaTransfersScanner:
         self.ss58_format = subtensor.substrate.ss58_format
         self._rpc_lock: asyncio.Lock = rpc_lock or asyncio.Lock()
 
+    def _allowed_extrinsic_indices(  # noqa: PLR0911
+        self,
+        extrinsics,
+        block_num: int,
+    ) -> set[int]:
+        """Whitelist extrinsic indices inside *extrinsics* that are allowed to produce α-stake events.
+
+        • Always allow SubtensorModule.transfer_stake.
+        • Allow Utility.{batch,force_batch,batch_all} only when self.allow_batch is True.
+        """
+        allowed: set[int] = set()
+        for idx, ex in enumerate(extrinsics):
+            try:
+                pallet = _name(ex["call"]["call_module"])
+                func = _name(ex["call"]["call_function"])
+                if self.debug_extr:
+                    bt.logging.debug(f"[blk {block_num}] ex#{idx} {pallet}.{func}")
+                # 1️⃣ direct α-stake transfer
+                if (pallet, func) == ("SubtensorModule", "transfer_stake"):
+                    allowed.add(idx)
+                # 2️⃣ optional Utility batches
+                elif (
+                    pallet == "Utility"
+                    and func in UTILITY_FUNS
+                    and getattr(self, "allow_batch", False)
+                ):
+                    allowed.add(idx)
+            except Exception as err:
+                if self.debug_extr:
+                    bt.logging.debug(f"[blk {block_num}] ex#{idx} unreadable – {err!s}")
+        return allowed
+
     async def _rpc(self, fn, *a, **kw):
         """
         Call substrate functions safely by:
@@ -339,7 +340,7 @@ class AlphaTransfersScanner:
                     break
                 try:
                     raw_events, extrinsics = await self._get_block(bn)
-                    allowed_idx = _allowed_extrinsic_indices(self, extrinsics, bn)
+                    allowed_idx = self._allowed_extrinsic_indices(extrinsics, bn)
                     # Normalize event rows to dicts; drop weird shapes/strings
                     cleaned = []
                     for ev in raw_events or []:

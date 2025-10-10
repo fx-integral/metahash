@@ -26,6 +26,7 @@ metahash/utils/colors.py
 metahash/utils/commitments.py
 metahash/utils/helpers.py
 metahash/utils/ipfs.py
+metahash/utils/phase_logs.py
 metahash/utils/pretty_logs.py
 metahash/utils/subnet_utils.py
 metahash/utils/valuation.py
