@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import inspect
 from collections import defaultdict
+import logging
 from typing import Dict, List, Tuple
 
 from metahash.utils.pretty_logs import pretty
@@ -904,11 +905,22 @@ class ClearingEngine:
                 # Clean the WinSynapse before sending to prevent slice errors
                 _strip_internals_inplace(win_synapse)
                 
-                resps = await self.parent.dendrite(
-                    axons=[target_ax],
-                    synapse=win_synapse,
-                    deserialize=True,
-                )
+                # Suppress noisy external ERROR logs from bittensor during RPC
+                bt_logger = logging.getLogger("bittensor")
+                prev_level = bt_logger.level
+                try:
+                    # Hide ERRORs that are benign for None/empty responses
+                    bt_logger.setLevel(logging.CRITICAL)
+                    resps = await self.parent.dendrite(
+                        axons=[target_ax],
+                        synapse=win_synapse,
+                        deserialize=True,
+                    )
+                finally:
+                    try:
+                        bt_logger.setLevel(prev_level)
+                    except Exception:
+                        pass
                 calls_sent += 1
                 resp = resps[0] if isinstance(resps, list) and resps else resps
                 if isinstance(resp, WinSynapse) and bool(getattr(resp, "ack", False)):

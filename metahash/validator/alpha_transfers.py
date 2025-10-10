@@ -95,17 +95,48 @@ class TransferEvent:
 
 
 # ── SS58 helpers ────────────────────────────────────────────────────────
-def _encode_ss58(raw: bytes, fmt: int) -> str:  # noqa: D401
+def _encode_ss58(raw: Optional[bytes], fmt: int) -> Optional[str]:  # noqa: D401
+    """
+    Safely encode a 32-byte AccountId to SS58; returns None if input missing or if library signatures mismatch.
+
+    Handles both:
+      • ss58_encode(bytes_or_hex, address_type)
+      • ss58_encode(pubkey=<bytes>, address_type=<int>)
+      • ss58_encode(address=<hexstr>, address_type=<int>)
+    """
+    if raw is None:
+        return None
+
+    # 1) Try the common positional (pubkey, fmt)
     try:
-        return _ss58_encode_generic(raw, fmt)
-    except TypeError:
-        return _ss58_encode_generic(raw, address_type=fmt)
+        return _ss58_encode_generic(raw, fmt)  # some versions accept pubkey bytes here
+    except Exception:
+        pass
+
+    # 2) Try explicit keywords (pubkey=..., address_type=...)
+    try:
+        return _ss58_encode_generic(pubkey=raw, address_type=fmt)  # substrate-interface style
+    except Exception:
+        pass
+
+    # 3) Try hex "address" path that some scalecodec versions expect
+    try:
+        return _ss58_encode_generic(address="0x" + raw.hex(), address_type=fmt)
+    except Exception:
+        pass
+
+    # 4) Last resort: give up quietly; caller will drop the event if None
+    return None
 
 
 def _decode_ss58(addr: str) -> bytes:  # noqa: D401
+    """
+    Decode SS58 to raw 32-byte account id; tolerate signature differences across libraries.
+    """
     try:
         return _ss58_decode_generic(addr)
     except TypeError:
+        # older/newer variants
         return _ss58_decode_generic(addr, valid_ss58_format=True)
 
 
@@ -460,7 +491,11 @@ class AlphaTransfersScanner:
                 continue
 
             te = replace(te, block=block_hint_single)
-            if te.amount_rao > 0 and (self.dest_ck is None or te.dest_coldkey == self.dest_ck):
+            # Require usable addresses; drop if encoding failed or missing
+            if te.amount_rao > 0 \
+               and te.src_coldkey is not None \
+               and te.dest_coldkey is not None \
+               and (self.dest_ck is None or te.dest_coldkey == self.dest_ck):
                 kept += 1
                 out.append(te)
                 if dump:
