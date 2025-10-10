@@ -149,16 +149,57 @@ def _decode_ss58(addr: str) -> bytes:  # noqa: D401
 
 
 def _account_id(obj) -> bytes | None:  # noqa: ANN001,D401
-    if isinstance(obj, (bytes, bytearray)) and len(obj) == 32:
-        return bytes(obj)
+    # Direct bytes-like 32 length
+    if isinstance(obj, (bytes, bytearray)):
+        try:
+            return bytes(obj) if len(obj) == 32 else None
+        except Exception:
+            return None
+    # Common scalecodec container shapes
+    if hasattr(obj, "value"):
+        try:
+            return _account_id(getattr(obj, "value"))
+        except Exception:
+            pass
+    if isinstance(obj, dict):
+        # Some versions wrap under 'value' first
+        if "value" in obj:
+            v = obj.get("value")
+            got = _account_id(v)
+            if got is not None:
+                return got
+        # Named variants e.g. {'Id': '0x..'}, {'AccountId': bytes}, {'AccountId32': {...}}
+        inner = (
+            obj.get("Id")
+            or obj.get("AccountId")
+            or obj.get("AccountId32")
+            or next(iter(obj.values()), None)
+        )
+        return _account_id(inner)
+    # List of ints or nested singleton
     if isinstance(obj, (list, tuple)):
         if len(obj) == 32 and all(isinstance(x, int) for x in obj):
-            return bytes(obj)
+            try:
+                return bytes(obj)  # list[int] -> bytes
+            except Exception:
+                return None
         if len(obj) == 1:
             return _account_id(obj[0])
-    if isinstance(obj, dict):
-        inner = obj.get("Id") or obj.get("AccountId") or next(iter(obj.values()), None)
-        return _account_id(inner)
+    # Hex string e.g. '0x..'
+    if isinstance(obj, str):
+        s = obj.strip()
+        if s.startswith("0x") and len(s) >= 66:  # 32 bytes -> 64 hex chars + 0x
+            try:
+                b = bytes.fromhex(s[2:])
+                return b if len(b) == 32 else None
+            except Exception:
+                return None
+        # Try SS58 decode
+        try:
+            b = _decode_ss58(s)
+            return b if isinstance(b, (bytes, bytearray)) and len(b) == 32 else None
+        except Exception:
+            return None
     return None
 
 
@@ -335,9 +376,18 @@ class AlphaTransfersScanner:
             # Fetch events / block using normalized hash
             events = await self._rpc(self.st.substrate.get_events, block_hash=bh_str)
             blk = await self._rpc(self.st.substrate.get_block, block_hash=bh_str)
+            try:
+                bt.logging.debug(
+                    f"[SCANNER] _get_block types: events={type(events).__name__} blk={type(blk).__name__}"
+                )
+            except Exception:
+                pass
 
             # Normalize events to a list of dict-ish items
             if not isinstance(events, list):
+                bt.logging.debug(
+                    f"[SCANNER] get_events returned {type(events).__name__}, expected list; coercing to []"
+                )
                 events = []
 
             # Normalize extrinsics shape
@@ -352,6 +402,9 @@ class AlphaTransfersScanner:
 
             # Ensure list
             if not isinstance(extrinsics, list):
+                bt.logging.debug(
+                    f"[SCANNER] extrinsics is {type(extrinsics).__name__}, expected list; coercing to []"
+                )
                 extrinsics = []
 
             return events, extrinsics
@@ -393,8 +446,21 @@ class AlphaTransfersScanner:
                     cleaned = []
                     for ev in raw_events or []:
                         if not isinstance(ev, dict):
+                            bt.logging.debug(
+                                f"[SCANNER] block {bn}: skip non-dict event of type {type(ev).__name__}"
+                            )
                             continue
                         idx = ev.get("extrinsic_idx")
+                        if idx is None:
+                            # Newer interfaces sometimes use 'extrinsic_index'
+                            idx = ev.get("extrinsic_index")
+                        if idx is None and self.dump_events:
+                            try:
+                                bt.logging.debug(
+                                    f"[SCANNER] block {bn}: event missing extrinsic_idx; keys={list(ev.keys())[:8]}"
+                                )
+                            except Exception:
+                                pass
                         if idx in allowed_idx or idx is None:
                             cleaned.append(ev)
                     raw_events = cleaned
@@ -473,6 +539,13 @@ class AlphaTransfersScanner:
             bucket = scratch.setdefault(idx, {})
             name = _event_name(ev)
             fields = _event_fields(ev)
+            if not isinstance(fields, (list, tuple)):
+                try:
+                    bt.logging.debug(
+                        f"[SCANNER] block {block_hint_single}: unexpected fields type for {name}: {type(fields).__name__}"
+                    )
+                except Exception:
+                    pass
 
             if name == "StakeRemoved":
                 bucket["src_amt"] = _amount_from_stake_removed(fields)
@@ -530,6 +603,14 @@ class AlphaTransfersScanner:
                     f"src_ck={_mask(te.src_coldkey)} dest_ck={_mask(te.dest_coldkey)} "
                     f"reason={','.join(reason_parts) if reason_parts else 'unknown'}"
                 )
+                if dump:
+                    try:
+                        bt.logging.info(
+                            f"[blk {block_hint_single}] DROP details: src_raw_len={(len(te.src_coldkey_raw) if te.src_coldkey_raw else None)} "
+                            f"dest_raw_len={(len(te.dest_coldkey_raw) if te.dest_coldkey_raw else None)} src_sid={te.src_subnet_id}"
+                        )
+                    except Exception:
+                        pass
             scratch.pop(idx, None)
 
         return seen, kept
