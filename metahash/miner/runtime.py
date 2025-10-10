@@ -193,19 +193,20 @@ class Runtime:
         height = 0
         last_error = None
         
-        # Try AsyncSubtensor methods first
+        # Try AsyncSubtensor methods first (serialize over the websocket)
         for name in ("get_current_block", "current_block", "block", "get_block_number"):
             try:
-                attr = getattr(st, name, None)
-                if attr is None:
-                    continue
-                res = attr() if callable(attr) else attr
-                if inspect.isawaitable(res):
-                    res = await res
-                b = int(res or 0)
-                if b > 0:
-                    height = b
-                    break
+                async with self._rpc_lock:  # type: ignore[arg-type]
+                    attr = getattr(st, name, None)
+                    if attr is None:
+                        continue
+                    res = attr() if callable(attr) else attr
+                    if inspect.isawaitable(res):
+                        res = await res
+                    b = int(res or 0)
+                    if b > 0:
+                        height = b
+                        break
             except Exception as e:
                 last_error = e
                 continue
@@ -213,13 +214,14 @@ class Runtime:
         # Try substrate method if AsyncSubtensor methods failed
         if height <= 0:
             try:
-                substrate = getattr(st, "substrate", None)
-                if substrate is not None:
-                    meth = getattr(substrate, "get_block_number", None)
-                    if callable(meth):
-                        b = int(meth(None) or 0)
-                        if b > 0:
-                            height = b
+                async with self._rpc_lock:  # type: ignore[arg-type]
+                    substrate = getattr(st, "substrate", None)
+                    if substrate is not None:
+                        meth = getattr(substrate, "get_block_number", None)
+                        if callable(meth):
+                            b = int(meth(None) or 0)
+                            if b > 0:
+                                height = b
             except Exception as e:
                 last_error = e
 
@@ -282,23 +284,21 @@ class Runtime:
             return {int(s): 0.0 for s in subnet_ids}
 
         unique_ids = list(dict.fromkeys(int(s) for s in subnet_ids))
-        coros = [
-            st.get_stake(
-                coldkey_ss58=cold_ss58,
-                hotkey_ss58=validator_hotkey_ss58,
-                netuid=int(sid),
-                reuse_block=True,
-            )
-            for sid in unique_ids
-        ]
-        results = await asyncio.gather(*coros, return_exceptions=True)
 
+        # Serialize RPCs to avoid concurrent recv() on the same websocket
         out: Dict[int, float] = {}
-        for sid, res in zip(unique_ids, results):
-            if isinstance(res, Exception):
-                out[int(sid)] = 0.0
-            else:
+        for sid in unique_ids:
+            try:
+                async with self._rpc_lock:  # type: ignore[arg-type]
+                    res = await st.get_stake(
+                        coldkey_ss58=cold_ss58,
+                        hotkey_ss58=validator_hotkey_ss58,
+                        netuid=int(sid),
+                        reuse_block=True,
+                    )
                 out[int(sid)] = self._balance_to_alpha(res)
+            except Exception:
+                out[int(sid)] = 0.0
         return out
 
     async def get_multi_validator_stakes_map(self, validator_hotkeys: List[str], subnet_ids: List[int]) -> Dict[int, float]:
@@ -320,7 +320,8 @@ class Runtime:
         st = self._async_subtensor
         for name in ("get_alpha_balance", "alpha_balance", "get_balance_alpha"):
             try:
-                attr = getattr(st, name)
+                async with self._rpc_lock:  # type: ignore[arg-type]
+                    attr = getattr(st, name)
             except AttributeError:
                 continue
             try:
