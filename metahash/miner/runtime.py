@@ -166,8 +166,10 @@ class Runtime:
             log_init(LogLevel.MEDIUM, "Initializing async subtensor connection", "chain")
             # Create with just network parameter to avoid config issues that cause slice attachment
             try:
-                network = getattr(self.config.subtensor, 'network', 'finney')
+                # Use the same network configuration as the main subtensor
+                network = self.config.subtensor.network
                 stxn = bt.AsyncSubtensor(network=network)
+                log_init(LogLevel.MEDIUM, f"Created async subtensor with network: {network}", "chain")
             except Exception as e:
                 log_init(LogLevel.HIGH, "Failed to create async subtensor with network, using fallback", "chain", {"error": str(e)})
                 stxn = bt.AsyncSubtensor(self.config)

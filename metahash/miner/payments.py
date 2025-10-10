@@ -315,6 +315,14 @@ class Payments:
     async def _payment_worker(self, inv: WinInvoice):
         try:
             await self.runtime._ensure_async_subtensor()
+            
+            # Log network configuration for debugging
+            network = getattr(self.runtime._async_subtensor, 'network', 'unknown')
+            log_settlement(LogLevel.MEDIUM, "Payment worker network configuration", "worker", {
+                "invoice_id": inv.invoice_id,
+                "network": network,
+                "subnet_id": inv.subnet_id
+            })
 
             start = int(inv.pay_window_start_block or 0)
             end = int(inv.pay_window_end_block or 0)
@@ -333,7 +341,7 @@ class Payments:
             block_fetch_failures = 0
             max_block_fetch_failures = 10
             worker_start_time = time.time()
-            max_worker_runtime = 3600  # 1 hour max runtime per worker
+            max_worker_runtime = 1800  # 30 minutes max runtime per worker (reduced from 1 hour)
             
             while True:
                 # Check if worker has been running too long
