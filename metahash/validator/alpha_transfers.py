@@ -105,27 +105,35 @@ def _encode_ss58(raw: Optional[bytes], fmt: int) -> Optional[str]:  # noqa: D401
       • ss58_encode(address=<hexstr>, address_type=<int>)
     """
     if raw is None:
+        bt.logging.debug("[SS58] encode skipped: raw AccountId is None")
         return None
 
     # 1) Try the common positional (pubkey, fmt)
     try:
-        return _ss58_encode_generic(raw, fmt)  # some versions accept pubkey bytes here
-    except Exception:
-        pass
+        out = _ss58_encode_generic(raw, fmt)  # some versions accept pubkey bytes here
+        bt.logging.debug("[SS58] encode path=positional(pubkey,fmt) ok")
+        return out
+    except Exception as e1:
+        bt.logging.debug(f"[SS58] encode path=positional failed: {type(e1).__name__}: {str(e1)[:120]}")
 
     # 2) Try explicit keywords (pubkey=..., address_type=...)
     try:
-        return _ss58_encode_generic(pubkey=raw, address_type=fmt)  # substrate-interface style
-    except Exception:
-        pass
+        out = _ss58_encode_generic(pubkey=raw, address_type=fmt)  # substrate-interface style
+        bt.logging.debug("[SS58] encode path=keywords(pubkey=,address_type=) ok")
+        return out
+    except Exception as e2:
+        bt.logging.debug(f"[SS58] encode path=keywords(pubkey=,address_type=) failed: {type(e2).__name__}: {str(e2)[:120]}")
 
     # 3) Try hex "address" path that some scalecodec versions expect
     try:
-        return _ss58_encode_generic(address="0x" + raw.hex(), address_type=fmt)
-    except Exception:
-        pass
+        out = _ss58_encode_generic(address="0x" + raw.hex(), address_type=fmt)
+        bt.logging.debug("[SS58] encode path=keywords(address=hex,address_type=) ok")
+        return out
+    except Exception as e3:
+        bt.logging.debug(f"[SS58] encode path=keywords(address=,address_type=) failed: {type(e3).__name__}: {str(e3)[:120]}")
 
     # 4) Last resort: give up quietly; caller will drop the event if None
+    bt.logging.warning("[SS58] encode failed: all strategies exhausted; dropping event")
     return None
 
 
@@ -504,6 +512,24 @@ class AlphaTransfersScanner:
                         f"net={te.subnet_id} uid={te.from_uid}->{te.to_uid} "
                         f"α={te.amount_rao} **KEPT** (to {_mask(te.dest_coldkey)})"
                     )
+            else:
+                # Verbose reason for drop
+                reason_parts = []
+                if te.amount_rao <= 0:
+                    reason_parts.append("nonpositive_amount")
+                if te.src_coldkey is None:
+                    reason_parts.append("src_ck_none")
+                if te.dest_coldkey is None:
+                    reason_parts.append("dest_ck_none")
+                if (self.dest_ck is not None) and (te.dest_coldkey != self.dest_ck):
+                    reason_parts.append("treasury_mismatch")
+                bt.logging.debug(
+                    "[SCANNER] drop StakeTransferred: "
+                    f"blk={block_hint_single} sid={te.subnet_id} amt={te.amount_rao} "
+                    f"src_raw={'yes' if te.src_coldkey_raw else 'no'} dest_raw={'yes' if te.dest_coldkey_raw else 'no'} "
+                    f"src_ck={_mask(te.src_coldkey)} dest_ck={_mask(te.dest_coldkey)} "
+                    f"reason={','.join(reason_parts) if reason_parts else 'unknown'}"
+                )
             scratch.pop(idx, None)
 
         return seen, kept
