@@ -70,7 +70,7 @@ POST_PAYMENT_CHECK_DELAY_BLOCKS: int = int(os.getenv("POST_PAYMENT_CHECK_DELAY_B
 
 # ╭──────────────────── PENALTIES & JAIL ──────────────────────────────╮
 JAIL_EPOCHS_PARTIAL: int = int(os.getenv("JAIL_EPOCHS_PARTIAL", "2"))
-JAIL_EPOCHS_NO_PAY: int = int(os.getenv("JAIL_EPOCHS_NO_PAY", "8"))
+JAIL_EPOCHS_NO_PAY: int = int(os.getenv("JAIL_EPOCHS_NO_PAY", "12"))
 # ╰────────────────────────────────────────────────────────────────────╯
 
 

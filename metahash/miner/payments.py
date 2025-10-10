@@ -636,9 +636,11 @@ class Payments:
                 pass
 
     async def handle_win(self, synapse: WinSynapse) -> WinSynapse:
-        await self.runtime._ensure_async_subtensor()
-        self.ensure_payment_config()
-
+        """
+        Non-blocking win handler that immediately returns response and schedules
+        heavy processing (state saving, payment scheduling, logging) in background.
+        """
+        # Quick validation and basic processing
         self._sanitize_win_synapse_numbers_inplace(synapse)
 
         uid = getattr(synapse, "validator_uid", None)
@@ -652,27 +654,10 @@ class Payments:
                 caller_hot = getattr(self.runtime.metagraph.axons[uid], "hotkey", None)
         vkey = caller_hot or (f"uid:{uid}" if uid is not None else "<unknown>")
 
-        log_commitments(LogLevel.MEDIUM, "Processing win notification", "win_handler", {
-            "validator": vkey,
-            "uid": uid,
-            "subnet_id": getattr(synapse, "subnet_id", "unknown"),
-            "accepted_alpha": getattr(synapse, "accepted_alpha", "unknown")
-        })
-
+        # Quick treasury validation
         treasury_ck = self.state.treasuries.get(caller_hot or "") or self.state.treasuries.get(vkey)
         if not treasury_ck:
             note = f"validator not allowlisted: {caller_hot or vkey or '?'}"
-            log_commitments(LogLevel.HIGH, "Win ignored - validator not allowlisted", "win_handler", {
-                "validator": f"{caller_hot or vkey} (uid={uid if uid is not None else '?'})",
-                "reason": "not allowlisted"
-            })
-            miner_logger.phase_panel(
-                MinerPhase.COMMITMENTS, "Win Ignored",
-                [("validator", f"{caller_hot or vkey} (uid={uid if uid is not None else '?'})"),
-                 ("reason", "not allowlisted"),
-                 ("note", note)],
-                LogLevel.HIGH
-            )
             synapse.ack = False
             synapse.payment_attempted = False
             synapse.payment_ok = False
@@ -680,11 +665,12 @@ class Payments:
             synapse.last_response = note
             return synapse
 
+        # Extract basic win data
         accepted_alpha = _as_float(getattr(synapse, "accepted_alpha", None) or getattr(synapse, "alpha", 0.0))
         requested_alpha = _as_float(getattr(synapse, "requested_alpha", None) or accepted_alpha)
         was_partial = bool(getattr(synapse, "was_partially_accepted", accepted_alpha < requested_alpha - 1e-12))
-
         amount_rao = int(round(accepted_alpha * PLANCK))
+        
         # Get current epoch from metagraph or use 0 as fallback
         try:
             epoch_now = int(getattr(self.runtime.metagraph, "current_epoch", 0) or 0)
@@ -696,6 +682,7 @@ class Payments:
         pay_ep = _as_int(getattr(synapse, "pay_epoch_index", 0))
         clearing_bps = _as_int(getattr(synapse, "clearing_discount_bps", 0))
 
+        # Create invoice
         inv = WinInvoice(
             validator_key=vkey,
             treasury_coldkey=treasury_ck,
@@ -716,6 +703,7 @@ class Payments:
             f"{vkey}|{inv.subnet_id}|{inv.alpha:.12f}|{inv.discount_bps}|{inv.amount_rao}|{inv.pay_window_start_block}|{inv.pay_window_end_block}|{inv.pay_epoch_index or 0}".encode("utf-8")
         ).hexdigest()[:12]
 
+        # Check for existing invoice
         for w in self.state.wins:
             if (
                 w.validator_key == inv.validator_key
@@ -737,45 +725,75 @@ class Payments:
         else:
             self.state.wins.append(inv)
 
-        await self.state.save_async()
-
-        # Enhanced win notification with structured information
-        log_commitments(LogLevel.MEDIUM, "Win received from allowlisted validator", "win_handler", {
-            "validator": f"{caller_hot or vkey} (uid={uid if uid is not None else '?'})",
-            "subnet_id": inv.subnet_id,
-            "accepted_alpha": inv.alpha,
-            "invoice_id": inv.invoice_id
-        })
-        
-        # Use the new clean win summary method
-        miner_logger.win_summary(
-            validator=f"{caller_hot or vkey} (uid={uid if uid is not None else '?'})",
-            epoch_now=epoch_now,
-            subnet_id=inv.subnet_id,
-            accepted_alpha=inv.alpha,
-            requested_alpha=inv.alpha_requested,
-            was_partial=inv.was_partial,
-            discount_bps=inv.discount_bps,
-            pay_epoch=inv.pay_epoch_index or (epoch_now + 1),
-            window=f"[{inv.pay_window_start_block}, {inv.pay_window_end_block or '?'}]",
-            amount_to_pay=inv.amount_rao/PLANCK,
-            invoice_id=inv.invoice_id,
-            treasury_src="LOCAL allowlist (pinned)"
-        )
-        
-
-        self._schedule_payment(inv)
-        self.state.status_tables()
-
+        # Immediately return response without waiting for heavy processing
         synapse.ack = True
         synapse.payment_attempted = bool(inv.pay_attempts > 0)
         synapse.payment_ok = bool(inv.paid)
         synapse.attempts = int(inv.pay_attempts)
         synapse.last_response = inv.last_response[:300] if inv.last_response else ""
+
+        # Schedule heavy processing in background (fire-and-forget)
+        self.submit(self._process_win_background(inv, caller_hot, vkey, uid, epoch_now))
         
-        log_commitments(LogLevel.MEDIUM, "Win processing completed", "win_handler", {
-            "invoice_id": inv.invoice_id,
-            "ack": True,
-            "payment_scheduled": True
-        })
         return synapse
+
+    async def _process_win_background(self, inv: WinInvoice, caller_hot: str, vkey: str, uid: int, epoch_now: int):
+        """
+        Background processing for win handling - includes async operations,
+        state saving, payment scheduling, and logging.
+        """
+        try:
+            # Ensure async subtensor is available
+            await self.runtime._ensure_async_subtensor()
+            self.ensure_payment_config()
+
+            # Save state
+            await self.state.save_async()
+
+            # Log win notification
+            log_commitments(LogLevel.MEDIUM, "Processing win notification", "win_handler", {
+                "validator": vkey,
+                "uid": uid,
+                "subnet_id": inv.subnet_id,
+                "accepted_alpha": inv.alpha
+            })
+
+            # Enhanced win notification with structured information
+            log_commitments(LogLevel.MEDIUM, "Win received from allowlisted validator", "win_handler", {
+                "validator": f"{caller_hot or vkey} (uid={uid if uid is not None else '?'})",
+                "subnet_id": inv.subnet_id,
+                "accepted_alpha": inv.alpha,
+                "invoice_id": inv.invoice_id
+            })
+            
+            # Use the new clean win summary method
+            miner_logger.win_summary(
+                validator=f"{caller_hot or vkey} (uid={uid if uid is not None else '?'})",
+                epoch_now=epoch_now,
+                subnet_id=inv.subnet_id,
+                accepted_alpha=inv.alpha,
+                requested_alpha=inv.alpha_requested,
+                was_partial=inv.was_partial,
+                discount_bps=inv.discount_bps,
+                pay_epoch=inv.pay_epoch_index or (epoch_now + 1),
+                window=f"[{inv.pay_window_start_block}, {inv.pay_window_end_block or '?'}]",
+                amount_to_pay=inv.amount_rao/PLANCK,
+                invoice_id=inv.invoice_id,
+                treasury_src="LOCAL allowlist (pinned)"
+            )
+            
+            # Schedule payment
+            self._schedule_payment(inv)
+            self.state.status_tables()
+
+            log_commitments(LogLevel.MEDIUM, "Win processing completed", "win_handler", {
+                "invoice_id": inv.invoice_id,
+                "ack": True,
+                "payment_scheduled": True
+            })
+            
+        except Exception as e:
+            log_commitments(LogLevel.HIGH, "Background win processing failed", "win_handler", {
+                "invoice_id": inv.invoice_id,
+                "error": str(e)
+            })

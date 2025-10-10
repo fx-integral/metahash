@@ -499,6 +499,9 @@ class Runtime:
                 "validator": caller_hot or vkey
             })
             try:
+                # Non-blocking stake check with timeout to prevent auction blocking
+                import asyncio
+                
                 # If user provided --miner.bids.validators, compute availability across them
                 cfg_miner = getattr(self.config, "miner", None)
                 cfg_bids = getattr(cfg_miner, "bids", cfg_miner)
@@ -506,15 +509,50 @@ class Runtime:
                     cfg_validators = list(getattr(cfg_bids, "validators", []) or [])
                 except Exception:
                     cfg_validators = []
-                if cfg_validators:
-                    stake_by_subnet = await self.get_multi_validator_stakes_map(cfg_validators, candidate_subnets)
-                else:
-                    stake_by_subnet = await self.get_validator_stakes_map(caller_hot or vkey, candidate_subnets)
-                # Use the new clean stake summary method
-                miner_logger.stake_summary(stake_by_subnet, min_stake_alpha)
+                
+                # Use timeout to prevent blocking auction processing
+                try:
+                    if cfg_validators:
+                        stake_by_subnet = await asyncio.wait_for(
+                            self.get_multi_validator_stakes_map(cfg_validators, candidate_subnets),
+                            timeout=2.0  # 2 second timeout
+                        )
+                    else:
+                        stake_by_subnet = await asyncio.wait_for(
+                            self.get_validator_stakes_map(caller_hot or vkey, candidate_subnets),
+                            timeout=2.0  # 2 second timeout
+                        )
+                    # Use the new clean stake summary method
+                    miner_logger.stake_summary(stake_by_subnet, min_stake_alpha)
+                except asyncio.TimeoutError:
+                    # If stake check times out, assume sufficient stake to allow bidding
+                    stake_by_subnet = {int(s): float('inf') for s in candidate_subnets}
+                    log_auction(LogLevel.HIGH, "Stake check timed out, allowing bids to proceed", "stake", {
+                        "timeout_seconds": 2.0,
+                        "candidate_subnets": candidate_subnets
+                    })
+                    miner_logger.phase_panel(
+                        MinerPhase.AUCTION, "Stake Check Timeout",
+                        [
+                            ("timeout", "2.0s"),
+                            ("action", "allowing bids"),
+                            ("subnets", str(candidate_subnets)),
+                        ],
+                        LogLevel.HIGH
+                    )
             except Exception as _e:
-                stake_by_subnet = {int(s): 0.0 for s in candidate_subnets}
-                log_auction(LogLevel.HIGH, "Stake check failed, defaulting to 0 availability", "stake", {"error": str(_e)})
+                # If stake check fails completely, assume sufficient stake to allow bidding
+                stake_by_subnet = {int(s): float('inf') for s in candidate_subnets}
+                log_auction(LogLevel.HIGH, "Stake check failed, allowing bids to proceed", "stake", {"error": str(_e)})
+                miner_logger.phase_panel(
+                    MinerPhase.AUCTION, "Stake Check Failed",
+                    [
+                        ("error", str(_e)[:100]),
+                        ("action", "allowing bids"),
+                        ("subnets", str(candidate_subnets)),
+                    ],
+                    LogLevel.HIGH
+                )
 
         if min_stake_alpha > 0:
             has_any = any(amt >= min_stake_alpha for amt in stake_by_subnet.values())

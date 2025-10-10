@@ -142,10 +142,46 @@ def _decode_ss58(addr: str) -> bytes:  # noqa: D401
     Decode SS58 to raw 32-byte account id; tolerate signature differences across libraries.
     """
     try:
-        return _ss58_decode_generic(addr)
-    except TypeError:
-        # older/newer variants
-        return _ss58_decode_generic(addr, valid_ss58_format=True)
+        result = _ss58_decode_generic(addr)
+        # Handle case where decode returns string instead of bytes
+        if isinstance(result, str):
+            # Try to convert hex string to bytes
+            if result.startswith('0x'):
+                return bytes.fromhex(result[2:])
+            else:
+                return bytes.fromhex(result)
+        elif isinstance(result, bytes):
+            return result
+        else:
+            # Try different formats
+            for fmt in [42, 0, 2]:
+                try:
+                    result = _ss58_decode_generic(addr, valid_ss58_format=fmt)
+                    if isinstance(result, str):
+                        if result.startswith('0x'):
+                            return bytes.fromhex(result[2:])
+                        else:
+                            return bytes.fromhex(result)
+                    elif isinstance(result, bytes):
+                        return result
+                except Exception:
+                    continue
+            raise ValueError(f"Could not decode SS58 address: {addr}")
+    except Exception as e:
+        # Try different formats as fallback
+        for fmt in [42, 0, 2]:
+            try:
+                result = _ss58_decode_generic(addr, valid_ss58_format=fmt)
+                if isinstance(result, str):
+                    if result.startswith('0x'):
+                        return bytes.fromhex(result[2:])
+                    else:
+                        return bytes.fromhex(result)
+                elif isinstance(result, bytes):
+                    return result
+            except Exception:
+                continue
+        raise ValueError(f"Could not decode SS58 address: {addr} - {e}")
 
 
 def _account_id(obj) -> bytes | None:  # noqa: ANN001,D401
@@ -209,6 +245,12 @@ def _account_id(obj) -> bytes | None:  # noqa: ANN001,D401
         for fmt in [42, 0, 2]:  # Common SS58 formats
             try:
                 b = _ss58_decode_generic(s, valid_ss58_format=fmt)
+                # Handle string result from decode
+                if isinstance(b, str):
+                    if b.startswith('0x'):
+                        b = bytes.fromhex(b[2:])
+                    else:
+                        b = bytes.fromhex(b)
                 if isinstance(b, (bytes, bytearray)) and len(b) == 32:
                     bt.logging.debug(f"[SCANNER] SS58 decode succeeded with format {fmt} for '{s}'")
                     return b
