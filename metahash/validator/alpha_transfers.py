@@ -281,15 +281,21 @@ class AlphaTransfersScanner:
         try:
             # Get block hash
             bh = await self._rpc(self.st.substrate.get_block_hash, block_id=int(bn))
-            
-            # Guard block hash - but use it as-is without conversion
-            # (matching the pattern in subnet_utils.py which works correctly)
+
+            # Guard block hash
             if not bh:
                 raise ValueError(f"Got empty block hash for block {bn}")
 
-            # Fetch events / block - use bh directly without any conversion
-            events = await self._rpc(self.st.substrate.get_events, block_hash=bh)
-            blk = await self._rpc(self.st.substrate.get_block, block_hash=bh)
+            # Normalize block hash to a hex string for downstream RPCs.
+            # Some substrate clients expect a string and will call .replace on it.
+            if isinstance(bh, (bytes, bytearray)):
+                bh_str = "0x" + bytes(bh).hex()
+            else:
+                bh_str = str(bh)
+
+            # Fetch events / block using normalized hash
+            events = await self._rpc(self.st.substrate.get_events, block_hash=bh_str)
+            blk = await self._rpc(self.st.substrate.get_block, block_hash=bh_str)
 
             # Normalize events to a list of dict-ish items
             if not isinstance(events, list):

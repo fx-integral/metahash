@@ -94,8 +94,20 @@ class Payments:
             self._bg_thread = threading.Thread(target=self._run_bg_loop, name="miner-payments-loop", daemon=True)
             self._bg_thread.start()
             log_init(LogLevel.MEDIUM, "Background payment thread started", "payments")
-        # resume unpaid + watchdog
-        self.submit(self._resume_pending_payments())
+        # Fresh-start safety: when --fresh is set, ensure no stale invoices remain
+        # and skip auto-resume of pending payments for this boot.
+        if bool(getattr(self.config, "fresh", False)):
+            try:
+                # Clear any loaded wins (payments) so miner truly starts fresh
+                self.state.wins.clear()
+                # Persist the cleared state
+                self.submit(self.state.save_async())
+                log_init(LogLevel.MEDIUM, "--fresh: cleared in-memory wins and skipped resume", "payments")
+            except Exception:
+                pass
+        else:
+            # resume unpaid + watchdog
+            self.submit(self._resume_pending_payments())
         self.submit(self._pending_payments_watchdog())
 
     def shutdown_background(self):

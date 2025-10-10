@@ -369,6 +369,7 @@ class SettlementEngine:
         except Exception as scan_exc:
             phase_log(f"[SETTLEMENT] Scanner failed for blocks {start_block}-{end_block}: {str(scan_exc)[:200]}")
             pretty.log(f"[yellow]Scanner failed: {scan_exc}[/yellow]")
+            raise scan_exc
             return None
 
         def _coerce(ev) -> TransferEvent | None:
