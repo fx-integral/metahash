@@ -31,7 +31,7 @@ class EpochValidatorNeuron(BaseValidatorNeuron):
         self.epoch_end_block: Optional[int] = None
         self._override_active: bool = False
         self._bootstrapped: bool = False
-        self._running: bool = False  # <-- guard
+        self._running: bool = False  # guard
 
         # Strategy wiring — be robust if config sets strategy_path=None
         raw_strategy_path = getattr(self.config, "strategy_path", None)
@@ -132,10 +132,15 @@ class EpochValidatorNeuron(BaseValidatorNeuron):
             if isinstance(out, dict):
                 nonzero = sum(1 for v in out.values() if int(v) > 0)
                 total = sum(int(v) for v in out.values())
-                bt.logging.info(f"[strategy] refreshed subnet weights (entries={len(out)} nonzero={nonzero} sum_bps={total})")
+                bt.logging.info(
+                    f"[strategy] refreshed subnet weights (entries={len(out)} "
+                    f"nonzero={nonzero} sum_bps={total})"
+                )
             else:
                 nz = sum(1 for v in (out or []) if v)
-                bt.logging.info(f"[strategy] refreshed weights (len={len(out or [])} nonzeros={nz})")
+                bt.logging.info(
+                    f"[strategy] refreshed weights (len={len(out or [])} nonzeros={nz})"
+                )
         except Exception as e:
             bt.logging.warning(f"[strategy] refresh failed: {e}")
 
@@ -184,9 +189,7 @@ class EpochValidatorNeuron(BaseValidatorNeuron):
                             bt.logging.warning(f"wallet sync failed: {e}")
                         self.step += 1
 
-                    if self.config.no_epoch:
-                        pass
-                    else:
+                    if not self.config.no_epoch:
                         await self._wait_for_next_head()
 
                 else:
@@ -203,7 +206,9 @@ class EpochValidatorNeuron(BaseValidatorNeuron):
                     self._refresh_strategy_before_forward()
                     await self.concurrent_forward()
                 except Exception as err:
+                    # FIX: don't 'raise e' (undefined). Log and continue.
                     bt.logging.error(f"forward() raised: {err}")
+                    bt.logging.debug("forward() traceback:", exc_info=True)
                 finally:
                     try:
                         self.sync()
@@ -217,7 +222,9 @@ class EpochValidatorNeuron(BaseValidatorNeuron):
         except RuntimeError as e:
             # Fallback if already inside a running loop (rare in CLI, common in notebooks).
             if "already running" in str(e):
-                bt.logging.warning("Detected an already-running event loop; scheduling background task.")
+                bt.logging.warning(
+                    "Detected an already-running event loop; scheduling background task."
+                )
                 loop = asyncio.get_event_loop()
                 loop.create_task(_loop())
             else:
@@ -225,7 +232,9 @@ class EpochValidatorNeuron(BaseValidatorNeuron):
         finally:
             self._running = False
             try:
-                getattr(self, "axon", bt.logging).stop()
+                ax = getattr(self, "axon", None)
+                if ax and hasattr(ax, "stop"):
+                    ax.stop()
             except Exception:
                 pass
             bt.logging.success("Validator main loop exited.")
