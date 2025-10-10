@@ -393,59 +393,69 @@ class AlphaTransfersScanner:
 
     async def _get_block(self, bn: int):
         """Return *(events, extrinsics_list)* for block *bn* with strict normalization."""
-        try:
-            # Get block hash
-            bh = await self._rpc(self.st.substrate.get_block_hash, block_id=int(bn))
+        # Get block hash
+        bh = await self._rpc(self.st.substrate.get_block_hash, block_id=int(bn))
 
-            # Guard block hash
-            if not bh:
-                raise ValueError(f"Got empty block hash for block {bn}")
+        # Guard block hash
+        if not bh:
+            raise ValueError(f"Got empty block hash for block {bn}")
 
-            # Normalize block hash to a hex string for downstream RPCs.
-            # Some substrate clients expect a string and will call .replace on it.
-            if isinstance(bh, (bytes, bytearray)):
-                bh_str = "0x" + bytes(bh).hex()
-            else:
-                bh_str = str(bh)
+        # Normalize block hash to a hex string for downstream RPCs.
+        # Some substrate clients expect a string and will call .replace on it.
+        if isinstance(bh, (bytes, bytearray)):
+            bh_str = "0x" + bytes(bh).hex()
+        else:
+            bh_str = str(bh)
 
-            # Fetch events / block using normalized hash
-            events = await self._rpc(self.st.substrate.get_events, block_hash=bh_str)
-            blk = await self._rpc(self.st.substrate.get_block, block_hash=bh_str)
-            try:
-                bt.logging.debug(
-                    f"[SCANNER] _get_block types: events={type(events).__name__} blk={type(blk).__name__}"
-                )
-            except Exception:
-                pass
+        # Fetch events / block using normalized hash
+        events = await self._rpc(self.st.substrate.get_events, block_hash=bh_str)
+        blk = await self._rpc(self.st.substrate.get_block, block_hash=bh_str)
+        
+        bt.logging.debug(
+            f"[SCANNER] _get_block types: events={type(events).__name__} blk={type(blk).__name__}"
+        )
 
-            # Normalize events to a list of dict-ish items
-            if not isinstance(events, list):
-                bt.logging.debug(
-                    f"[SCANNER] get_events returned {type(events).__name__}, expected list; coercing to []"
-                )
-                events = []
+        # Log detailed structure of events
+        if events:
+            bt.logging.debug(f"[SCANNER] events count: {len(events)}")
+            if len(events) > 0:
+                sample_event = events[0]
+                bt.logging.debug(f"[SCANNER] sample event type: {type(sample_event).__name__}")
+                if isinstance(sample_event, dict):
+                    bt.logging.debug(f"[SCANNER] sample event keys: {list(sample_event.keys())}")
+                    if "event" in sample_event:
+                        evt = sample_event["event"]
+                        bt.logging.debug(f"[SCANNER] event.event type: {type(evt).__name__}")
+                        if isinstance(evt, dict):
+                            bt.logging.debug(f"[SCANNER] event.event keys: {list(evt.keys())}")
+                        elif hasattr(evt, '__dict__'):
+                            bt.logging.debug(f"[SCANNER] event.event attrs: {list(evt.__dict__.keys())}")
 
-            # Normalize extrinsics shape
-            if isinstance(blk, dict):
-                extrinsics = (
-                    blk.get("block", {}).get("extrinsics")  # v1.7+ deep
-                    or blk.get("extrinsics")                 # shallow
-                    or []
-                )
-            else:
-                extrinsics = getattr(blk, "extrinsics", None) or []
+        # Normalize events to a list of dict-ish items
+        if not isinstance(events, list):
+            bt.logging.error(
+                f"[SCANNER] get_events returned {type(events).__name__}, expected list"
+            )
+            raise TypeError(f"Expected list from get_events, got {type(events).__name__}")
 
-            # Ensure list
-            if not isinstance(extrinsics, list):
-                bt.logging.debug(
-                    f"[SCANNER] extrinsics is {type(extrinsics).__name__}, expected list; coercing to []"
-                )
-                extrinsics = []
+        # Normalize extrinsics shape
+        if isinstance(blk, dict):
+            extrinsics = (
+                blk.get("block", {}).get("extrinsics")  # v1.7+ deep
+                or blk.get("extrinsics")                 # shallow
+                or []
+            )
+        else:
+            extrinsics = getattr(blk, "extrinsics", None) or []
 
-            return events, extrinsics
-        except Exception as e:
-            # Re-raise with context for the worker to handle
-            raise Exception(f"Failed to get block {bn}: {e}") from e
+        # Ensure list
+        if not isinstance(extrinsics, list):
+            bt.logging.error(
+                f"[SCANNER] extrinsics is {type(extrinsics).__name__}, expected list"
+            )
+            raise TypeError(f"Expected list for extrinsics, got {type(extrinsics).__name__}")
+
+        return events, extrinsics
 
     async def scan(self, frm: int, to: int) -> List[TransferEvent]:
         if frm > to:
@@ -474,56 +484,27 @@ class AlphaTransfersScanner:
                 bn = await q.get()
                 if bn is None:
                     break
-                try:
-                    raw_events, extrinsics = await self._get_block(bn)
-                    allowed_idx = self._allowed_extrinsic_indices(extrinsics, bn)
-                    # Normalize event rows to dicts; drop weird shapes/strings
-                    cleaned = []
-                    for ev in raw_events or []:
-                        if not isinstance(ev, dict):
-                            bt.logging.debug(
-                                f"[SCANNER] block {bn}: skip non-dict event of type {type(ev).__name__}"
-                            )
-                            continue
-                        idx = ev.get("extrinsic_idx")
-                        if idx is None:
-                            # Newer interfaces sometimes use 'extrinsic_index'
-                            idx = ev.get("extrinsic_index")
-                        if idx is None and self.dump_events:
-                            try:
-                                bt.logging.debug(
-                                    f"[SCANNER] block {bn}: event missing extrinsic_idx; keys={list(ev.keys())[:8]}"
-                                )
-                            except Exception:
-                                pass
-                        if idx in allowed_idx or idx is None:
-                            cleaned.append(ev)
-                    raw_events = cleaned
-                except websockets.exceptions.WebSocketException as err:
-                    bt.logging.warning(f"[SCANNER] WebSocket error at block {bn}: {str(err)[:100]}; skipping block.")
-                    blk_cnt += 1
-                    continue
-                except SubstrateRequestException as err:
-                    # This is the main error we're trying to fix - log with context
-                    bt.logging.warning(f"[SCANNER] Substrate RPC error at block {bn}: {str(err)[:100]}; skipping block.")
-                    bt.logging.debug(f"[SCANNER] Full SubstrateRequestException for block {bn}: {err}")
-                    blk_cnt += 1
-                    continue
-                except ValueError as err:
-                    bt.logging.warning(f"[SCANNER] Invalid data at block {bn}: {str(err)[:100]}; skipping block.")
-                    blk_cnt += 1
-                    continue
-                except TypeError as terr:
-                    # Typical after ws task blows up and returns a bad shape
-                    bt.logging.warning(f"[SCANNER] Type error at block {bn}: {str(terr)[:100]}; skipping block.")
-                    blk_cnt += 1
-                    continue
-                except Exception as err:
-                    # Catch-all for unexpected errors - log briefly but don't spam
-                    bt.logging.warning(f"[SCANNER] Unexpected error at block {bn}: {str(err)[:100]}; skipping block.")
-                    bt.logging.debug(f"[SCANNER] Full exception for block {bn}: {err}")
-                    blk_cnt += 1
-                    continue
+                raw_events, extrinsics = await self._get_block(bn)
+                allowed_idx = self._allowed_extrinsic_indices(extrinsics, bn)
+                # Normalize event rows to dicts; drop weird shapes/strings
+                cleaned = []
+                for ev in raw_events or []:
+                    if not isinstance(ev, dict):
+                        bt.logging.error(
+                            f"[SCANNER] block {bn}: skip non-dict event of type {type(ev).__name__}"
+                        )
+                        continue
+                    idx = ev.get("extrinsic_idx")
+                    if idx is None:
+                        # Newer interfaces sometimes use 'extrinsic_index'
+                        idx = ev.get("extrinsic_index")
+                    if idx is None and self.dump_events:
+                        bt.logging.debug(
+                            f"[SCANNER] block {bn}: event missing extrinsic_idx; keys={list(ev.keys())[:8]}"
+                        )
+                    if idx in allowed_idx or idx is None:
+                        cleaned.append(ev)
+                raw_events = cleaned
 
                 bucket = events_by_block.setdefault(bn, [])
                 seen, kept = self._accumulate(
@@ -531,6 +512,7 @@ class AlphaTransfersScanner:
                     bucket,
                     block_hint_single=bn,
                     dump=self.dump_events and bn >= to - self.dump_last + 1,
+                    extrinsics=extrinsics,
                 )
                 ev_cnt += seen
                 keep_cnt += kept
@@ -562,10 +544,49 @@ class AlphaTransfersScanner:
         *,
         block_hint_single: int,
         dump: bool,
+        extrinsics: Optional[Sequence] = None,
     ) -> Tuple[int, int]:
         """Filters one block’s events; mutates *out*; returns (seen, kept)."""
         seen = kept = 0
         scratch: Dict[int, Dict] = {}  # per-extrinsic bucket
+
+        def _accounts_from_extrinsic(ex) -> Tuple[bytes | None, bytes | None]:
+            """Try to extract up to two distinct 32-byte AccountIds from an extrinsic's call args."""
+            try:
+                args = None
+                if isinstance(ex, dict):
+                    args = ex.get("call", {}).get("args") or ex.get("args")
+                else:
+                    args = getattr(getattr(ex, "call", None), "args", None) or getattr(ex, "args", None)
+                if args is None:
+                    return None, None
+                # Flatten nested values
+                vals: list = []
+                if isinstance(args, dict):
+                    vals.extend(args.values())
+                elif isinstance(args, (list, tuple)):
+                    vals.extend(args)
+                # Dive one level for dict/list containers
+                flat: list = []
+                for v in vals:
+                    if isinstance(v, dict):
+                        flat.extend(v.values())
+                    elif isinstance(v, (list, tuple)):
+                        flat.extend(v)
+                    else:
+                        flat.append(v)
+                found: list[bytes] = []
+                for v in flat:
+                    raw = _account_id(v)
+                    if raw is not None and raw not in found:
+                        found.append(raw)
+                    if len(found) >= 2:
+                        break
+                a = found[0] if len(found) >= 1 else None
+                b = found[1] if len(found) >= 2 else None
+                return a, b
+            except Exception:
+                return None, None
 
         for ev in raw_events:
             idx = ev.get("extrinsic_idx")
@@ -575,90 +596,86 @@ class AlphaTransfersScanner:
             name = _event_name(ev)
             fields = _event_fields(ev)
             if not isinstance(fields, (list, tuple)):
-                try:
+                if name in {"StakeRemoved", "StakeAdded", "StakeTransferred"}:
                     bt.logging.debug(
                         f"[SCANNER] block {block_hint_single}: unexpected fields type for {name}: {type(fields).__name__}"
                     )
-                except Exception:
-                    pass
+                    if isinstance(fields, dict):
+                        bt.logging.debug(
+                            f"[SCANNER] dict-field keys for {name}: {list(fields.keys())}"
+                        )
+                        # Log sample values for debugging
+                        for k, v in list(fields.items())[:3]:
+                            bt.logging.debug(f"[SCANNER] {name}.{k}: {type(v).__name__} = {v}")
                 # Normalize dict-like fields to a list of values for downstream helpers
                 if isinstance(fields, dict):
-                    try:
-                        fields = list(fields.values())
-                    except Exception:
-                        fields = ()
+                    fields = list(fields.values())
+                else:
+                    fields = ()
 
             if name == "StakeRemoved":
                 bucket["src_amt"] = _amount_from_stake_removed(fields)
                 bucket["src_net"] = _subnet_from_stake_removed(fields)
                 # Try to capture source coldkey raw from any AccountId-like field
                 if "src_raw" not in bucket:
-                    try:
-                        # scan both normalized list and original mapping
-                        candidates = []
-                        if isinstance(fields, (list, tuple)):
-                            candidates.extend(fields)
-                        elif isinstance(fields, dict):
-                            candidates.extend(fields.values())
-                        for v in candidates:
-                            raw = _account_id(v)
-                            if raw is not None:
-                                bucket["src_raw"] = raw
-                                break
-                    except Exception:
-                        pass
+                    # scan both normalized list and original mapping
+                    candidates = []
+                    if isinstance(fields, (list, tuple)):
+                        candidates.extend(fields)
+                    elif isinstance(fields, dict):
+                        candidates.extend(fields.values())
+                    for v in candidates:
+                        raw = _account_id(v)
+                        if raw is not None:
+                            bucket["src_raw"] = raw
+                            bt.logging.debug(f"[SCANNER] Found src_raw from StakeRemoved: {raw.hex()[:16]}...")
+                            break
             elif name == "StakeAdded":
                 bucket["dst_amt"] = _amount_from_stake_added(fields)
                 bucket["dst_net"] = _subnet_from_stake_added(fields)
                 # Try to capture destination coldkey raw from any AccountId-like field
                 if "dst_raw" not in bucket:
-                    try:
-                        candidates = []
-                        if isinstance(fields, (list, tuple)):
-                            candidates.extend(fields)
-                        elif isinstance(fields, dict):
-                            candidates.extend(fields.values())
-                        for v in candidates:
-                            raw = _account_id(v)
-                            if raw is not None:
-                                bucket["dst_raw"] = raw
-                                break
-                    except Exception:
-                        pass
+                    candidates = []
+                    if isinstance(fields, (list, tuple)):
+                        candidates.extend(fields)
+                    elif isinstance(fields, dict):
+                        candidates.extend(fields.values())
+                    for v in candidates:
+                        raw = _account_id(v)
+                        if raw is not None:
+                            bucket["dst_raw"] = raw
+                            bt.logging.debug(f"[SCANNER] Found dst_raw from StakeAdded: {raw.hex()[:16]}...")
+                            break
             elif name == "StakeTransferred":
                 seen += 1
                 bucket["te"] = _parse_stake_transferred(fields, self.ss58_format)
                 # Also try to record raw accounts from this event directly if present
                 if "src_raw" not in bucket:
-                    try:
-                        candidates = []
-                        if isinstance(fields, (list, tuple)):
-                            candidates.extend(fields)
-                        elif isinstance(fields, dict):
-                            candidates.extend(fields.values())
-                        for v in candidates:
-                            raw = _account_id(v)
-                            if raw is not None:
-                                bucket["src_raw"] = raw
-                                break
-                    except Exception:
-                        pass
+                    candidates = []
+                    if isinstance(fields, (list, tuple)):
+                        candidates.extend(fields)
+                    elif isinstance(fields, dict):
+                        candidates.extend(fields.values())
+                    for v in candidates:
+                        raw = _account_id(v)
+                        if raw is not None:
+                            bucket["src_raw"] = raw
+                            bt.logging.debug(f"[SCANNER] Found src_raw from StakeTransferred: {raw.hex()[:16]}...")
+                            break
                 if "dst_raw" not in bucket:
-                    try:
-                        candidates = []
-                        if isinstance(fields, (list, tuple)):
-                            candidates.extend(fields)
-                        elif isinstance(fields, dict):
-                            candidates.extend(fields.values())
-                        for v in candidates:
-                            raw = _account_id(v)
-                            if raw is not None:
-                                # do not overwrite src_raw if only one account found
-                                if "src_raw" in bucket and bucket["src_raw"] != raw:
-                                    bucket["dst_raw"] = raw
-                                    break
-                    except Exception:
-                        pass
+                    candidates = []
+                    if isinstance(fields, (list, tuple)):
+                        candidates.extend(fields)
+                    elif isinstance(fields, dict):
+                        candidates.extend(fields.values())
+                    for v in candidates:
+                        raw = _account_id(v)
+                        if raw is not None:
+                            # do not overwrite src_raw if only one account found
+                            if "src_raw" in bucket and bucket["src_raw"] != raw:
+                                bucket["dst_raw"] = raw
+                                bt.logging.debug(f"[SCANNER] Found dst_raw from StakeTransferred: {raw.hex()[:16]}...")
+                                break
 
             te: TransferEvent | None = bucket.get("te")
             if te is None:
@@ -675,6 +692,17 @@ class AlphaTransfersScanner:
             if getattr(te, "dest_coldkey_raw", None) is None and "dst_raw" in bucket:
                 raw = bucket.get("dst_raw")
                 te = replace(te, dest_coldkey_raw=raw, dest_coldkey=_encode_ss58(raw, self.ss58_format))
+            # Final fallback: try reading accounts from extrinsic args when both missing
+            if (te.src_coldkey_raw is None or te.dest_coldkey_raw is None) and extrinsics is not None:
+                ex = extrinsics[idx] if isinstance(extrinsics, list) and 0 <= idx < len(extrinsics) else None
+                a, b = _accounts_from_extrinsic(ex)
+                # Only apply if we don't already have values
+                if te.src_coldkey_raw is None and a is not None:
+                    te = replace(te, src_coldkey_raw=a, src_coldkey=_encode_ss58(a, self.ss58_format))
+                    bt.logging.debug(f"[SCANNER] Found src_raw from extrinsic: {a.hex()[:16]}...")
+                if te.dest_coldkey_raw is None and b is not None and b != (te.src_coldkey_raw or a):
+                    te = replace(te, dest_coldkey_raw=b, dest_coldkey=_encode_ss58(b, self.ss58_format))
+                    bt.logging.debug(f"[SCANNER] Found dst_raw from extrinsic: {b.hex()[:16]}...")
 
             # SECURITY: drop cross-subnet
             if te.src_subnet_id is not None and te.src_subnet_id != te.subnet_id:
@@ -714,13 +742,10 @@ class AlphaTransfersScanner:
                     f"reason={','.join(reason_parts) if reason_parts else 'unknown'}"
                 )
                 if dump:
-                    try:
-                        bt.logging.info(
-                            f"[blk {block_hint_single}] DROP details: src_raw_len={(len(te.src_coldkey_raw) if te.src_coldkey_raw else None)} "
-                            f"dest_raw_len={(len(te.dest_coldkey_raw) if te.dest_coldkey_raw else None)} src_sid={te.src_subnet_id}"
-                        )
-                    except Exception:
-                        pass
+                    bt.logging.info(
+                        f"[blk {block_hint_single}] DROP details: src_raw_len={(len(te.src_coldkey_raw) if te.src_coldkey_raw else None)} "
+                        f"dest_raw_len={(len(te.dest_coldkey_raw) if te.dest_coldkey_raw else None)} src_sid={te.src_subnet_id}"
+                    )
             scratch.pop(idx, None)
 
         return seen, kept
