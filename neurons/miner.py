@@ -214,7 +214,7 @@ class Miner(BaseMinerNeuron):
                     ("total_bid_lines", len(self.lines)),
                     ("total_alpha", f"{total_alpha:.4f} α"),
                     ("target_subnets", ", ".join(subnets)),
-                    ("discount_mode", "RAW (pass-through)" if getattr(self.runtime, "_bids_raw_discount", False) else "EFFECTIVE (weight-adjusted)"),
+                    ("discount_mode", "EFFECTIVE-DISCOUNT (weight-adjusted)"),
                 ]
             )
 

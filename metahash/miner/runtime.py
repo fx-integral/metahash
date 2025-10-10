@@ -24,21 +24,6 @@ def clamp_bps(x: int) -> int:
     return 0 if x < 0 else (10_000 if x > 10_000 else x)
 
 
-def compute_raw_discount_bps(effective_factor_bps: int, weight_bps: int) -> int:
-    w_bps = clamp_bps(int(weight_bps or 0))
-    ef_bps = clamp_bps(int(effective_factor_bps or 0))
-    if w_bps <= 0:
-        return 0
-    w = w_bps / 10_000.0
-    ef = ef_bps / 10_000.0
-    raw = 1.0 - (ef / w)
-    if raw < 0.0:
-        raw = 0.0
-    elif raw > 1.0:
-        raw = 1.0
-    return int(round(raw * 10_000))
-
-
 def parse_discount_token(tok: str) -> int:
     t = str(tok).strip().lower().replace("%", "")
     if t.endswith("bps"):
@@ -100,8 +85,8 @@ class Runtime:
         self._async_subtensor: Optional[bt.AsyncSubtensor] = None
         self._rpc_lock: Optional[asyncio.Lock] = None
 
-        # Discount mode (config-parsed)
-        self._bids_raw_discount: bool = False
+        # Discount mode (config-parsed) - now always weight-adjusted
+        self._bids_raw_discount: bool = False  # Deprecated, kept for compatibility
 
         # Block cache
         self._blk_cache_height: int = 0
@@ -166,7 +151,7 @@ class Runtime:
         return lines
 
     def log_cfg_summary(self, lines: List[BidLine]):
-        mode = "RAW (pass-through)" if self._bids_raw_discount else "EFFECTIVE (weight-adjusted)"
+        mode = "EFFECTIVE-DISCOUNT (weight-adjusted)"
         rows = [[i, ln.subnet_id, f"{ln.alpha:.4f} α", f"{ln.discount_bps} bps"] for i, ln in enumerate(lines)]
         if rows:
             miner_logger.phase_table(
@@ -492,7 +477,7 @@ class Runtime:
             budget_alpha=budget_alpha,
             min_stake_alpha=min_stake_alpha,
             weights_count=len(weights_bps),
-            discount_mode="RAW (pass-through)" if self._bids_raw_discount else "EFFECTIVE (weight-adjusted)",
+            discount_mode="EFFECTIVE-DISCOUNT (weight-adjusted)",
             timeline=f"bid now (e) → pay in (e+1={epoch+1}) → weights from e in (e+2={epoch+2})",
             treasury_src="LOCAL allowlist (pinned)"
         )
@@ -618,14 +603,34 @@ class Runtime:
             remaining_by_subnet[subnet_id] = max(0.0, available - send_alpha)
 
 
-            if self._bids_raw_discount:
-                send_disc_bps = int(ln.discount_bps)
-                eff_factor_bps = int(round(weight_bps * (1.0 - (send_disc_bps / 10_000.0))))
-                mode_note = "raw"
-            else:
-                send_disc_bps = compute_raw_discount_bps(ln.discount_bps, weight_bps)
-                eff_factor_bps = int(round(weight_bps * (1.0 - (send_disc_bps / 10_000.0))))
-                mode_note = "effective→raw"
+            # ln.discount_bps is the discount the miner wants to pay vs current price
+            # subnet_weight < 1.0 means validator already applies a discount (weight discount)
+            # We need to calculate the effective additional discount on top of weight discount
+            configured_discount_bps = int(ln.discount_bps)
+            weight_factor = weight_bps / 10_000.0
+            
+            # Calculate effective discount: configured_discount - (1 - weight_factor)
+            # This gives us the additional discount on top of the weight discount
+            effective_discount = (configured_discount_bps / 10_000.0) - (1.0 - weight_factor)
+            
+            # If effective discount is too small or negative, skip this bid
+            # Threshold: minimum 0.5% effective discount to be worth bidding
+            min_effective_discount = 0.005  # 0.5%
+            if effective_discount < min_effective_discount:
+                log_auction(LogLevel.MEDIUM, "Bid skipped - effective discount too small", "bidding", {
+                    "subnet_id": subnet_id,
+                    "configured_discount_bps": configured_discount_bps,
+                    "weight_factor": weight_factor,
+                    "effective_discount": effective_discount,
+                    "min_required": min_effective_discount
+                })
+                continue
+            
+            send_disc_bps = int(round(effective_discount * 10_000))
+            
+            # Calculate effective factor for logging
+            eff_factor_bps = int(round(weight_bps * (1.0 - (send_disc_bps / 10_000.0))))
+            mode_note = "effective-adjusted"
 
             if self.state.has_bid(vkey, epoch, subnet_id, send_alpha, send_disc_bps):
                 continue
@@ -639,8 +644,8 @@ class Runtime:
             rows_sent.append([
                 subnet_id,
                 f"{send_alpha:.4f} α",
-                f"{ln.discount_bps} bps" + (" (cfg)" if not self._bids_raw_discount else ""),
-                f"{send_disc_bps} bps",
+                f"{configured_discount_bps} bps (cfg)",
+                f"{send_disc_bps} bps (eff)",
                 f"{weight_bps} w_bps",
                 f"{eff_factor_bps} eff_bps",
                 bid_id,
