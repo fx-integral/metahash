@@ -648,6 +648,17 @@ class AlphaTransfersScanner:
                             break
             elif name == "StakeTransferred":
                 seen += 1
+                # Log the exact structure of StakeTransferred events for debugging
+                bt.logging.debug(f"[SCANNER] StakeTransferred fields type: {type(fields).__name__}")
+                if isinstance(fields, dict):
+                    bt.logging.debug(f"[SCANNER] StakeTransferred dict keys: {list(fields.keys())}")
+                    for k, v in fields.items():
+                        bt.logging.debug(f"[SCANNER] StakeTransferred.{k}: {type(v).__name__} = {v}")
+                elif isinstance(fields, (list, tuple)):
+                    bt.logging.debug(f"[SCANNER] StakeTransferred list length: {len(fields)}")
+                    for i, field in enumerate(fields):
+                        bt.logging.debug(f"[SCANNER] StakeTransferred[{i}]: {type(field).__name__} = {field}")
+                
                 bucket["te"] = _parse_stake_transferred(fields, self.ss58_format)
                 # Also try to record raw accounts from this event directly if present
                 if "src_raw" not in bucket:
@@ -656,8 +667,10 @@ class AlphaTransfersScanner:
                         candidates.extend(fields)
                     elif isinstance(fields, dict):
                         candidates.extend(fields.values())
-                    for v in candidates:
+                    bt.logging.debug(f"[SCANNER] Checking {len(candidates)} candidates for src_raw")
+                    for i, v in enumerate(candidates):
                         raw = _account_id(v)
+                        bt.logging.debug(f"[SCANNER] Candidate[{i}]: {type(v).__name__} = {v} -> raw: {raw.hex()[:16] if raw else None}")
                         if raw is not None:
                             bucket["src_raw"] = raw
                             bt.logging.debug(f"[SCANNER] Found src_raw from StakeTransferred: {raw.hex()[:16]}...")
@@ -668,8 +681,10 @@ class AlphaTransfersScanner:
                         candidates.extend(fields)
                     elif isinstance(fields, dict):
                         candidates.extend(fields.values())
-                    for v in candidates:
+                    bt.logging.debug(f"[SCANNER] Checking {len(candidates)} candidates for dst_raw")
+                    for i, v in enumerate(candidates):
                         raw = _account_id(v)
+                        bt.logging.debug(f"[SCANNER] Candidate[{i}]: {type(v).__name__} = {v} -> raw: {raw.hex()[:16] if raw else None}")
                         if raw is not None:
                             # do not overwrite src_raw if only one account found
                             if "src_raw" in bucket and bucket["src_raw"] != raw:
