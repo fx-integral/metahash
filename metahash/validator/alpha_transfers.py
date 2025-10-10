@@ -198,7 +198,17 @@ def _account_id(obj) -> bytes | None:  # noqa: ANN001,D401
         try:
             b = _decode_ss58(s)
             return b if isinstance(b, (bytes, bytearray)) and len(b) == 32 else None
-        except Exception:
+        except Exception as e:
+            bt.logging.debug(f"[SCANNER] SS58 decode failed for '{s}': {e}")
+            # Try with different SS58 formats as fallback
+            for fmt in [42, 0, 2]:  # Common SS58 formats
+                try:
+                    b = _ss58_decode_generic(s, valid_ss58_format=fmt)
+                    if isinstance(b, (bytes, bytearray)) and len(b) == 32:
+                        bt.logging.debug(f"[SCANNER] SS58 decode succeeded with format {fmt} for '{s}'")
+                        return b
+                except Exception:
+                    continue
             return None
     return None
 
