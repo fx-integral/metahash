@@ -239,6 +239,28 @@ def _f(params, idx, default=None):  # noqa: ANN001
         return default
 
 
+def _fk(params, key_names: Sequence[str], default=None):  # noqa: ANN001
+    """Fetch parameter by any of the candidate names from dict-shaped params or list of (name,value) dicts."""
+    try:
+        # Direct dict with named attributes
+        if isinstance(params, dict):
+            for k in key_names:
+                if k in params:
+                    v = params.get(k)
+                    return v["value"] if isinstance(v, dict) and "value" in v else v
+        # List/tuple of dicts that look like {name:..., value:...}
+        if isinstance(params, (list, tuple)):
+            for item in params:
+                if isinstance(item, dict):
+                    name = item.get("name") or item.get("id") or item.get("key")
+                    if isinstance(name, str) and name in key_names:
+                        v = item.get("value") if "value" in item else item.get(name)
+                        return v
+        return default
+    except Exception:
+        return default
+
+
 def _mask(ck: Optional[str]) -> str:
     return ck if ck is None or len(ck) < 10 else f"{ck[:4]}…{ck[-4:]}"
 
@@ -246,17 +268,23 @@ def _mask(ck: Optional[str]) -> str:
 # ── parser helpers ──────────────────────────────────────────────────────
 def _parse_stake_transferred(params, fmt: int) -> TransferEvent:  # noqa: ANN001
     """Parse StakeTransferred event parameters (chain v9 & v10)."""
-    # Try positional indices first (list/tuple or dict coerced by _f)
-    from_coldkey_raw = _account_id(_f(params, 0))
-    dest_coldkey_raw = _account_id(_f(params, 1))
-    subnet_id = int(_f(params, 3, -1))  # destination netuid
-    to_uid = int(_f(params, 4, -1))
+    # Prefer named keys when available
+    from_val = _fk(params, ["from_coldkey", "from", "src", "source", "who"]) or _f(params, 0)
+    to_val = _fk(params, ["to_coldkey", "to", "dest", "destination"]) or _f(params, 1)
+    net_val = _fk(params, ["dest_netuid", "netuid", "subnet", "to_netuid"]) or _f(params, 3, -1)
+    uid_val = _fk(params, ["to_uid", "uid", "dest_uid"]) or _f(params, 4, -1)
+    amt_val = _fk(params, ["amount", "value", "stake", "amt", "rao"]) or _f(params, 5, 0)
+
+    from_coldkey_raw = _account_id(from_val)
+    dest_coldkey_raw = _account_id(to_val)
+    subnet_id = int(net_val if net_val is not None else -1)
+    to_uid = int(uid_val if uid_val is not None else -1)
     return TransferEvent(
         block=-1,
         from_uid=-1,  # origin UID not provided
         to_uid=to_uid,
         subnet_id=subnet_id,  # = dest netuid
-        amount_rao=int(_f(params, 5, 0)),  # placeholder, fixed later
+        amount_rao=int(amt_val or 0),  # placeholder, fixed later
         src_coldkey=_encode_ss58(from_coldkey_raw, fmt),
         dest_coldkey=_encode_ss58(dest_coldkey_raw, fmt),
         src_coldkey_raw=from_coldkey_raw,
@@ -600,6 +628,37 @@ class AlphaTransfersScanner:
             elif name == "StakeTransferred":
                 seen += 1
                 bucket["te"] = _parse_stake_transferred(fields, self.ss58_format)
+                # Also try to record raw accounts from this event directly if present
+                if "src_raw" not in bucket:
+                    try:
+                        candidates = []
+                        if isinstance(fields, (list, tuple)):
+                            candidates.extend(fields)
+                        elif isinstance(fields, dict):
+                            candidates.extend(fields.values())
+                        for v in candidates:
+                            raw = _account_id(v)
+                            if raw is not None:
+                                bucket["src_raw"] = raw
+                                break
+                    except Exception:
+                        pass
+                if "dst_raw" not in bucket:
+                    try:
+                        candidates = []
+                        if isinstance(fields, (list, tuple)):
+                            candidates.extend(fields)
+                        elif isinstance(fields, dict):
+                            candidates.extend(fields.values())
+                        for v in candidates:
+                            raw = _account_id(v)
+                            if raw is not None:
+                                # do not overwrite src_raw if only one account found
+                                if "src_raw" in bucket and bucket["src_raw"] != raw:
+                                    bucket["dst_raw"] = raw
+                                    break
+                    except Exception:
+                        pass
 
             te: TransferEvent | None = bucket.get("te")
             if te is None:

@@ -362,7 +362,8 @@ class SettlementEngine:
         # phase_log(f"[SETTLEMENT] Scanning α transfers: blocks {start_block} to {end_block} (range: {end_block - start_block + 1} blocks)")
 
         if self._scanner is None:
-            self._scanner = AlphaTransfersScanner(await self.parent._stxn(), dest_coldkey=None, rpc_lock=self._rpc_lock)
+            # Allow Utility.* batches to ensure wrapped transfer_stake are scanned
+            self._scanner = AlphaTransfersScanner(await self.parent._stxn(), dest_coldkey=None, allow_batch=True, rpc_lock=self._rpc_lock)
 
         try:
             events_raw = await self._scanner.scan(start_block, end_block)
