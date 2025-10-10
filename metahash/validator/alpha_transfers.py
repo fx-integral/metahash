@@ -600,10 +600,15 @@ class AlphaTransfersScanner:
 
         for ev in raw_events:
             idx = ev.get("extrinsic_idx")
+            name = _event_name(ev)
             if idx is None:
+                if name in {"StakeRemoved", "StakeAdded", "StakeTransferred"}:
+                    bt.logging.debug(f"[SCANNER] Skipping {name} event with no extrinsic_idx (system event)")
                 continue  # ignore system events
             bucket = scratch.setdefault(idx, {})
-            name = _event_name(ev)
+            # Log all stake-related events we're processing
+            if name in {"StakeRemoved", "StakeAdded", "StakeTransferred"}:
+                bt.logging.debug(f"[SCANNER] Processing {name} event at extrinsic_idx {idx}")
             fields = _event_fields(ev)
             if not isinstance(fields, (list, tuple)):
                 if name in {"StakeRemoved", "StakeAdded", "StakeTransferred"}:
