@@ -635,7 +635,7 @@ class Runtime:
             if self.state.has_bid(vkey, epoch, subnet_id, send_alpha, send_disc_bps):
                 continue
 
-            bid_id = hashlib.sha1(f"{vkey}|{epoch}|{subnet_id}|{send_alpha:.12f}|{send_disc_bps}".encode("utf-8")).hexdigest()[:10]
+            bid_id = hashlib.sha256(f"{vkey}|{epoch}|{subnet_id}|{send_alpha:.12f}|{send_disc_bps}".encode("utf-8")).hexdigest()[:10]
 
             out_bids.append((int(subnet_id), float(send_alpha), int(send_disc_bps), str(bid_id)))
 
