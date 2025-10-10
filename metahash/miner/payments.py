@@ -700,7 +700,7 @@ class Payments:
         )
 
         import hashlib
-        inv.invoice_id = hashlib.sha1(
+        inv.invoice_id = hashlib.sha256(
             f"{vkey}|{inv.subnet_id}|{inv.alpha:.12f}|{inv.discount_bps}|{inv.amount_rao}|{inv.pay_window_start_block}|{inv.pay_window_end_block}|{inv.pay_epoch_index or 0}".encode("utf-8")
         ).hexdigest()[:12]
 
