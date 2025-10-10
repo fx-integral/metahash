@@ -48,7 +48,12 @@ async def maybe_async(fn: Callable[..., T] | T, *args, **kwargs) -> T:  # noqa: 
         return await fn  # type: ignore[return-value]
     if asyncio.iscoroutinefunction(fn):
         return await fn(*args, **kwargs)  # type: ignore[misc]
-    return await asyncio.to_thread(fn, *args, **kwargs)
+    # Call synchronous function in thread to avoid blocking the event loop.
+    # Critically, if it returns an awaitable (e.g., a cached coroutine), await it here.
+    result = await asyncio.to_thread(fn, *args, **kwargs)
+    if inspect.isawaitable(result):
+        return await result  # type: ignore[return-value]
+    return result  # type: ignore[return-value]
 
 
 def _name(obj) -> str | None:
