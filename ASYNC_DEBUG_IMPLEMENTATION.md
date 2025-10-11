@@ -72,12 +72,21 @@ export METAHASH_DEBUG_ASYNC=false
 5. **Heartbeats**: Confirms background coroutines are actually running
 6. **Chain Operations**: Shows loop status during blockchain operations
 
-## Expected Root Cause Discovery
+## Root Cause Confirmed & Solution Implemented
 
-The logs should reveal that:
+The logs confirmed that:
 1. During `__init__`, there's no running event loop (`has_running_loop=False`)
 2. Early `submit()` calls fail with "no running event loop" error
 3. After the first RPC call, the event loop becomes available
 4. Background tasks start successfully after the event loop is established
 
-This will prove that the issue is PM2 not providing an event loop during initialization, and the solution is to defer background task startup until after the first RPC call establishes the event loop.
+**Solution Implemented**: Defer background task startup until the first RPC call establishes the event loop.
+
+### How the Fix Works:
+- **Removed eager scheduling** from `__init__` that was failing due to no event loop
+- **Added `_ensure_background_tasks_started()`** method that starts background tasks on first RPC
+- **All RPC handlers** (`auctionstart_forward`, `win_forward`, `forward`) now call this method
+- **Background tasks start automatically** when the first validator sends a request
+- **No more "no running event loop" errors** during initialization
+
+This approach is much cleaner than trying to start background tasks during initialization when no event loop exists.

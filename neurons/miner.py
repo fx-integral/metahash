@@ -198,6 +198,9 @@ class Miner(BaseMinerNeuron):
             payments_async_subtensor=self.payments_async_subtensor,
         )
 
+        # Track if background tasks have been started (will start on first RPC)
+        self._background_tasks_started = False
+        
         # Log loop status before starting background tasks
         if DEBUG_ASYNC:
             log_init(LogLevel.MEDIUM, "miner: before starting bg payments", "init", loop_info_dict("miner.before_bg"))
@@ -256,27 +259,8 @@ class Miner(BaseMinerNeuron):
                 ]
             )
 
-        # Eager schedule unpaid invoices + watchdog
-        log_init(LogLevel.MEDIUM, "Setting up payment scheduling", "payments")
-        try:
-            self.payments.ensure_payment_config()
-            
-            # Guard the eager callsite that schedules tasks from sync code
-            try:
-                asyncio.get_running_loop()
-                has_loop = True
-            except RuntimeError:
-                has_loop = False
-
-            if DEBUG_ASYNC:
-                log_init(LogLevel.MEDIUM, "scheduling from init", "init", {"has_running_loop": has_loop})
-
-            # Keep the call (so we see it fail/succeed in logs)
-            self.payments.schedule_unpaid_pending()
-        except Exception as _e:
-            log_init(LogLevel.HIGH, "Eager scheduling skipped", "payments", {"error": str(_e)})
-
-        log_init(LogLevel.MEDIUM, "Payment system initialized (will start in main loop)", "payments")
+        # Payment system will start on first RPC call (when event loop is available)
+        log_init(LogLevel.MEDIUM, "Payment system initialized (will start on first RPC)", "payments")
         
         # ---------------------- Auto-Sell Manager ----------------------
         log_init(LogLevel.MEDIUM, "Initializing auto-sell manager", "autosell")
@@ -411,6 +395,27 @@ class Miner(BaseMinerNeuron):
         
         return self.payments_async_subtensor
 
+    # ---------------------- Background task management ----------------------
+
+    async def _ensure_background_tasks_started(self):
+        """Start background tasks on first RPC call when event loop is available."""
+        if not self._background_tasks_started:
+            if DEBUG_ASYNC:
+                log_init(LogLevel.MEDIUM, "Starting background tasks on first RPC", "init", loop_info_dict("miner.first_rpc"))
+            
+            # Start payment background tasks
+            if hasattr(self, 'payments'):
+                self.payments.start_background_tasks()
+                if DEBUG_ASYNC:
+                    log_init(LogLevel.MEDIUM, "miner: after starting bg payments", "init", loop_info_dict("miner.after_bg"))
+            
+            # Start auto-sell background tasks
+            if hasattr(self, 'autosell_manager'):
+                self.autosell_manager.start_background_tasks()
+            
+            self._background_tasks_started = True
+            log_init(LogLevel.MEDIUM, "Background tasks started successfully", "init")
+
     # ---------------------- Protocol handlers ----------------------
 
     async def auctionstart_forward(self, synapse: AuctionStartSynapse) -> AuctionStartSynapse:
@@ -418,6 +423,9 @@ class Miner(BaseMinerNeuron):
         Keep the standard pattern: fill fields into the incoming synapse in Runtime,
         then strip non-serializable internals before returning it.
         """
+        # Start background tasks on first RPC call (when event loop is available)
+        await self._ensure_background_tasks_started()
+        
         if DEBUG_ASYNC:
             log_auction(LogLevel.MEDIUM, "auctionstart_forward entry", "handler", loop_info_dict("auctionstart.entry"))
         log_auction(LogLevel.MEDIUM, "Processing auction start request", "handler", {
@@ -455,6 +463,9 @@ class Miner(BaseMinerNeuron):
         Same approach for wins: Payments fills the same object; we sanitize it
         before giving it back to Axon for serialization.
         """
+        # Start background tasks on first RPC call (when event loop is available)
+        await self._ensure_background_tasks_started()
+        
         if DEBUG_ASYNC:
             log_commitments(LogLevel.MEDIUM, "win_forward entry", "handler", loop_info_dict("win.entry"))
         log_commitments(LogLevel.MEDIUM, "Processing win notification", "handler", {
@@ -489,22 +500,18 @@ class Miner(BaseMinerNeuron):
         You requested to keep echoing the inbound base Synapse. That's fine;
         the slice problem comes from typed routes, which we now sanitize.
         """
+        # Start background tasks on first RPC call (when event loop is available)
+        await self._ensure_background_tasks_started()
+        
         _strip_internals_inplace(synapse)
         return synapse
 
     # ---------------------- Override async main loop for debugging ----------------------
 
     async def _async_main_loop(self):
-        """Override to add loop status logging after background tasks start."""
-        # Start payment tasks in main event loop (PM2 compatible)
-        if hasattr(self, 'payments'):
-            self.payments.start_background_tasks()
-            if DEBUG_ASYNC:
-                log_init(LogLevel.MEDIUM, "miner: after starting bg payments", "init", loop_info_dict("miner.after_bg"))
-        
-        # Start auto-sell tasks in main event loop (PM2 compatible)
-        if hasattr(self, 'autosell_manager'):
-            self.autosell_manager.start_background_tasks()
+        """Override to add loop status logging - background tasks now start on first RPC."""
+        if DEBUG_ASYNC:
+            log_init(LogLevel.MEDIUM, "miner: async main loop started (background tasks will start on first RPC)", "init", loop_info_dict("miner.main_loop"))
         
         while not self.should_exit:
             self.sync()   
