@@ -2,11 +2,23 @@
 # neurons/miner.py
 
 import asyncio
+import os
+import sys
+import faulthandler
 from pathlib import Path
 from typing import Any
 
 import bittensor as bt
 from bittensor import Synapse
+
+# Enable debug mode by default
+DEBUG_ASYNC = os.getenv("METAHASH_DEBUG_ASYNC", "1") not in ("0", "", "false", "False", "no", "No")
+
+# Enable Python's own async debug and fault handler by default
+if DEBUG_ASYNC:
+    os.environ.setdefault("PYTHONASYNCIODEBUG", "1")
+    os.environ.setdefault("PYTHONUNBUFFERED", "1")
+    faulthandler.enable(file=sys.stderr)
 
 from metahash.base.miner import BaseMinerNeuron
 from metahash.base.utils.logging import ColoredLogger as clog
@@ -18,6 +30,7 @@ from metahash.miner.logging import (
     MinerPhase, LogLevel, miner_logger, 
     init_banner, log_init, log_auction, log_commitments, log_settlement
 )
+from metahash.utils.async_debug import loop_info_dict
 
 # Compact components
 from metahash.miner.state import StateStore
@@ -185,6 +198,10 @@ class Miner(BaseMinerNeuron):
             payments_async_subtensor=self.payments_async_subtensor,
         )
 
+        # Log loop status before starting background tasks
+        if DEBUG_ASYNC:
+            log_init(LogLevel.MEDIUM, "miner: before starting bg payments", "init", loop_info_dict("miner.before_bg"))
+
         # Build bid lines from config and show summary
         log_init(LogLevel.MEDIUM, "Building bid lines from configuration", "config")
         self.lines = self.runtime.build_lines_from_config()
@@ -243,6 +260,18 @@ class Miner(BaseMinerNeuron):
         log_init(LogLevel.MEDIUM, "Setting up payment scheduling", "payments")
         try:
             self.payments.ensure_payment_config()
+            
+            # Guard the eager callsite that schedules tasks from sync code
+            try:
+                asyncio.get_running_loop()
+                has_loop = True
+            except RuntimeError:
+                has_loop = False
+
+            if DEBUG_ASYNC:
+                log_init(LogLevel.MEDIUM, "scheduling from init", "init", {"has_running_loop": has_loop})
+
+            # Keep the call (so we see it fail/succeed in logs)
             self.payments.schedule_unpaid_pending()
         except Exception as _e:
             log_init(LogLevel.HIGH, "Eager scheduling skipped", "payments", {"error": str(_e)})
@@ -389,6 +418,8 @@ class Miner(BaseMinerNeuron):
         Keep the standard pattern: fill fields into the incoming synapse in Runtime,
         then strip non-serializable internals before returning it.
         """
+        if DEBUG_ASYNC:
+            log_auction(LogLevel.MEDIUM, "auctionstart_forward entry", "handler", loop_info_dict("auctionstart.entry"))
         log_auction(LogLevel.MEDIUM, "Processing auction start request", "handler", {
             "validator_uid": getattr(synapse, "validator_uid", "unknown"),
             "epoch": getattr(synapse, "epoch_index", "unknown")
@@ -424,6 +455,8 @@ class Miner(BaseMinerNeuron):
         Same approach for wins: Payments fills the same object; we sanitize it
         before giving it back to Axon for serialization.
         """
+        if DEBUG_ASYNC:
+            log_commitments(LogLevel.MEDIUM, "win_forward entry", "handler", loop_info_dict("win.entry"))
         log_commitments(LogLevel.MEDIUM, "Processing win notification", "handler", {
             "validator_uid": getattr(synapse, "validator_uid", "unknown"),
             "subnet_id": getattr(synapse, "subnet_id", "unknown"),
@@ -458,6 +491,27 @@ class Miner(BaseMinerNeuron):
         """
         _strip_internals_inplace(synapse)
         return synapse
+
+    # ---------------------- Override async main loop for debugging ----------------------
+
+    async def _async_main_loop(self):
+        """Override to add loop status logging after background tasks start."""
+        # Start payment tasks in main event loop (PM2 compatible)
+        if hasattr(self, 'payments'):
+            self.payments.start_background_tasks()
+            if DEBUG_ASYNC:
+                log_init(LogLevel.MEDIUM, "miner: after starting bg payments", "init", loop_info_dict("miner.after_bg"))
+        
+        # Start auto-sell tasks in main event loop (PM2 compatible)
+        if hasattr(self, 'autosell_manager'):
+            self.autosell_manager.start_background_tasks()
+        
+        while not self.should_exit:
+            self.sync()   
+            self.step += 1
+            
+            # Use asyncio.sleep instead of time.sleep for PM2 compatibility
+            await asyncio.sleep(12 * 4)
 
     # ---------------------- Context manager shutdown ----------------------
 

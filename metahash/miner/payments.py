@@ -2,13 +2,18 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 import inspect
+import threading
 from concurrent.futures import Future
 from typing import Dict, List, Optional, Any, Coroutine
 
 import bittensor as bt
 from bittensor import BLOCKTIME
+
+from metahash.utils.async_debug import loop_info_dict, short_tb
+DEBUG_ASYNC = os.getenv("METAHASH_DEBUG_ASYNC", "1") not in ("0", "", "false", "False", "no", "No")
 
 from metahash.config import PLANCK
 from metahash.utils.pretty_logs import pretty
@@ -160,26 +165,25 @@ class Payments:
 
     def start_background_tasks(self):
         """Start payment tasks in the main event loop (PM2 compatible)."""
-        # Initialize lock in main event loop
         if self._pay_lock is None:
             self._pay_lock = asyncio.Lock()
-        
-        log_init(LogLevel.MEDIUM, "Starting payment tasks in main event loop", "payments")
-        
-        # Fresh-start safety: when --fresh is set, ensure no stale invoices remain
+
+        info = loop_info_dict(prefix="payments.start_bg")
+        if DEBUG_ASYNC:
+            log_settlement(LogLevel.MEDIUM, "start_background_tasks()", "payments", info)
+
         if bool(getattr(self.config, "fresh", False)):
             try:
-                # Clear any loaded wins (payments) so miner truly starts fresh
                 self.state.wins.clear()
-                # Persist the cleared state
-                asyncio.create_task(self.state.save_async())
-                log_init(LogLevel.MEDIUM, "--fresh: cleared in-memory wins and skipped resume", "payments")
-            except Exception:
-                pass
-        else:
-            # resume unpaid + watchdog
-            asyncio.create_task(self._resume_pending_payments())
-            asyncio.create_task(self._pending_payments_watchdog())
+                asyncio.create_task(self.state.save_async())  # this one may also fail if no loop; we'll log it below
+                if DEBUG_ASYNC:
+                    log_settlement(LogLevel.MEDIUM, "fresh: cleared wins", "payments", {})
+            except Exception as e:
+                log_settlement(LogLevel.HIGH, "fresh: clear failed", "payments", {"error": str(e)})
+
+        # Use submit() so we validate loop presence
+        self.submit(self._resume_pending_payments())
+        self.submit(self._pending_payments_watchdog())
 
     def shutdown_background(self):
         """Shutdown payment tasks (PM2 compatible)."""
@@ -192,18 +196,49 @@ class Payments:
 
     def submit(self, coro: Coroutine[Any, Any, Any]) -> asyncio.Task:
         """Submit coroutine to main event loop (PM2 compatible)."""
-        if not asyncio.iscoroutine(coro):
-            raise TypeError("Expected coroutine in submit()")
-        
-        task = asyncio.create_task(coro)
-        
-        def _log_exc(task: asyncio.Task) -> None:
-            try:
-                task.result()
-            except Exception as e:
-                pretty.log(f"[yellow]Unhandled task exception[/yellow]: {e}")
-        task.add_done_callback(_log_exc)
-        return task
+        info = loop_info_dict(prefix="payments.submit")
+        if DEBUG_ASYNC:
+            log_settlement(
+                LogLevel.MEDIUM,
+                "submit() called",
+                "payments",
+                {
+                    **info,
+                    "coro": getattr(coro, "__name__", str(coro)),
+                    "stack": short_tb(8),
+                },
+            )
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError as e:
+            # No running loop in this thread → prove it
+            log_settlement(
+                LogLevel.HIGH,
+                "submit(): no running event loop",
+                "payments",
+                {"error": str(e), **info, "stack": short_tb(8)}
+            )
+            raise
+
+        t = loop.create_task(coro)
+
+        def _done(task: asyncio.Task):
+            exc = task.exception()
+            log_settlement(
+                LogLevel.MEDIUM if exc is None else LogLevel.HIGH,
+                "task finished",
+                "payments",
+                {
+                    "ok": exc is None,
+                    "exc": repr(exc) if exc else None,
+                    "task": repr(task),
+                    "prefix": "payments.submit.done",
+                    "loop_id": id(loop),
+                    "thread": threading.current_thread().name,
+                },
+            )
+        t.add_done_callback(_done)
+        return t
 
     # ---------------------- Payment config ----------------------
 
@@ -300,14 +335,27 @@ class Payments:
             log_init(LogLevel.HIGH, "Startup resume failed", "payments", {"error": str(e)})
 
     async def _pending_payments_watchdog(self):
+        hb = 0
         try:
+            if DEBUG_ASYNC:
+                log_settlement(LogLevel.MEDIUM, "watchdog started", "payments", loop_info_dict("watchdog.start"))
             while True:
+                hb += 1
+                if DEBUG_ASYNC and hb % 10 == 1:
+                    log_settlement(
+                        LogLevel.MEDIUM,
+                        "watchdog heartbeat",
+                        "payments",
+                        {"hb": hb, **loop_info_dict("watchdog.hb")}
+                    )
                 self.schedule_unpaid_pending()
                 await asyncio.sleep(max(0.5, float(BLOCKTIME)))
         except asyncio.CancelledError:
+            if DEBUG_ASYNC:
+                log_settlement(LogLevel.MEDIUM, "watchdog cancelled", "payments", loop_info_dict("watchdog.cancel"))
             raise
         except Exception as e:
-            log_settlement(LogLevel.HIGH, "Payments watchdog error", "payments", {"error": str(e)})
+            log_settlement(LogLevel.HIGH, "watchdog error", "payments", {"error": str(e), **loop_info_dict("watchdog.err")})
 
     def schedule_unpaid_pending(self):
         """Idempotent: schedules only invoices that are not paid and not expired."""
@@ -378,6 +426,13 @@ class Payments:
             return await transfer_alpha(**kwargs)  # type: ignore[misc]
 
     async def _payment_worker(self, inv: WinInvoice):
+        if DEBUG_ASYNC:
+            log_settlement(
+                LogLevel.MEDIUM,
+                "worker start",
+                "payments",
+                {"invoice_id": inv.invoice_id, **loop_info_dict("worker.start")}
+            )
         try:
             # Use separate AsyncSubtensor for payments
             await self._ensure_payments_async_subtensor()
@@ -457,6 +512,15 @@ class Payments:
                 
                 # Reset block fetch failure counter on success
                 block_fetch_failures = 0
+
+                # ... after blk = await self._get_current_block_payments()
+                if DEBUG_ASYNC and (attempt % 5 == 1):
+                    log_settlement(
+                        LogLevel.MEDIUM,
+                        "worker tick",
+                        "payments",
+                        {"invoice_id": inv.invoice_id, "blk": blk, "attempt": attempt, **loop_info_dict("worker.tick")}
+                    )
 
                 if start and blk < allowed_start:
                     inv.last_response = f"waiting (blk {blk} < start {allowed_start})"

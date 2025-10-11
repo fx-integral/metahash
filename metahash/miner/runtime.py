@@ -4,10 +4,13 @@ from __future__ import annotations
 import asyncio
 import inspect
 import hashlib
+import os
 from math import isfinite
 from typing import Dict, List, Optional, Iterable, Tuple, Any
 
 import bittensor as bt
+
+DEBUG_ASYNC = os.getenv("METAHASH_DEBUG_ASYNC", "1") not in ("0", "", "false", "False", "no", "No")
 from metahash.config import PLANCK, S_MIN_ALPHA_MINER
 from metahash.protocol import AuctionStartSynapse
 from metahash.utils.pretty_logs import pretty
@@ -184,6 +187,9 @@ class Runtime:
             self._rpc_lock = asyncio.Lock()
 
     async def get_current_block(self) -> int:
+        if DEBUG_ASYNC:
+            from metahash.utils.async_debug import loop_info_dict
+            log_init(LogLevel.DEBUG, "get_current_block entry", "chain", loop_info_dict("runtime.get_current_block"))
         await self._ensure_async_subtensor()
         st = self._async_subtensor
         now = __import__("time").time()
