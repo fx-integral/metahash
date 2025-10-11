@@ -138,35 +138,32 @@ class PortfolioService:
                 treasury_balances = {}
                 
                 # Get miner balances (simplified - would need actual balance queries)
+                bt.logging.info(f"💰 Processing {len(metagraph.axons)} miner axons...")
                 serving_axons = [axon for axon in metagraph.axons if axon.is_serving]
-                bt.logging.info(f"💰 Processing {len(serving_axons)} serving miners out of {len(metagraph.axons)} total axons...")
                 
-                if serving_axons:
-                    with tqdm(total=len(serving_axons), desc="Processing miners", unit="miner") as pbar:
-                        for uid, axon in enumerate(metagraph.axons):
-                            if axon.is_serving:
-                                coldkey = axon.coldkey
-                                # This would need actual balance queries from the blockchain
-                                # For now, using placeholder values
-                                tao_balance = 0.0  # Would query actual TAO balance
-                                alpha_balance = 0.0  # Would query actual alpha balance
-                                
-                                miner_balances[coldkey] = {
-                                    'tao': tao_balance,
-                                    'alpha': alpha_balance
-                                }
-                                
-                                total_tao += tao_balance
-                                total_alpha += alpha_balance
-                                
-                                pbar.update(1)
-                                pbar.set_postfix({
-                                    'tao': f"{total_tao:.2f}",
-                                    'alpha': f"{total_alpha:.2f}",
-                                    'miners': len(miner_balances)
-                                })
-                else:
-                    bt.logging.info("⚠️ No serving miners found in metagraph")
+                with tqdm(total=len(serving_axons), desc="Processing miners", unit="miner") as pbar:
+                    for uid, axon in enumerate(metagraph.axons):
+                        if axon.is_serving:
+                            coldkey = axon.coldkey
+                            # This would need actual balance queries from the blockchain
+                            # For now, using placeholder values
+                            tao_balance = 0.0  # Would query actual TAO balance
+                            alpha_balance = 0.0  # Would query actual alpha balance
+                            
+                            miner_balances[coldkey] = {
+                                'tao': tao_balance,
+                                'alpha': alpha_balance
+                            }
+                            
+                            total_tao += tao_balance
+                            total_alpha += alpha_balance
+                            
+                            pbar.update(1)
+                            pbar.set_postfix({
+                                'tao': f"{total_tao:.2f}",
+                                'alpha': f"{total_alpha:.2f}",
+                                'miners': len(miner_balances)
+                            })
                 
                 bt.logging.info(f"📈 Calculating subnet allocations...")
                 # Calculate subnet allocations (simplified)
