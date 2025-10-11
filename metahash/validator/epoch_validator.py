@@ -182,7 +182,7 @@ class EpochValidatorNeuron(BaseValidatorNeuron):
                         await self.concurrent_forward()
                     except Exception as err:
                         bt.logging.error(f"bootstrap forward() raised: {err}")
-                        raise err
+                        bt.logging.debug("bootstrap forward() traceback:", exc_info=True)
                     finally:
                         try:
                             self.sync()
@@ -218,7 +218,6 @@ class EpochValidatorNeuron(BaseValidatorNeuron):
                     # FIX: don't 'raise e' (undefined). Log and continue.
                     bt.logging.error(f"forward() raised: {err}")
                     bt.logging.debug("forward() traceback:", exc_info=True)
-                    raise err
                 finally:
                     try:
                         self.sync()

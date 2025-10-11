@@ -528,7 +528,15 @@ class AlphaTransfersScanner:
                 bn = await q.get()
                 if bn is None:
                     break
-                raw_events, extrinsics = await self._get_block(bn)
+                try:
+                    raw_events, extrinsics = await self._get_block(bn)
+                except Exception as err:
+                    bt.logging.error(
+                        f"[SCANNER] block {bn}: failed to fetch block data: {err}"
+                    )
+                    bt.logging.debug("[SCANNER] block fetch traceback:", exc_info=True)
+                    continue
+
                 allowed_idx = self._allowed_extrinsic_indices(extrinsics, bn)
                 # Normalize event rows to dicts; drop weird shapes/strings
                 cleaned = []
