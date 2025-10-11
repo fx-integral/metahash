@@ -66,13 +66,9 @@ class Payments:
         # Use separate AsyncSubtensor for payments (for parallel processing)
         self._payments_async_subtensor: Optional[bt.AsyncSubtensor] = payments_async_subtensor
 
-        # Background asyncio loop (daemon)
-        self._bg_loop: asyncio.AbstractEventLoop = asyncio.new_event_loop()
-        self._bg_thread = None
-
-        # Async primitives (created on loop)
+        # Use main event loop instead of background thread (PM2 compatible)
+        self._tasks: Dict[str, asyncio.Task] = {}
         self._pay_lock: Optional[asyncio.Lock] = None
-        self._tasks: Dict[str, Future[Any]] = {}
 
         # Payment config
         self._pay_cfg_initialized: bool = False
@@ -162,62 +158,52 @@ class Payments:
 
     # ---------------------- Background loop ----------------------
 
-    def _run_bg_loop(self):
-        asyncio.set_event_loop(self._bg_loop)
-        self._pay_lock = asyncio.Lock()
-        self._bg_loop.run_forever()
-
     def start_background_tasks(self):
-        if self._bg_thread is None:
-            import threading
-            self._bg_thread = threading.Thread(target=self._run_bg_loop, name="miner-payments-loop", daemon=True)
-            self._bg_thread.start()
-            log_init(LogLevel.MEDIUM, "Background payment thread started", "payments")
+        """Start payment tasks in the main event loop (PM2 compatible)."""
+        # Initialize lock in main event loop
+        if self._pay_lock is None:
+            self._pay_lock = asyncio.Lock()
+        
+        log_init(LogLevel.MEDIUM, "Starting payment tasks in main event loop", "payments")
+        
         # Fresh-start safety: when --fresh is set, ensure no stale invoices remain
-        # and skip auto-resume of pending payments for this boot.
         if bool(getattr(self.config, "fresh", False)):
             try:
                 # Clear any loaded wins (payments) so miner truly starts fresh
                 self.state.wins.clear()
                 # Persist the cleared state
-                self.submit(self.state.save_async())
+                asyncio.create_task(self.state.save_async())
                 log_init(LogLevel.MEDIUM, "--fresh: cleared in-memory wins and skipped resume", "payments")
             except Exception:
                 pass
         else:
             # resume unpaid + watchdog
-            self.submit(self._resume_pending_payments())
-        self.submit(self._pending_payments_watchdog())
+            asyncio.create_task(self._resume_pending_payments())
+            asyncio.create_task(self._pending_payments_watchdog())
 
     def shutdown_background(self):
-        log_init(LogLevel.MEDIUM, "Shutting down background payment tasks", "payments")
-        for fut in list(self._tasks.values()):
+        """Shutdown payment tasks (PM2 compatible)."""
+        log_init(LogLevel.MEDIUM, "Shutting down payment tasks", "payments")
+        for task in list(self._tasks.values()):
             try:
-                fut.cancel()
+                task.cancel()
             except Exception:
                 pass
-        try:
-            if self._bg_loop and not self._bg_loop.is_closed():
-                self._bg_loop.call_soon_threadsafe(self._bg_loop.stop)
-            if self._bg_thread and self._bg_thread.is_alive():
-                self._bg_thread.join(timeout=2)
-        except Exception as e:
-            log_init(LogLevel.HIGH, "Error during background task shutdown", "payments", {"error": str(e)})
 
-    def submit(self, coro: Coroutine[Any, Any, Any]) -> Future[Any]:
+    def submit(self, coro: Coroutine[Any, Any, Any]) -> asyncio.Task:
+        """Submit coroutine to main event loop (PM2 compatible)."""
         if not asyncio.iscoroutine(coro):
             raise TypeError("Expected coroutine in submit()")
-        if not self._bg_loop or self._bg_loop.is_closed():
-            raise RuntimeError("Background loop not running")
-        fut = asyncio.run_coroutine_threadsafe(coro, self._bg_loop)
-
-        def _log_exc(f: Future[Any]) -> None:
+        
+        task = asyncio.create_task(coro)
+        
+        def _log_exc(task: asyncio.Task) -> None:
             try:
-                f.result()
+                task.result()
             except Exception as e:
                 pretty.log(f"[yellow]Unhandled task exception[/yellow]: {e}")
-        fut.add_done_callback(_log_exc)
-        return fut
+        task.add_done_callback(_log_exc)
+        return task
 
     # ---------------------- Payment config ----------------------
 
@@ -358,8 +344,8 @@ class Payments:
         inv.last_response = f"scheduled (wait ≥{self._pay_start_safety_blocks} blk)"
         self.submit(self.state.save_async())
 
-        fut = self.submit(self._payment_worker(inv))
-        self._tasks[tid] = fut
+        task = self.submit(self._payment_worker(inv))
+        self._tasks[tid] = task
 
         # Enhanced payment scheduling information
         log_settlement(LogLevel.MEDIUM, "Payment scheduled successfully", "scheduling", {
@@ -695,9 +681,9 @@ class Payments:
             )
             return
         finally:
-            t = self._tasks.get(inv.invoice_id)
+            task = self._tasks.get(inv.invoice_id)
             try:
-                if t and t.done():
+                if task and task.done():
                     self._tasks.pop(inv.invoice_id, None)
             except Exception:
                 self._tasks.pop(inv.invoice_id, None)

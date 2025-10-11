@@ -1,0 +1,105 @@
+{
+  "6626385": {
+    "block_number": 6626385,
+    "timestamp": "2025-10-11T07:20:44.999991",
+    "data": {
+      "block_number": 6626385,
+      "timestamp": "2025-10-11T07:20:44.999457",
+      "total_tao": 0.0,
+      "total_alpha": 0.0,
+      "subnet_allocations": {
+        "1": {
+          "tao": 0.0,
+          "alpha": 0.0,
+          "percentage": 50.0
+        }
+      },
+      "miner_balances": {
+        "5EhQWxcFdYAk7B9tNdQnJQFzww5N3964rbsMk55SujcX3PwM": {
+          "tao": 0.0,
+          "alpha": 0.0
+        },
+        "5GghBginBdcGovMvCTZgaTogWMik7iZXR2n8GLfi7XU3huCu": {
+          "tao": 0.0,
+          "alpha": 0.0
+        },
+        "5EFKykkD8EAzM6XPftYrEnSEnx7KjKkrTactuKZcZVgLGsfs": {
+          "tao": 0.0,
+          "alpha": 0.0
+        },
+        "5CoRXrWzSQKrRzibFoLF39fKRUmvF2mMZKDvDexfWNR4ikQQ": {
+          "tao": 0.0,
+          "alpha": 0.0
+        },
+        "5CiWXet9yiaQg8GZJW2cb7bF9DBdcLLubuy1RX2m1kGvqLxS": {
+          "tao": 0.0,
+          "alpha": 0.0
+        },
+        "5FbWR9zv9vpszGfgJ8ZsQk78nP6aQ2iHFcxDCyJDGfJnXoXi": {
+          "tao": 0.0,
+          "alpha": 0.0
+        },
+        "5FRakAmbnqMnVQ11BLMh3Gusu3DDbvKdTUZRSBWgnZiyu4oZ": {
+          "tao": 0.0,
+          "alpha": 0.0
+        },
+        "5CZozhBvEze4zrDAbr46VBxbGJT43CHTjdm7rXrYW3jM1XEa": {
+          "tao": 0.0,
+          "alpha": 0.0
+        },
+        "5FuzgvtfbZWdKSRxyYVPAPYNaNnf9cMnpT7phL3s2T3Kkrzo": {
+          "tao": 0.0,
+          "alpha": 0.0
+        },
+        "5GMvxt8nmoqBxcQhowzjNs9qUKgUWLAB7mKbAmi8i85ouJ18": {
+          "tao": 0.0,
+          "alpha": 0.0
+        },
+        "5GCC4DPduC2Bcz1kAKyQw8tqg7aGe8bcJyBs25wQnmmgpinm": {
+          "tao": 0.0,
+          "alpha": 0.0
+        },
+        "5FHxxe8ZKYaNmGcSLdG5ekxXeZDhQnk9cbpHdsJW8RunGpSs": {
+          "tao": 0.0,
+          "alpha": 0.0
+        },
+        "5DyMLUKuc6T3QFAXKd3w6dTcxmcH1WBZ1gDrRwJAnPf7N28w": {
+          "tao": 0.0,
+          "alpha": 0.0
+        },
+        "5GZSAgaVGQqegjhEkxpJjpSVLVmNnE2vx2PFLzr7kBBMKpGQ": {
+          "tao": 0.0,
+          "alpha": 0.0
+        },
+        "5E9fVY1jexCNVMjd2rdBsAxeamFGEMfzHcyTn2fHgdHeYc5p": {
+          "tao": 0.0,
+          "alpha": 0.0
+        },
+        "5Dw1yYA9wLo2zKbDUmcUJt5exa6JCy83ah3n24xkLsR1aFh7": {
+          "tao": 0.0,
+          "alpha": 0.0
+        },
+        "5FhLctVatGhR5yv7rbRrg1aXjZ5uirtvxfW3xGUyueffcAki": {
+          "tao": 0.0,
+          "alpha": 0.0
+        },
+        "5FZFxZFeHC4AzPDtufGg9m3bP9pfh9h5syzaZbJt2Ckk1ssd": {
+          "tao": 0.0,
+          "alpha": 0.0
+        },
+        "5FRXwb2qsEhqDQQKcm5m2MF26xTWwW65MHTEtKFFydypuqjG": {
+          "tao": 0.0,
+          "alpha": 0.0
+        },
+        "5Eq8b9p6zJMjEXyH9sX4DRMYspnUyorEKq3Zmha1WN6AC4sf": {
+          "tao": 0.0,
+          "alpha": 0.0
+        }
+      },
+      "treasury_balances": {},
+      "total_budget": 0.0,
+      "used_budget": 0.0,
+      "available_budget": 0.0
+    }
+  }
+}

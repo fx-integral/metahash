@@ -23,6 +23,8 @@ from metahash.miner.logging import (
 from metahash.miner.state import StateStore
 from metahash.miner.runtime import Runtime
 from metahash.miner.payments import Payments
+from metahash.miner.autosell import AutoSellManager, AutoSellConfig
+from metahash.miner.bidding_control import BiddingController, BiddingControlConfig
 
 
 def _strip_internals_inplace(syn: Any) -> None:
@@ -152,6 +154,14 @@ class Miner(BaseMinerNeuron):
         self.state.load()
         self.state.treasuries = dict(VALIDATOR_TREASURIES)  # re-pin allowlist
 
+        # ---------------------- Bidding Controller (needed for runtime) ----------------------
+        log_init(LogLevel.MEDIUM, "Initializing bidding controller", "bidding_control")
+        self.bidding_control_config = self._build_bidding_control_config()
+        self.bidding_controller = BiddingController(
+            config=self.bidding_control_config,
+            state_store=self.state
+        )
+
         # ---------------------- Runtime & Payments ----------------------
         log_init(LogLevel.MEDIUM, "Initializing runtime component", "runtime")
         self.runtime = Runtime(
@@ -160,6 +170,7 @@ class Miner(BaseMinerNeuron):
             metagraph=self.metagraph,
             state=self.state,
             shared_async_subtensor=self.shared_async_subtensor,
+            bidding_controller=self.bidding_controller,
         )
 
         # Initialize separate AsyncSubtensor for payments
@@ -236,10 +247,46 @@ class Miner(BaseMinerNeuron):
         except Exception as _e:
             log_init(LogLevel.HIGH, "Eager scheduling skipped", "payments", {"error": str(_e)})
 
-        log_init(LogLevel.MEDIUM, "Starting background payment tasks", "payments")
-        self.payments.start_background_tasks()
+        log_init(LogLevel.MEDIUM, "Payment system initialized (will start in main loop)", "payments")
+        
+        # ---------------------- Auto-Sell Manager ----------------------
+        log_init(LogLevel.MEDIUM, "Initializing auto-sell manager", "autosell")
+        self.autosell_config = self._build_autosell_config()
+        self.autosell_manager = AutoSellManager(
+            config=self.autosell_config,
+            wallet=self.wallet,
+            runtime=self.runtime
+        )
+        
+        # Auto-sell will start in main event loop (PM2 compatible)
+        if self.autosell_config.enabled:
+            log_init(LogLevel.MEDIUM, "Auto-sell manager initialized (will start in main loop)", "autosell")
+        else:
+            log_init(LogLevel.MEDIUM, "Auto-sell manager initialized (disabled)", "autosell")
         
         log_init(LogLevel.MEDIUM, "Miner initialization completed successfully", "main")
+
+    def _build_autosell_config(self) -> AutoSellConfig:
+        """Build AutoSellConfig from miner configuration."""
+        return AutoSellConfig(
+            enabled=getattr(self.config, 'autosell.enabled', False),
+            keep_alpha=getattr(self.config, 'autosell.keep_alpha', 0.0),
+            subnet_id=getattr(self.config, 'autosell.subnet_id', 73),
+            check_interval=getattr(self.config, 'autosell.check_interval', 30.0),
+            max_retries=getattr(self.config, 'autosell.max_retries', 3),
+            wait_for_inclusion=getattr(self.config, 'autosell.wait_for_inclusion', True),
+            wait_for_finalization=getattr(self.config, 'autosell.wait_for_finalization', False),
+            period=getattr(self.config, 'autosell.period', 512),
+            total_alpha_target=getattr(self.config, 'autosell.total_alpha_target', 0.0)
+        )
+
+    def _build_bidding_control_config(self) -> BiddingControlConfig:
+        """Build BiddingControlConfig from miner configuration."""
+        return BiddingControlConfig(
+            max_total_alpha=getattr(self.config, 'bidding.max_total_alpha', 0.0),
+            min_stake_alpha=getattr(self.config, 'bidding.min_stake_alpha', 0.0),
+            stop_on_low_stake=getattr(self.config, 'bidding.stop_on_low_stake', False)
+        )
 
     # ---------------------- Shared AsyncSubtensor ----------------------
     
@@ -347,7 +394,28 @@ class Miner(BaseMinerNeuron):
             "epoch": getattr(synapse, "epoch_index", "unknown")
         })
         _strip_internals_inplace(synapse)
-        out = await self.runtime.handle_auction_start(synapse, self.lines)
+        
+        # Auto-sell monitoring runs in background via main event loop
+        
+        # Use timeout to prevent auction processing from blocking other requests
+        try:
+            out = await asyncio.wait_for(
+                self.runtime.handle_auction_start(synapse, self.lines),
+                timeout=3.0  # 3 second timeout for auction processing
+            )
+        except asyncio.TimeoutError:
+            log_auction(LogLevel.HIGH, "Auction processing timed out, returning empty response", "handler", {
+                "validator_uid": getattr(synapse, "validator_uid", "unknown"),
+                "epoch": getattr(synapse, "epoch_index", "unknown")
+            })
+            # Return empty response to avoid blocking
+            synapse.ack = True
+            synapse.retries_attempted = 0
+            synapse.bids = []
+            synapse.bids_sent = 0
+            synapse.note = "auction processing timeout"
+            out = synapse
+        
         _strip_internals_inplace(out)
         return out
 
@@ -361,7 +429,25 @@ class Miner(BaseMinerNeuron):
             "subnet_id": getattr(synapse, "subnet_id", "unknown"),
             "accepted_alpha": getattr(synapse, "accepted_alpha", "unknown")
         })
-        synapse = await self.payments.handle_win(synapse)
+        
+        # Use timeout to prevent win processing from blocking other requests
+        try:
+            synapse = await asyncio.wait_for(
+                self.payments.handle_win(synapse),
+                timeout=1.0  # 1 second timeout for win processing (should be fast)
+            )
+        except asyncio.TimeoutError:
+            log_commitments(LogLevel.HIGH, "Win processing timed out, returning error response", "handler", {
+                "validator_uid": getattr(synapse, "validator_uid", "unknown"),
+                "subnet_id": getattr(synapse, "subnet_id", "unknown")
+            })
+            # Return error response to avoid blocking
+            synapse.ack = False
+            synapse.payment_attempted = False
+            synapse.payment_ok = False
+            synapse.attempts = 0
+            synapse.last_response = "win processing timeout"
+        
         _strip_internals_inplace(synapse)
         return synapse
 
@@ -380,7 +466,14 @@ class Miner(BaseMinerNeuron):
         try:
             self.payments.shutdown_background()
         except Exception as e:
-            log_init(LogLevel.HIGH, "Error during shutdown", "shutdown", {"error": str(e)})
+            log_init(LogLevel.HIGH, "Error during payments shutdown", "shutdown", {"error": str(e)})
+        
+        try:
+            if hasattr(self, 'autosell_manager') and self.autosell_manager:
+                # Auto-sell shutdown is handled by task cancellation in main event loop
+                log_init(LogLevel.MEDIUM, "Auto-sell shutdown handled by main event loop", "shutdown")
+        except Exception as e:
+            log_init(LogLevel.HIGH, "Error during auto-sell shutdown", "shutdown", {"error": str(e)})
         finally:
             return super().__exit__(exc_type, exc, tb)
 

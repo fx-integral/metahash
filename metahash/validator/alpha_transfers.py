@@ -112,18 +112,21 @@ def _encode_ss58(raw: Optional[bytes], fmt: int) -> Optional[str]:  # noqa: D401
         out = _ss58_encode_generic(raw, fmt)  # some versions accept pubkey bytes here
         return out
     except Exception as e1:
+        pass
 
     # 2) Try explicit keywords (pubkey=..., address_type=...)
     try:
         out = _ss58_encode_generic(pubkey=raw, address_type=fmt)  # substrate-interface style
         return out
     except Exception as e2:
+        pass
 
     # 3) Try hex "address" path that some scalecodec versions expect
     try:
         out = _ss58_encode_generic(address="0x" + raw.hex(), address_type=fmt)
         return out
     except Exception as e3:
+        pass
 
     # 4) Last resort: give up quietly; caller will drop the event if None
     return None
@@ -228,7 +231,9 @@ def _account_id(obj) -> bytes | None:  # noqa: ANN001,D401
             if isinstance(b, (bytes, bytearray)) and len(b) == 32:
                 return b
             else:
+                pass
         except Exception as e:
+            pass
         
         # Try with different SS58 formats as fallback
         for fmt in [42, 0, 2]:  # Common SS58 formats
@@ -243,6 +248,7 @@ def _account_id(obj) -> bytes | None:  # noqa: ANN001,D401
                 if isinstance(b, (bytes, bytearray)) and len(b) == 32:
                     return b
                 else:
+                    pass
             except Exception as fmt_e:
                 continue
         return None
@@ -619,11 +625,11 @@ class AlphaTransfersScanner:
                 continue  # ignore system events
             bucket = scratch.setdefault(idx, {})
             fields = _event_fields(ev)
-                # Normalize dict-like fields to a list of values for downstream helpers
-                if isinstance(fields, dict):
-                    fields = list(fields.values())
-                else:
-                    fields = ()
+            # Normalize dict-like fields to a list of values for downstream helpers
+            if isinstance(fields, dict):
+                fields = list(fields.values())
+            else:
+                fields = ()
 
             if name == "StakeRemoved":
                 bucket["src_amt"] = _amount_from_stake_removed(fields)

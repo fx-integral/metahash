@@ -31,7 +31,7 @@ def parse_discount_token(tok: str) -> int:
             bps = int(float(t[:-3]))
             return max(0, min(10_000, bps))
         except Exception:
-            pass
+            return 0  # Return 0 instead of None
     try:
         val = float(t)
     except Exception:
@@ -75,11 +75,12 @@ class Runtime:
       - AuctionStart handling (including per-target-subnet stake gate)
     """
 
-    def __init__(self, config, wallet, metagraph, state: StateStore, shared_async_subtensor=None):
+    def __init__(self, config, wallet, metagraph, state: StateStore, shared_async_subtensor=None, bidding_controller=None):
         self.config = config
         self.wallet = wallet
         self.metagraph = metagraph
         self.state = state
+        self.bidding_controller = bidding_controller
 
         # Use shared AsyncSubtensor from miner instead of creating our own
         self._async_subtensor: Optional[bt.AsyncSubtensor] = shared_async_subtensor
@@ -127,6 +128,15 @@ class Runtime:
         lines: List[BidLine] = []
         skipped_count = 0
         for sid, amt, disc in zip(netuids, amounts, discounts):
+            log_init(LogLevel.DEBUG, "Processing config values", "config", {
+                "sid": sid,
+                "sid_type": type(sid).__name__,
+                "amt": amt,
+                "amt_type": type(amt).__name__,
+                "disc": disc,
+                "disc_type": type(disc).__name__
+            })
+            
             if amt <= 0:
                 log_init(LogLevel.HIGH, "Skipping non-positive amount", "config", {
                     "subnet_id": sid,
@@ -141,6 +151,12 @@ class Runtime:
                 })
                 skipped_count += 1
                 continue
+            
+            log_init(LogLevel.DEBUG, "Creating BidLine", "config", {
+                "subnet_id": int(sid),
+                "alpha": float(amt),
+                "discount_bps": int(disc)
+            })
             lines.append(BidLine(subnet_id=int(sid), alpha=float(amt), discount_bps=int(disc)))
         
         log_init(LogLevel.MEDIUM, "Bid lines built successfully", "config", {
@@ -495,17 +511,17 @@ class Runtime:
                 except Exception:
                     cfg_validators = []
                 
-                # Use timeout to prevent blocking auction processing
+                # Use very short timeout to prevent blocking auction processing
                 try:
                     if cfg_validators:
                         stake_by_subnet = await asyncio.wait_for(
                             self.get_multi_validator_stakes_map(cfg_validators, candidate_subnets),
-                            timeout=2.0  # 2 second timeout
+                            timeout=0.5  # 500ms timeout - very aggressive
                         )
                     else:
                         stake_by_subnet = await asyncio.wait_for(
                             self.get_validator_stakes_map(caller_hot or vkey, candidate_subnets),
-                            timeout=2.0  # 2 second timeout
+                            timeout=0.5  # 500ms timeout - very aggressive
                         )
                     # Use the new clean stake summary method
                     miner_logger.stake_summary(stake_by_subnet, min_stake_alpha)
@@ -513,13 +529,13 @@ class Runtime:
                     # If stake check times out, assume sufficient stake to allow bidding
                     stake_by_subnet = {int(s): float('inf') for s in candidate_subnets}
                     log_auction(LogLevel.HIGH, "Stake check timed out, allowing bids to proceed", "stake", {
-                        "timeout_seconds": 2.0,
+                        "timeout_seconds": 0.5,
                         "candidate_subnets": candidate_subnets
                     })
                     miner_logger.phase_panel(
                         MinerPhase.AUCTION, "Stake Check Timeout",
                         [
-                            ("timeout", "2.0s"),
+                            ("timeout", "0.5s"),
                             ("action", "allowing bids"),
                             ("subnets", str(candidate_subnets)),
                         ],
@@ -587,18 +603,45 @@ class Runtime:
         })
         
         for ln in lines:
-            # skip disabled subnets proactively
+            # Add detailed logging for debugging None comparisons
+            log_auction(LogLevel.DEBUG, "Processing bid line", "bidding", {
+                "subnet_id": ln.subnet_id,
+                "subnet_id_type": type(ln.subnet_id).__name__,
+                "alpha": ln.alpha,
+                "alpha_type": type(ln.alpha).__name__,
+                "discount_bps": ln.discount_bps,
+                "discount_bps_type": type(ln.discount_bps).__name__
+            })
+            
+            # Ensure subnet_id is not None and skip disabled subnets proactively
+            if ln.subnet_id is None:
+                log_auction(LogLevel.HIGH, "Invalid subnet_id - skipping line", "bidding", {
+                    "subnet_id": ln.subnet_id
+                })
+                continue
             if self.state.is_subnet_disabled(int(ln.subnet_id)):
                 log_auction(LogLevel.MEDIUM, "Bid skipped - subnet disabled", "bidding", {
                     "subnet_id": int(ln.subnet_id)
                 })
                 continue
+            # Ensure alpha is not None and is valid
+            if ln.alpha is None:
+                log_auction(LogLevel.HIGH, "Alpha is None, setting to 0.0", "bidding", {
+                    "subnet_id": ln.subnet_id
+                })
+                ln.alpha = 0.0
             if not isfinite(ln.alpha) or ln.alpha <= 0:
                 log_auction(LogLevel.HIGH, "Invalid alpha - skipping line", "bidding", {
                     "subnet_id": ln.subnet_id,
                     "alpha": ln.alpha
                 })
                 continue
+            # Ensure discount_bps is not None and is valid
+            if ln.discount_bps is None:
+                log_auction(LogLevel.HIGH, "Discount_bps is None, setting to 0", "bidding", {
+                    "subnet_id": ln.subnet_id
+                })
+                ln.discount_bps = 0
             if not (0 <= ln.discount_bps <= 10_000):
                 log_auction(LogLevel.HIGH, "Invalid discount - skipping line", "bidding", {
                     "subnet_id": ln.subnet_id,
@@ -608,8 +651,23 @@ class Runtime:
 
             subnet_id = int(ln.subnet_id)
             weight_bps = weights_bps.get(subnet_id, 10_000)
+            
+            # Ensure weight_bps is not None
+            if weight_bps is None:
+                log_auction(LogLevel.HIGH, "Weight_bps is None, setting to 10_000", "bidding", {
+                    "subnet_id": subnet_id
+                })
+                weight_bps = 10_000
 
             available = float(remaining_by_subnet.get(subnet_id, 0.0))
+            
+            log_auction(LogLevel.DEBUG, "Bid line values after validation", "bidding", {
+                "subnet_id": subnet_id,
+                "weight_bps": weight_bps,
+                "weight_bps_type": type(weight_bps).__name__,
+                "available": available,
+                "available_type": type(available).__name__
+            })
             if available <= 0.0:
                 log_auction(LogLevel.HIGH, "Bid skipped - insufficient delegated stake", "bidding", {
                     "subnet_id": subnet_id,
@@ -625,7 +683,63 @@ class Runtime:
 
             send_alpha = min(float(ln.alpha), available)
             remaining_by_subnet[subnet_id] = max(0.0, available - send_alpha)
+            
+            log_auction(LogLevel.DEBUG, "Calculated bid amounts", "bidding", {
+                "subnet_id": subnet_id,
+                "send_alpha": send_alpha,
+                "send_alpha_type": type(send_alpha).__name__,
+                "remaining": remaining_by_subnet[subnet_id]
+            })
 
+            # Check bidding control constraints
+            if self.bidding_controller:
+                # Get current alpha balance for bidding control (not delegated stake)
+                try:
+                    current_alpha_balance = await self.get_alpha_balance(subnet_id, self.wallet.hotkey.ss58_address)
+                    if current_alpha_balance is None:
+                        current_alpha_balance = available  # Fallback to available if we can't get balance
+                except Exception:
+                    current_alpha_balance = available  # Fallback to available on error
+                
+                # Ensure current_alpha_balance is not None before passing to bidding controller
+                if current_alpha_balance is None:
+                    log_auction(LogLevel.HIGH, "Current_alpha_balance is None, setting to 0.0", "bidding", {
+                        "subnet_id": subnet_id
+                    })
+                    current_alpha_balance = 0.0  # Safe fallback
+                
+                log_auction(LogLevel.DEBUG, "Calling bidding controller", "bidding", {
+                    "subnet_id": subnet_id,
+                    "current_alpha_balance": current_alpha_balance,
+                    "current_alpha_balance_type": type(current_alpha_balance).__name__,
+                    "send_alpha": send_alpha,
+                    "send_alpha_type": type(send_alpha).__name__
+                })
+                
+                should_bid, reason = self.bidding_controller.should_bid(current_alpha_balance, send_alpha)
+                if not should_bid:
+                    log_auction(LogLevel.MEDIUM, "Bid skipped - bidding control", "bidding", {
+                        "subnet_id": subnet_id,
+                        "cfg_alpha": ln.alpha,
+                        "available_alpha": available,
+                        "reason": reason
+                    })
+                    miner_logger.phase_panel(
+                        MinerPhase.AUCTION, "Bid Skipped – Bidding Control",
+                        [("subnet", subnet_id), ("cfg α", f"{ln.alpha:.4f}"), ("available α", f"{available:.4f}"), ("reason", reason)],
+                        LogLevel.MEDIUM
+                    )
+                    continue
+                
+                # If partial bid is allowed, adjust the amount
+                if "Partial bid allowed" in reason:
+                    # Extract the max amount from the reason
+                    if "remaining:" in reason:
+                        remaining = float(reason.split("remaining:")[1].strip())
+                        send_alpha = min(send_alpha, remaining)
+                    elif "max:" in reason:
+                        max_bid = float(reason.split("max:")[1].strip())
+                        send_alpha = min(send_alpha, max_bid)
 
             # ln.discount_bps is the discount the miner wants to pay vs current price
             # subnet_weight < 1.0 means validator already applies a discount (weight discount)
@@ -664,6 +778,10 @@ class Runtime:
             out_bids.append((int(subnet_id), float(send_alpha), int(send_disc_bps), str(bid_id)))
 
             self.state.remember_bid(vkey, epoch, subnet_id, send_alpha, send_disc_bps)
+
+            # Record bid in bidding controller
+            if self.bidding_controller:
+                self.bidding_controller.record_bid(send_alpha, subnet_id, epoch)
 
             rows_sent.append([
                 subnet_id,
