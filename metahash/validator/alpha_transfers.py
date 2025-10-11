@@ -111,7 +111,7 @@ def _encode_ss58(raw: Optional[bytes], fmt: int) -> Optional[str]:  # noqa: D401
     # 1) Try the common positional (pubkey, fmt)
     try:
         out = _ss58_encode_generic(raw, fmt)  # some versions accept pubkey bytes here
-        bt.logging.debug("[SS58] encode path=positional(pubkey,fmt) ok")
+        # bt.logging.debug("[SS58] encode path=positional(pubkey,fmt) ok")
         return out
     except Exception as e1:
         bt.logging.debug(f"[SS58] encode path=positional failed: {type(e1).__name__}: {str(e1)[:120]}")
@@ -119,7 +119,7 @@ def _encode_ss58(raw: Optional[bytes], fmt: int) -> Optional[str]:  # noqa: D401
     # 2) Try explicit keywords (pubkey=..., address_type=...)
     try:
         out = _ss58_encode_generic(pubkey=raw, address_type=fmt)  # substrate-interface style
-        bt.logging.debug("[SS58] encode path=keywords(pubkey=,address_type=) ok")
+        # bt.logging.debug("[SS58] encode path=keywords(pubkey=,address_type=) ok")
         return out
     except Exception as e2:
         bt.logging.debug(f"[SS58] encode path=keywords(pubkey=,address_type=) failed: {type(e2).__name__}: {str(e2)[:120]}")
@@ -127,7 +127,7 @@ def _encode_ss58(raw: Optional[bytes], fmt: int) -> Optional[str]:  # noqa: D401
     # 3) Try hex "address" path that some scalecodec versions expect
     try:
         out = _ss58_encode_generic(address="0x" + raw.hex(), address_type=fmt)
-        bt.logging.debug("[SS58] encode path=keywords(address=hex,address_type=) ok")
+        # bt.logging.debug("[SS58] encode path=keywords(address=hex,address_type=) ok")
         return out
     except Exception as e3:
         bt.logging.debug(f"[SS58] encode path=keywords(address=,address_type=) failed: {type(e3).__name__}: {str(e3)[:120]}")
@@ -234,7 +234,7 @@ def _account_id(obj) -> bytes | None:  # noqa: ANN001,D401
         try:
             b = _decode_ss58(s)
             if isinstance(b, (bytes, bytearray)) and len(b) == 32:
-                bt.logging.debug(f"[SCANNER] SS58 decode succeeded with default format for '{s}'")
+                # bt.logging.debug(f"[SCANNER] SS58 decode succeeded with default format for '{s}'")
                 return b
             else:
                 bt.logging.debug(f"[SCANNER] SS58 decode returned invalid result for '{s}': {type(b)} len={len(b) if hasattr(b, '__len__') else 'N/A'}")
@@ -252,7 +252,7 @@ def _account_id(obj) -> bytes | None:  # noqa: ANN001,D401
                     else:
                         b = bytes.fromhex(b)
                 if isinstance(b, (bytes, bytearray)) and len(b) == 32:
-                    bt.logging.debug(f"[SCANNER] SS58 decode succeeded with format {fmt} for '{s}'")
+                    # bt.logging.debug(f"[SCANNER] SS58 decode succeeded with format {fmt} for '{s}'")
                     return b
                 else:
                     bt.logging.debug(f"[SCANNER] SS58 decode with format {fmt} returned invalid result for '{s}': {type(b)} len={len(b) if hasattr(b, '__len__') else 'N/A'}")
@@ -471,25 +471,9 @@ class AlphaTransfersScanner:
         events = await self._rpc(self.st.substrate.get_events, block_hash=bh_str)
         blk = await self._rpc(self.st.substrate.get_block, block_hash=bh_str)
         
-        bt.logging.debug(
-            f"[SCANNER] _get_block types: events={type(events).__name__} blk={type(blk).__name__}"
-        )
-
-        # Log detailed structure of events
-        if events:
-            bt.logging.debug(f"[SCANNER] events count: {len(events)}")
-            if len(events) > 0:
-                sample_event = events[0]
-                bt.logging.debug(f"[SCANNER] sample event type: {type(sample_event).__name__}")
-                if isinstance(sample_event, dict):
-                    bt.logging.debug(f"[SCANNER] sample event keys: {list(sample_event.keys())}")
-                    if "event" in sample_event:
-                        evt = sample_event["event"]
-                        bt.logging.debug(f"[SCANNER] event.event type: {type(evt).__name__}")
-                        if isinstance(evt, dict):
-                            bt.logging.debug(f"[SCANNER] event.event keys: {list(evt.keys())}")
-                        elif hasattr(evt, '__dict__'):
-                            bt.logging.debug(f"[SCANNER] event.event attrs: {list(evt.__dict__.keys())}")
+        # Reduced logging - only log block processing errors
+        if not events:
+            bt.logging.debug(f"[SCANNER] No events found in block {bn}")
 
         # Normalize events to a list of dict-ish items
         if not isinstance(events, list):
@@ -656,9 +640,9 @@ class AlphaTransfersScanner:
                     bt.logging.debug(f"[SCANNER] Skipping {name} event with no extrinsic_idx (system event)")
                 continue  # ignore system events
             bucket = scratch.setdefault(idx, {})
-            # Log all stake-related events we're processing
-            if name in {"StakeRemoved", "StakeAdded", "StakeTransferred"}:
-                bt.logging.debug(f"[SCANNER] Processing {name} event at extrinsic_idx {idx}")
+            # Reduced logging for stake-related events
+            # if name in {"StakeRemoved", "StakeAdded", "StakeTransferred"}:
+            #     bt.logging.debug(f"[SCANNER] Processing {name} event at extrinsic_idx {idx}")
             fields = _event_fields(ev)
             if not isinstance(fields, (list, tuple)):
                 if name in {"StakeRemoved", "StakeAdded", "StakeTransferred"}:
@@ -693,7 +677,7 @@ class AlphaTransfersScanner:
                         raw = _account_id(v)
                         if raw is not None:
                             bucket["src_raw"] = raw
-                            bt.logging.debug(f"[SCANNER] Found src_raw from StakeRemoved: {raw.hex()[:16]}...")
+                            # bt.logging.debug(f"[SCANNER] Found src_raw from StakeRemoved: {raw.hex()[:16]}...")
                             break
             elif name == "StakeAdded":
                 bucket["dst_amt"] = _amount_from_stake_added(fields)
@@ -709,20 +693,20 @@ class AlphaTransfersScanner:
                         raw = _account_id(v)
                         if raw is not None:
                             bucket["dst_raw"] = raw
-                            bt.logging.debug(f"[SCANNER] Found dst_raw from StakeAdded: {raw.hex()[:16]}...")
+                            # bt.logging.debug(f"[SCANNER] Found dst_raw from StakeAdded: {raw.hex()[:16]}...")
                             break
             elif name == "StakeTransferred":
                 seen += 1
-                # Log the exact structure of StakeTransferred events for debugging
-                bt.logging.debug(f"[SCANNER] StakeTransferred fields type: {type(fields).__name__}")
-                if isinstance(fields, dict):
-                    bt.logging.debug(f"[SCANNER] StakeTransferred dict keys: {list(fields.keys())}")
-                    for k, v in fields.items():
-                        bt.logging.debug(f"[SCANNER] StakeTransferred.{k}: {type(v).__name__} = {v}")
-                elif isinstance(fields, (list, tuple)):
-                    bt.logging.debug(f"[SCANNER] StakeTransferred list length: {len(fields)}")
-                    for i, field in enumerate(fields):
-                        bt.logging.debug(f"[SCANNER] StakeTransferred[{i}]: {type(field).__name__} = {field}")
+                # Reduced logging for StakeTransferred events
+                # bt.logging.debug(f"[SCANNER] StakeTransferred fields type: {type(fields).__name__}")
+                # if isinstance(fields, dict):
+                #     bt.logging.debug(f"[SCANNER] StakeTransferred dict keys: {list(fields.keys())}")
+                #     for k, v in fields.items():
+                #         bt.logging.debug(f"[SCANNER] StakeTransferred.{k}: {type(v).__name__} = {v}")
+                # elif isinstance(fields, (list, tuple)):
+                #     bt.logging.debug(f"[SCANNER] StakeTransferred list length: {len(fields)}")
+                #     for i, field in enumerate(fields):
+                #         bt.logging.debug(f"[SCANNER] StakeTransferred[{i}]: {type(field).__name__} = {field}")
                 
                 bucket["te"] = _parse_stake_transferred(fields, self.ss58_format)
                 # Also try to record raw accounts from this event directly if present
@@ -732,13 +716,13 @@ class AlphaTransfersScanner:
                         candidates.extend(fields)
                     elif isinstance(fields, dict):
                         candidates.extend(fields.values())
-                    bt.logging.debug(f"[SCANNER] Checking {len(candidates)} candidates for src_raw")
+                    # bt.logging.debug(f"[SCANNER] Checking {len(candidates)} candidates for src_raw")
                     for i, v in enumerate(candidates):
                         raw = _account_id(v)
-                        bt.logging.debug(f"[SCANNER] Candidate[{i}]: {type(v).__name__} = {v} -> raw: {raw.hex()[:16] if raw else None}")
+                        # bt.logging.debug(f"[SCANNER] Candidate[{i}]: {type(v).__name__} = {v} -> raw: {raw.hex()[:16] if raw else None}")
                         if raw is not None:
                             bucket["src_raw"] = raw
-                            bt.logging.debug(f"[SCANNER] Found src_raw from StakeTransferred: {raw.hex()[:16]}...")
+                            # bt.logging.debug(f"[SCANNER] Found src_raw from StakeTransferred: {raw.hex()[:16]}...")
                             break
                 if "dst_raw" not in bucket:
                     candidates = []
@@ -746,15 +730,15 @@ class AlphaTransfersScanner:
                         candidates.extend(fields)
                     elif isinstance(fields, dict):
                         candidates.extend(fields.values())
-                    bt.logging.debug(f"[SCANNER] Checking {len(candidates)} candidates for dst_raw")
+                    # bt.logging.debug(f"[SCANNER] Checking {len(candidates)} candidates for dst_raw")
                     for i, v in enumerate(candidates):
                         raw = _account_id(v)
-                        bt.logging.debug(f"[SCANNER] Candidate[{i}]: {type(v).__name__} = {v} -> raw: {raw.hex()[:16] if raw else None}")
+                        # bt.logging.debug(f"[SCANNER] Candidate[{i}]: {type(v).__name__} = {v} -> raw: {raw.hex()[:16] if raw else None}")
                         if raw is not None:
                             # do not overwrite src_raw if only one account found
                             if "src_raw" in bucket and bucket["src_raw"] != raw:
                                 bucket["dst_raw"] = raw
-                                bt.logging.debug(f"[SCANNER] Found dst_raw from StakeTransferred: {raw.hex()[:16]}...")
+                                # bt.logging.debug(f"[SCANNER] Found dst_raw from StakeTransferred: {raw.hex()[:16]}...")
                                 break
 
             te: TransferEvent | None = bucket.get("te")
@@ -779,10 +763,10 @@ class AlphaTransfersScanner:
                 # Only apply if we don't already have values
                 if te.src_coldkey_raw is None and a is not None:
                     te = replace(te, src_coldkey_raw=a, src_coldkey=_encode_ss58(a, self.ss58_format))
-                    bt.logging.debug(f"[SCANNER] Found src_raw from extrinsic: {a.hex()[:16]}...")
+                    # bt.logging.debug(f"[SCANNER] Found src_raw from extrinsic: {a.hex()[:16]}...")
                 if te.dest_coldkey_raw is None and b is not None and b != (te.src_coldkey_raw or a):
                     te = replace(te, dest_coldkey_raw=b, dest_coldkey=_encode_ss58(b, self.ss58_format))
-                    bt.logging.debug(f"[SCANNER] Found dst_raw from extrinsic: {b.hex()[:16]}...")
+                    # bt.logging.debug(f"[SCANNER] Found dst_raw from extrinsic: {b.hex()[:16]}...")
 
             # SECURITY: drop cross-subnet
             if te.src_subnet_id is not None and te.src_subnet_id != te.subnet_id:

@@ -57,11 +57,14 @@ class Payments:
     Background loop + payment scheduling/worker with α balance pre-check.
     """
 
-    def __init__(self, config, wallet, runtime: Runtime, state: StateStore):
+    def __init__(self, config, wallet, runtime: Runtime, state: StateStore, payments_async_subtensor=None):
         self.config = config
         self.wallet = wallet
         self.runtime = runtime
         self.state = state
+        
+        # Use separate AsyncSubtensor for payments (for parallel processing)
+        self._payments_async_subtensor: Optional[bt.AsyncSubtensor] = payments_async_subtensor
 
         # Background asyncio loop (daemon)
         self._bg_loop: asyncio.AbstractEventLoop = asyncio.new_event_loop()
@@ -80,6 +83,82 @@ class Payments:
         self._retry_every_blocks: int = 2
         self._retry_max_attempts: int = 3
         
+    # ---------------------- Payments AsyncSubtensor ----------------------
+    
+    async def _ensure_payments_async_subtensor(self):
+        """Ensure the payments AsyncSubtensor is initialized and ready to use."""
+        if self._payments_async_subtensor is None:
+            raise RuntimeError("Payments AsyncSubtensor not available - this should have been initialized by the miner")
+        
+        # Initialize if method exists and is coroutine
+        init = getattr(self._payments_async_subtensor, "initialize", None)
+        if callable(init):
+            try:
+                maybe_coro = init()
+                if asyncio.iscoroutine(maybe_coro):
+                    await maybe_coro
+            except Exception as e:
+                log_settlement(LogLevel.HIGH, f"Payments AsyncSubtensor initialization failed: {e}", "payments")
+        
+        return self._payments_async_subtensor
+
+    async def _get_current_block_payments(self) -> int:
+        """Get current block using the payments AsyncSubtensor."""
+        st = await self._ensure_payments_async_subtensor()
+        
+        # Try AsyncSubtensor methods first
+        for name in ("get_current_block", "current_block", "block", "get_block_number"):
+            try:
+                attr = getattr(st, name, None)
+                if attr is None:
+                    continue
+                res = attr() if callable(attr) else attr
+                if inspect.isawaitable(res):
+                    res = await res
+                b = int(res or 0)
+                if b > 0:
+                    return b
+            except Exception:
+                continue
+        
+        # Try substrate method if AsyncSubtensor methods failed
+        try:
+            substrate = getattr(st, "substrate", None)
+            if substrate is not None:
+                meth = getattr(substrate, "get_block_number", None)
+                if callable(meth):
+                    b = int(meth(None) or 0)
+                    if b > 0:
+                        return b
+        except Exception:
+            pass
+        
+        return 0
+
+    async def _get_alpha_balance_payments(self, subnet_id: int, hotkey_ss58: str) -> Optional[float]:
+        """Get alpha balance using the payments AsyncSubtensor."""
+        st = await self._ensure_payments_async_subtensor()
+        
+        for name in ("get_alpha_balance", "alpha_balance", "get_balance_alpha"):
+            try:
+                attr = getattr(st, name)
+            except AttributeError:
+                continue
+            try:
+                res = attr(hotkey_ss58, netuid=int(subnet_id)) if callable(attr) else attr
+                if inspect.isawaitable(res):
+                    res = await res
+                if hasattr(res, "rao"):
+                    return float(getattr(res, "rao")) / float(PLANCK)
+                if hasattr(res, "value"):
+                    return float(getattr(res, "value")) / float(PLANCK)
+                try:
+                    return float(res)
+                except Exception:
+                    continue
+            except Exception:
+                continue
+        return None
 
     # ---------------------- Background loop ----------------------
 
@@ -314,10 +393,11 @@ class Payments:
 
     async def _payment_worker(self, inv: WinInvoice):
         try:
-            await self.runtime._ensure_async_subtensor()
+            # Use separate AsyncSubtensor for payments
+            await self._ensure_payments_async_subtensor()
             
             # Log network configuration for debugging
-            network = getattr(self.runtime._async_subtensor, 'network', 'unknown')
+            network = getattr(self._payments_async_subtensor, 'network', 'unknown')
             log_settlement(LogLevel.MEDIUM, "Payment worker network configuration", "worker", {
                 "invoice_id": inv.invoice_id,
                 "network": network,
@@ -359,7 +439,7 @@ class Payments:
                         LogLevel.HIGH
                     )
                     break
-                blk = await self.runtime.get_current_block()
+                blk = await self._get_current_block_payments()
                 
                 # Handle block fetch failures
                 if blk <= 0:
@@ -446,7 +526,7 @@ class Payments:
                 origin_hotkey = self._origin_hotkey_for_invoice(inv)
 
                 need_alpha = float(inv.amount_rao) / float(PLANCK)
-                bal_alpha = await self.runtime.get_alpha_balance(inv.subnet_id, origin_hotkey)
+                bal_alpha = await self._get_alpha_balance_payments(inv.subnet_id, origin_hotkey)
                 if bal_alpha is not None and bal_alpha + 1e-12 < need_alpha:
                     inv.last_response = f"insufficient α on subnet {inv.subnet_id}: have {bal_alpha:.6f}, need {need_alpha:.6f}"
                     await self.state.save_async()
@@ -472,42 +552,43 @@ class Payments:
                     await asyncio.sleep(max(0.5, float(BLOCKTIME) * float(self._retry_every_blocks)))
                     continue
 
-                async with self.runtime._rpc_lock:  # type: ignore
-                    blk2 = await self.runtime.get_current_block()
-                    if start and (blk2 <= 0 or blk2 < allowed_start):
-                        inv.last_response = f"not yet in window (blk {blk2} < start {start}+{self._pay_start_safety_blocks})"
+                # Use payments AsyncSubtensor for the transaction
+                payments_st = await self._ensure_payments_async_subtensor()
+                blk2 = await self._get_current_block_payments()
+                if start and (blk2 <= 0 or blk2 < allowed_start):
+                    inv.last_response = f"not yet in window (blk {blk2} < start {start}+{self._pay_start_safety_blocks})"
+                    ok = False
+                    resp = inv.last_response
+                elif end and blk2 > end:
+                    inv.last_response = f"window over (blk {blk2} > end {end})"
+                    inv.expired = True
+                    ok = False
+                    resp = inv.last_response
+                elif inv.paid:
+                    ok = True
+                    resp = "already paid"
+                else:
+                    try:
+                        result = await self._maybe_transfer_alpha(
+                            subtensor=payments_st,
+                            wallet=self.wallet,
+                            hotkey_ss58=origin_hotkey,
+                            origin_and_dest_netuid=inv.subnet_id,
+                            dest_coldkey_ss58=inv.treasury_coldkey,
+                            amount=bt.Balance.from_rao(inv.amount_rao),
+                            wait_for_inclusion=True,
+                            wait_for_finalization=False,
+                        )
+                        if isinstance(result, bool):
+                            ok = result
+                        else:
+                            ok = True
+                            tx_hash = getattr(result, "extrinsic_hash", None) or getattr(result, "tx_hash", None) or getattr(result, "hash", None)
+                            paid_block = getattr(result, "in_block", None) or getattr(result, "included_block", None)
+                        resp = "ok" if ok else "rejected"
+                    except Exception as exc:
                         ok = False
-                        resp = inv.last_response
-                    elif end and blk2 > end:
-                        inv.last_response = f"window over (blk {blk2} > end {end})"
-                        inv.expired = True
-                        ok = False
-                        resp = inv.last_response
-                    elif inv.paid:
-                        ok = True
-                        resp = "already paid"
-                    else:
-                        try:
-                            result = await self._maybe_transfer_alpha(
-                                subtensor=self.runtime._async_subtensor,
-                                wallet=self.wallet,
-                                hotkey_ss58=origin_hotkey,
-                                origin_and_dest_netuid=inv.subnet_id,
-                                dest_coldkey_ss58=inv.treasury_coldkey,
-                                amount=bt.Balance.from_rao(inv.amount_rao),
-                                wait_for_inclusion=True,
-                                wait_for_finalization=False,
-                            )
-                            if isinstance(result, bool):
-                                ok = result
-                            else:
-                                ok = True
-                                tx_hash = getattr(result, "extrinsic_hash", None) or getattr(result, "tx_hash", None) or getattr(result, "hash", None)
-                                paid_block = getattr(result, "in_block", None) or getattr(result, "included_block", None)
-                            resp = "ok" if ok else "rejected"
-                        except Exception as exc:
-                            ok = False
-                            resp = f"exception: {exc}"
+                        resp = f"exception: {exc}"
 
                 inv.pay_attempts += 1
                 inv.last_response = str(resp)[:300]
@@ -751,7 +832,7 @@ class Payments:
         state saving, payment scheduling, and logging.
         """
         try:
-            # Ensure async subtensor is available
+            # Ensure shared async subtensor is available for background processing
             await self.runtime._ensure_async_subtensor()
             self.ensure_payment_config()
 

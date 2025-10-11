@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 # neurons/miner.py
 
+import asyncio
 from pathlib import Path
 from typing import Any
 
+import bittensor as bt
 from bittensor import Synapse
 
 from metahash.base.miner import BaseMinerNeuron
@@ -117,6 +119,9 @@ class Miner(BaseMinerNeuron):
         # Initialize phase-aware logging
         init_banner("Miner Initialization Started", "Setting up miner components and configuration")
         
+        # Initialize shared AsyncSubtensor with proper network configuration
+        self._initialize_shared_async_subtensor()
+        
         # Wallet unlock (best-effort)
         log_init(LogLevel.MEDIUM, "Unlocking wallet", "wallet", {"hotkey": getattr(self.wallet.hotkey, "ss58_address", "unknown")})
         unlock_wallet(wallet=self.wallet)
@@ -154,14 +159,19 @@ class Miner(BaseMinerNeuron):
             wallet=self.wallet,
             metagraph=self.metagraph,
             state=self.state,
+            shared_async_subtensor=self.shared_async_subtensor,
         )
 
+        # Initialize separate AsyncSubtensor for payments
+        self._initialize_payments_async_subtensor()
+        
         log_init(LogLevel.MEDIUM, "Initializing payments component", "payments")
         self.payments = Payments(
             config=self.config,
             wallet=self.wallet,
             runtime=self.runtime,
             state=self.state,
+            payments_async_subtensor=self.payments_async_subtensor,
         )
 
         # Build bid lines from config and show summary
@@ -230,6 +240,100 @@ class Miner(BaseMinerNeuron):
         self.payments.start_background_tasks()
         
         log_init(LogLevel.MEDIUM, "Miner initialization completed successfully", "main")
+
+    # ---------------------- Shared AsyncSubtensor ----------------------
+    
+    def _initialize_shared_async_subtensor(self):
+        """
+        Initialize shared AsyncSubtensor with custom endpoint for read operations.
+        This uses the custom endpoint for AsyncSubtensor operations while main subtensor handles axon serving.
+        """
+        log_init(LogLevel.MEDIUM, "Starting shared AsyncSubtensor initialization", "chain")
+        
+        # Log configuration details
+        log_init(LogLevel.MEDIUM, f"Config subtensor.network: {getattr(self.config.subtensor, 'network', 'None')}", "chain")
+        log_init(LogLevel.MEDIUM, f"Config subtensor.chain_endpoint: {getattr(self.config.subtensor, 'chain_endpoint', 'None')}", "chain")
+        log_init(LogLevel.MEDIUM, f"Config subtensor._mock: {getattr(self.config.subtensor, '_mock', 'None')}", "chain")
+        
+        # Use the custom endpoint for AsyncSubtensor operations (read-only operations)
+        custom_endpoint = self.config.subtensor.chain_endpoint
+        if not custom_endpoint:
+            log_init(LogLevel.CRITICAL, "No chain_endpoint configuration found in config.subtensor.chain_endpoint", "chain")
+            raise RuntimeError("No chain_endpoint configuration found in config.subtensor.chain_endpoint")
+        
+        log_init(LogLevel.MEDIUM, f"Creating AsyncSubtensor with custom endpoint: {custom_endpoint}", "chain")
+        self.shared_async_subtensor = bt.AsyncSubtensor(network=custom_endpoint)
+        
+        # Ensure the network attribute is set for debugging
+        self.shared_async_subtensor.network = custom_endpoint
+        log_init(LogLevel.MEDIUM, f"Shared AsyncSubtensor created successfully", "chain")
+        log_init(LogLevel.MEDIUM, f"AsyncSubtensor.network attribute: {getattr(self.shared_async_subtensor, 'network', 'None')}", "chain")
+        log_init(LogLevel.MEDIUM, f"AsyncSubtensor.chain_endpoint attribute: {getattr(self.shared_async_subtensor, 'chain_endpoint', 'None')}", "chain")
+
+    async def _ensure_shared_async_subtensor(self):
+        """Ensure the shared AsyncSubtensor is initialized and ready to use."""
+        if self.shared_async_subtensor is None:
+            self._initialize_shared_async_subtensor()
+        if self.shared_async_subtensor is None:
+            raise RuntimeError("Failed to initialize shared AsyncSubtensor")
+        
+        # Initialize if method exists and is coroutine
+        init = getattr(self.shared_async_subtensor, "initialize", None)
+        if callable(init):
+            try:
+                maybe_coro = init()
+                if asyncio.iscoroutine(maybe_coro):
+                    await maybe_coro
+            except Exception as e:
+                log_init(LogLevel.HIGH, f"Shared AsyncSubtensor initialization failed: {e}", "chain")
+        
+        return self.shared_async_subtensor
+
+    def _initialize_payments_async_subtensor(self):
+        """
+        Initialize separate AsyncSubtensor for payments with custom endpoint.
+        This ensures payments have their own connection for parallel processing.
+        """
+        log_init(LogLevel.MEDIUM, "Starting payments AsyncSubtensor initialization", "payments")
+        
+        # Log configuration details
+        log_init(LogLevel.MEDIUM, f"Config subtensor.network: {getattr(self.config.subtensor, 'network', 'None')}", "payments")
+        log_init(LogLevel.MEDIUM, f"Config subtensor.chain_endpoint: {getattr(self.config.subtensor, 'chain_endpoint', 'None')}", "payments")
+        log_init(LogLevel.MEDIUM, f"Config subtensor._mock: {getattr(self.config.subtensor, '_mock', 'None')}", "payments")
+        
+        # Use the custom endpoint for payments AsyncSubtensor operations
+        custom_endpoint = self.config.subtensor.chain_endpoint
+        if not custom_endpoint:
+            log_init(LogLevel.CRITICAL, "No chain_endpoint configuration found in config.subtensor.chain_endpoint", "payments")
+            raise RuntimeError("No chain_endpoint configuration found in config.subtensor.chain_endpoint")
+        
+        log_init(LogLevel.MEDIUM, f"Creating payments AsyncSubtensor with custom endpoint: {custom_endpoint}", "payments")
+        self.payments_async_subtensor = bt.AsyncSubtensor(network=custom_endpoint)
+        
+        # Ensure the network attribute is set for debugging
+        self.payments_async_subtensor.network = custom_endpoint
+        log_init(LogLevel.MEDIUM, f"Payments AsyncSubtensor created successfully", "payments")
+        log_init(LogLevel.MEDIUM, f"Payments AsyncSubtensor.network attribute: {getattr(self.payments_async_subtensor, 'network', 'None')}", "payments")
+        log_init(LogLevel.MEDIUM, f"Payments AsyncSubtensor.chain_endpoint attribute: {getattr(self.payments_async_subtensor, 'chain_endpoint', 'None')}", "payments")
+
+    async def _ensure_payments_async_subtensor(self):
+        """Ensure the payments AsyncSubtensor is initialized and ready to use."""
+        if self.payments_async_subtensor is None:
+            self._initialize_payments_async_subtensor()
+        if self.payments_async_subtensor is None:
+            raise RuntimeError("Failed to initialize payments AsyncSubtensor")
+        
+        # Initialize if method exists and is coroutine
+        init = getattr(self.payments_async_subtensor, "initialize", None)
+        if callable(init):
+            try:
+                maybe_coro = init()
+                if asyncio.iscoroutine(maybe_coro):
+                    await maybe_coro
+            except Exception as e:
+                log_init(LogLevel.HIGH, f"Payments AsyncSubtensor initialization failed: {e}", "payments")
+        
+        return self.payments_async_subtensor
 
     # ---------------------- Protocol handlers ----------------------
 

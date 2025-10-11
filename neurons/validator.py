@@ -36,6 +36,9 @@ class Validator(EpochValidatorNeuron):
         self.hotkey_ss58: str = self.wallet.hotkey.ss58_address
         self._async_subtensor: bt.AsyncSubtensor | None = None
         self._rpc_lock: asyncio.Lock = asyncio.Lock()
+        
+        # Initialize AsyncSubtensor with proper network configuration
+        self._initialize_async_subtensor()
 
         self.state = StateStore()
         if getattr(self.config, "fresh", False):
@@ -89,9 +92,47 @@ class Validator(EpochValidatorNeuron):
         )
 
     # ---------------------- AsyncSubtensor helpers ----------------------
+    def _initialize_async_subtensor(self):
+        """
+        Initialize AsyncSubtensor with custom endpoint for read operations.
+        This uses the custom endpoint for AsyncSubtensor operations while main subtensor handles write operations.
+        """
+        bt.logging.info("Starting AsyncSubtensor initialization")
+        
+        # Log configuration details
+        bt.logging.info(f"Config subtensor.network: {getattr(self.config.subtensor, 'network', 'None')}")
+        bt.logging.info(f"Config subtensor.chain_endpoint: {getattr(self.config.subtensor, 'chain_endpoint', 'None')}")
+        bt.logging.info(f"Config subtensor._mock: {getattr(self.config.subtensor, '_mock', 'None')}")
+        
+        # Use the custom endpoint for AsyncSubtensor operations (read-only operations)
+        custom_endpoint = self.config.subtensor.chain_endpoint
+        if not custom_endpoint:
+            bt.logging.error("No chain_endpoint configuration found in config.subtensor.chain_endpoint")
+            raise RuntimeError("No chain_endpoint configuration found in config.subtensor.chain_endpoint")
+        
+        bt.logging.info(f"Creating AsyncSubtensor with custom endpoint: {custom_endpoint}")
+        self._async_subtensor = bt.AsyncSubtensor(network=custom_endpoint)
+        
+        # Ensure the network attribute is set for debugging
+        self._async_subtensor.network = custom_endpoint
+        bt.logging.info(f"AsyncSubtensor created successfully")
+        bt.logging.info(f"AsyncSubtensor.network attribute: {getattr(self._async_subtensor, 'network', 'None')}")
+        bt.logging.info(f"AsyncSubtensor.chain_endpoint attribute: {getattr(self._async_subtensor, 'chain_endpoint', 'None')}")
+
     async def _stxn(self) -> bt.AsyncSubtensor:
         if self._async_subtensor is None:
-            self._async_subtensor = await self._new_async_subtensor()
+            self._initialize_async_subtensor()
+        
+        # Initialize if method exists and is coroutine
+        init = getattr(self._async_subtensor, "initialize", None)
+        if callable(init):
+            try:
+                maybe_coro = init()
+                if asyncio.iscoroutine(maybe_coro):
+                    await maybe_coro
+            except Exception as e:
+                bt.logging.warning(f"AsyncSubtensor initialization failed: {e}")
+        
         return self._async_subtensor
 
     async def _new_async_subtensor(self) -> bt.AsyncSubtensor:
@@ -99,15 +140,8 @@ class Validator(EpochValidatorNeuron):
         Create AsyncSubtensor compatible with multiple bittensor versions.
         Avoid passing unsupported kwargs like `chain_endpoint`.
         """
-        # Minimal constructor; older versions only accept 'network'
-        stxn = bt.AsyncSubtensor(network=self.config.subtensor.network)
-        # Initialize if method exists and is coroutine
-        init = getattr(stxn, "initialize", None)
-        if callable(init):
-            maybe_coro = init()
-            if asyncio.iscoroutine(maybe_coro):
-                await maybe_coro
-        return stxn
+        # Use the already initialized instance
+        return await self._stxn()
 
     # ---------------------- Epoch alignment / population ----------------------
     async def _maybe_call_async(self, obj, method_name: str, *args, **kwargs):

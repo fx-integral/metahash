@@ -75,14 +75,14 @@ class Runtime:
       - AuctionStart handling (including per-target-subnet stake gate)
     """
 
-    def __init__(self, config, wallet, metagraph, state: StateStore):
+    def __init__(self, config, wallet, metagraph, state: StateStore, shared_async_subtensor=None):
         self.config = config
         self.wallet = wallet
         self.metagraph = metagraph
         self.state = state
 
-        # Async subtensor + locks (created lazily)
-        self._async_subtensor: Optional[bt.AsyncSubtensor] = None
+        # Use shared AsyncSubtensor from miner instead of creating our own
+        self._async_subtensor: Optional[bt.AsyncSubtensor] = shared_async_subtensor
         self._rpc_lock: Optional[asyncio.Lock] = None
 
         # Discount mode (config-parsed) - now always weight-adjusted
@@ -163,24 +163,7 @@ class Runtime:
 
     async def _ensure_async_subtensor(self):
         if self._async_subtensor is None:
-            log_init(LogLevel.MEDIUM, "Initializing async subtensor connection", "chain")
-            # Create with just network parameter to avoid config issues that cause slice attachment
-            try:
-                # Use the same network configuration as the main subtensor
-                network = self.config.subtensor.network
-                stxn = bt.AsyncSubtensor(network=network)
-                log_init(LogLevel.MEDIUM, f"Created async subtensor with network: {network}", "chain")
-            except Exception as e:
-                log_init(LogLevel.HIGH, "Failed to create async subtensor with network, using fallback", "chain", {"error": str(e)})
-                stxn = bt.AsyncSubtensor(self.config)
-            init = getattr(stxn, "initialize", None)
-            if callable(init):
-                try:
-                    await init()
-                except Exception as e:
-                    log_init(LogLevel.HIGH, "Failed to initialize async subtensor", "chain", {"error": str(e)})
-                    # Don't fail completely, try to continue with uninitialized subtensor
-            self._async_subtensor = stxn
+            raise RuntimeError("Shared AsyncSubtensor not available - this should have been initialized by the miner")
         if self._rpc_lock is None:
             self._rpc_lock = asyncio.Lock()
 
