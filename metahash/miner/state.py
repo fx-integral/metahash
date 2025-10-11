@@ -46,11 +46,15 @@ class StateStore:
         self.treasuries.clear()
         self.already_bid.clear()
         self.wins.clear()
+        self.disabled_subnets.clear()
         try:
             if self.path.exists():
                 self.path.unlink()
+                log_init(LogLevel.MEDIUM, "State file deleted successfully", "state", {"file_path": str(self.path)})
+            else:
+                log_init(LogLevel.MEDIUM, "No state file to delete", "state", {"file_path": str(self.path)})
         except Exception as e:
-            log_init(LogLevel.HIGH, "Could not remove state file", "state", {"error": str(e)})
+            log_init(LogLevel.HIGH, "Could not remove state file", "state", {"error": str(e), "file_path": str(self.path)})
 
     def load(self):
         if not self.path.exists():

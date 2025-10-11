@@ -462,7 +462,7 @@ class Payments:
             block_fetch_failures = 0
             max_block_fetch_failures = 10
             worker_start_time = time.time()
-            max_worker_runtime = 1800  # 30 minutes max runtime per worker (reduced from 1 hour)
+            max_worker_runtime = 3600  # 60 minutes max runtime per worker (increased for payment window)
             
             while True:
                 # Check if worker has been running too long
@@ -485,29 +485,22 @@ class Payments:
                 # Handle block fetch failures
                 if blk <= 0:
                     block_fetch_failures += 1
+                    log_settlement(LogLevel.MEDIUM, "Block fetch failed, retrying", "worker", {
+                        "invoice_id": inv.invoice_id,
+                        "attempt": block_fetch_failures,
+                        "max_attempts": max_block_fetch_failures
+                    })
                     if block_fetch_failures >= max_block_fetch_failures:
                         inv.last_response = f"failed to fetch current block after {max_block_fetch_failures} attempts"
                         inv.expired = True
                         await self.state.save_async()
-                        log_settlement(LogLevel.HIGH, "Payment failed - cannot fetch current block", "worker", {
+                        log_settlement(LogLevel.HIGH, "Payment worker failed - too many block fetch failures", "worker", {
                             "invoice_id": inv.invoice_id,
                             "failures": block_fetch_failures
                         })
-                        miner_logger.phase_panel(
-                            MinerPhase.SETTLEMENT, "PAY Exit",
-                            [("inv", inv.invoice_id), ("reason", "block fetch failed"), ("failures", block_fetch_failures)],
-                            LogLevel.HIGH
-                        )
                         break
-                    
-                    inv.last_response = f"block fetch failed ({block_fetch_failures}/{max_block_fetch_failures}), retrying..."
-                    await self.state.save_async()
-                    log_settlement(LogLevel.HIGH, "Block fetch failed, retrying", "worker", {
-                        "invoice_id": inv.invoice_id,
-                        "current_block": blk,
-                        "failures": block_fetch_failures
-                    })
-                    await asyncio.sleep(max(0.5, float(BLOCKTIME) * 2))
+                    # Wait longer between retries for network issues
+                    await asyncio.sleep(30)
                     continue
                 
                 # Reset block fetch failure counter on success

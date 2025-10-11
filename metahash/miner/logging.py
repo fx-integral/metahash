@@ -254,8 +254,13 @@ class MinerLogger:
             
             # Extract numeric values from formatted strings
             try:
+                # Parse alpha value - remove " α" suffix
                 alpha_val = float(alpha_str.replace(" α", ""))
-                disc_send_val = float(disc_send_str.replace(" bps", ""))
+                
+                # Parse discount value - handle both "1000 bps" and "1000 bps (eff)" formats
+                disc_send_clean = disc_send_str.split(" bps")[0]  # Get everything before " bps"
+                disc_send_val = float(disc_send_clean)
+                
                 total_alpha_sent += alpha_val
                 total_discount += disc_send_val
                 unique_subnets.add(subnet_id)

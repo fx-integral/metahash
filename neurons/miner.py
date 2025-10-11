@@ -11,8 +11,8 @@ from typing import Any
 import bittensor as bt
 from bittensor import Synapse
 
-# Enable debug mode by default
-DEBUG_ASYNC = os.getenv("METAHASH_DEBUG_ASYNC", "1") not in ("0", "", "false", "False", "no", "No")
+    # Enable debug mode by default (can be disabled via environment variable)
+DEBUG_ASYNC = os.getenv("METAHASH_DEBUG_ASYNC", "0") not in ("0", "", "false", "False", "no", "No")
 
 # Enable Python's own async debug and fault handler by default
 if DEBUG_ASYNC:
@@ -163,8 +163,9 @@ class Miner(BaseMinerNeuron):
             log_init(LogLevel.HIGH, "Fresh start requested - clearing local state", "state", {"coldkey": self._coldkey_ss58})
             self.state.wipe()
             log_init(LogLevel.MEDIUM, "Local state cleared successfully", "state")
-
-        self.state.load()
+        else:
+            # Only load state if not doing a fresh start
+            self.state.load()
         self.state.treasuries = dict(VALIDATOR_TREASURIES)  # re-pin allowlist
 
         # ---------------------- Bidding Controller (needed for runtime) ----------------------
@@ -517,8 +518,8 @@ class Miner(BaseMinerNeuron):
             self.sync()   
             self.step += 1
             
-            # Use asyncio.sleep instead of time.sleep for PM2 compatibility
-            await asyncio.sleep(12 * 4)
+            # Reduced sleep time for better responsiveness (12 seconds instead of 48)
+            await asyncio.sleep(12)
 
     # ---------------------- Context manager shutdown ----------------------
 
