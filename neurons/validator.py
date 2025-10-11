@@ -94,8 +94,8 @@ class Validator(EpochValidatorNeuron):
     # ---------------------- AsyncSubtensor helpers ----------------------
     def _initialize_async_subtensor(self):
         """
-        Initialize AsyncSubtensor with custom endpoint for read operations.
-        This uses the custom endpoint for AsyncSubtensor operations while main subtensor handles write operations.
+        Initialize AsyncSubtensor with the same network configuration as the main subtensor.
+        This ensures both subtensors use the same network (local vs finney).
         """
         bt.logging.info("Starting AsyncSubtensor initialization")
         
@@ -104,17 +104,19 @@ class Validator(EpochValidatorNeuron):
         bt.logging.info(f"Config subtensor.chain_endpoint: {getattr(self.config.subtensor, 'chain_endpoint', 'None')}")
         bt.logging.info(f"Config subtensor._mock: {getattr(self.config.subtensor, '_mock', 'None')}")
         
-        # Use the custom endpoint for AsyncSubtensor operations (read-only operations)
-        custom_endpoint = self.config.subtensor.chain_endpoint
-        if not custom_endpoint:
-            bt.logging.error("No chain_endpoint configuration found in config.subtensor.chain_endpoint")
-            raise RuntimeError("No chain_endpoint configuration found in config.subtensor.chain_endpoint")
+        # Use the same network configuration as the main subtensor
+        network = getattr(self.config.subtensor, 'network', 'local')
+        chain_endpoint = getattr(self.config.subtensor, 'chain_endpoint', None)
         
-        bt.logging.info(f"Creating AsyncSubtensor with custom endpoint: {custom_endpoint}")
-        self._async_subtensor = bt.AsyncSubtensor(network=custom_endpoint)
+        bt.logging.info(f"Creating AsyncSubtensor with network: {network}")
+        if chain_endpoint:
+            bt.logging.info(f"Using chain_endpoint: {chain_endpoint}")
+            # Create AsyncSubtensor with network and chain_endpoint
+            self._async_subtensor = bt.AsyncSubtensor(network=network, chain_endpoint=chain_endpoint)
+        else:
+            # Create AsyncSubtensor with just network
+            self._async_subtensor = bt.AsyncSubtensor(network=network)
         
-        # Ensure the network attribute is set for debugging
-        self._async_subtensor.network = custom_endpoint
         bt.logging.info(f"AsyncSubtensor created successfully")
         bt.logging.info(f"AsyncSubtensor.network attribute: {getattr(self._async_subtensor, 'network', 'None')}")
         bt.logging.info(f"AsyncSubtensor.chain_endpoint attribute: {getattr(self._async_subtensor, 'chain_endpoint', 'None')}")
