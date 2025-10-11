@@ -1,3 +1,0 @@
-[console_scripts]
-run_miner = metahash.scripts.run_miner:main
-run_validator = metahash.scripts.run_validator:main
