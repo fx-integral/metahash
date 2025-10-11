@@ -14,3 +14,4 @@ test/
 miner_state.json
 pending_commits.json
 validated_epochs.json
+metahash.egg-info/
