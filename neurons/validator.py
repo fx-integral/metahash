@@ -108,7 +108,13 @@ class Validator(EpochValidatorNeuron):
         network = getattr(self.config.subtensor, 'network', 'local')
         chain_endpoint = getattr(self.config.subtensor, 'chain_endpoint', None)
         
-        self._async_subtensor = bt.AsyncSubtensor(config=self.config)
+        # Create AsyncSubtensor with explicit network parameter (like in miner)
+        if chain_endpoint:
+            bt.logging.info(f"Creating AsyncSubtensor with custom endpoint: {chain_endpoint}")
+            self._async_subtensor = bt.AsyncSubtensor(network=chain_endpoint)
+        else:
+            bt.logging.info(f"Creating AsyncSubtensor with network: {network}")
+            self._async_subtensor = bt.AsyncSubtensor(network=network)
         
         bt.logging.info(f"AsyncSubtensor created successfully")
         bt.logging.info(f"AsyncSubtensor.network attribute: {getattr(self._async_subtensor, 'network', 'None')}")
