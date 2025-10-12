@@ -628,8 +628,10 @@ class AlphaTransfersScanner:
             # Normalize dict-like fields to a list of values for downstream helpers
             if isinstance(fields, dict):
                 fields = list(fields.values())
+            elif isinstance(fields, (list, tuple)):
+                fields = list(fields)
             else:
-                fields = ()
+                fields = [fields] if fields is not None else []
 
             if name == "StakeRemoved":
                 bucket["src_amt"] = _amount_from_stake_removed(fields)
@@ -728,6 +730,12 @@ class AlphaTransfersScanner:
                and te.src_coldkey is not None \
                and te.dest_coldkey is not None \
                and (self.dest_ck is None or te.dest_coldkey == self.dest_ck):
+                keep_msg = (
+                    f"[SCANNER] keeping transfer | blk={block_hint_single} "
+                    f"idx={idx} net={te.subnet_id} α={te.amount_rao} "
+                    f"src={_mask(te.src_coldkey)} dst={_mask(te.dest_coldkey)}"
+                )
+                bt.logging.debug(keep_msg)
                 kept += 1
                 out.append(te)
                 if dump:
@@ -747,6 +755,14 @@ class AlphaTransfersScanner:
                     reason_parts.append("dest_ck_none")
                 if (self.dest_ck is not None) and (te.dest_coldkey != self.dest_ck):
                     reason_parts.append("treasury_mismatch")
+                reason_msg = ",".join(reason_parts) or "unknown"
+                drop_msg = (
+                    f"[SCANNER] dropping transfer | blk={block_hint_single} "
+                    f"idx={idx} reasons={reason_msg} net={te.subnet_id} "
+                    f"α={te.amount_rao} src={_mask(te.src_coldkey)} "
+                    f"dst={_mask(te.dest_coldkey)}"
+                )
+                bt.logging.warning(drop_msg)
             scratch.pop(idx, None)
 
         return seen, kept
