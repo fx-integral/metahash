@@ -1,159 +1,135 @@
-# Finance Module - Portfolio and Transfer Caching Services
+# Finance Module – Treasury Analytics Toolkit
 
-This module provides caching services for portfolio states and transfer events in the MetaHash network. It allows efficient retrieval of historical portfolio and transfer data by caching calculations and scans.
+This directory contains the tooling used to understand the MetaHash treasury’s
+portfolio.  The new stack focuses on three pillars:
 
-## Features
+1. **Transaction capture** – a persistent JSON cache of every alpha transfer
+   touching the treasury coldkeys.
+2. **Chain snapshots** – lightweight helpers for fetching delegated stake,
+   subnet prices, and validator commitments from the archive network.
+3. **Metric synthesis** – deterministic calculations for APR, locked balances,
+   auction performance, and buyback progress.
 
-- **PortfolioService**: Calculates and caches portfolio states including TAO/Alpha balances, subnet allocations, and budget utilization
-- **TransferService**: Scans and caches transfer events using the existing AlphaTransfersScanner
-- **CacheLayer**: Generic caching layer with block-based keys and tolerance ranges
-- **Efficient Retrieval**: Fast lookups using cached data with configurable tolerance ranges
+Everything runs against the `archive` subtensor endpoint so historical blocks
+can be revisited without re-scanning the live chain every time.
 
-## Components
+---
 
-### CacheLayer
-Base caching layer that provides:
-- Thread-safe operations
-- Block-based caching with tolerance ranges
-- Persistent storage to disk
-- Efficient range queries
+## Key Components
 
-### PortfolioService
-Service for calculating and caching portfolio states:
-- Calculates portfolio metrics (TAO/Alpha balances, subnet allocations, budget utilization)
-- Caches results for efficient retrieval
-- Supports range queries and tolerance-based lookups
+| Module | Responsibility |
+| --- | --- |
+| `treasury_cache.py` | Maintains `cache/treasury_transactions.json`, updating it with new stake transfers via `AlphaTransfersScanner`. |
+| `treasury_chain.py` | Async helpers for delegated stake snapshots, subnet prices, and commitment history (using archive-safe RPC hygiene). |
+| `treasury_metrics.py` | Pure Python aggregation of treasury metrics (APR, locked ratios, budget utilisation, buybacks, etc). |
+| `cli.py` | CLI entry point tying everything together – updates caches and prints/export metrics. |
 
-### TransferService
-Service for scanning and caching transfer events:
-- Uses existing AlphaTransfersScanner for transfer detection
-- Caches transfer summaries with statistics
-- Supports range scanning with configurable step sizes
+Dataclasses live in `models.py` and configuration constants in `constants.py`.
 
-## Usage
+---
 
-### Basic Usage
-
-```python
-import asyncio
-from pathlib import Path
-import bittensor as bt
-from metahash.finance import PortfolioService, TransferService
-
-async def main():
-    # Initialize bittensor
-    subtensor = bt.subtensor(network="finney")
-    
-    # Create cache directory
-    cache_dir = Path("./cache")
-    
-    # Initialize services
-    portfolio_service = PortfolioService(cache_dir, subtensor, tolerance_blocks=360)
-    transfer_service = TransferService(cache_dir, subtensor, tolerance_blocks=360)
-    
-    # Get portfolio state for a specific block
-    target_block = 6633585
-    portfolio_state = await portfolio_service.get_portfolio_state(target_block)
-    
-    # Get transfers for a specific block
-    transfer_summary = await transfer_service.get_transfers(target_block)
-    
-    # Get cached data (fast retrieval)
-    cached_portfolio = portfolio_service.get_cached_portfolio(target_block)
-    cached_transfers = transfer_service.get_cached_transfers(target_block)
-
-asyncio.run(main())
-```
-
-### Processing Block Ranges
-
-Use the `process_blocks.py` script to process large block ranges:
+## Quick Start
 
 ```bash
-# Process last 7200 blocks with 360-block intervals
-python -m metahash.finance.process_blocks --start-block 6626385 --end-block 6633585 --step 360
+# Update the local cache (default 120 days back) and dump metrics to stdout.
+python -m finance.cli --network archive --print-json
 
-# Generate summary report only
-python -m metahash.finance.process_blocks --start-block 6626385 --end-block 6633585 --summary-only
+# Write metrics to a file while keeping stdout clean.
+python -m finance.cli --output cache/treasury_metrics.json
+
+# Recompute metrics without touching the chain (use cached transfers only).
+python -m finance.cli --no-update --print-json
+
+# Focus on a custom treasury / hotkey pair.
+python -m finance.cli \
+  --treasury 5GW6xj5wUpLBz7jCNp38FzkdS6DfeFdUTuvUjcn6uKH5krsn \
+  --hotkey 5Dnkprjf9fUrvWq3ZfFP8WrUNSjQws6UoHkbDfR1bQK8pFhW
 ```
 
-### Command Line Options
+Arguments of interest:
 
-- `--start-block`: Starting block number (default: 6633585 - 7200)
-- `--end-block`: Ending block number (default: 6633585)
-- `--step`: Step size between blocks (default: 360)
-- `--cache-dir`: Cache directory (default: ./cache)
-- `--network`: Bittensor network (default: finney)
-- `--netuid`: Network UID (default: 1)
-- `--summary-only`: Only generate summary report
+- `--days-back` – how far to backfill when the cache is empty (default 120).
+- `--max-commitment-epochs` – cap the number of auction commitments to ingest (default 120 epochs).
+- `--cache-file` – where to store the transaction history (`cache/treasury_transactions.json` by default).
+- `--scan-chunk` – number of blocks per transfer scan batch (default 600; lower values help on slow archive nodes). Progress is now displayed via `tqdm` when available.
+- `--start-block` / `--end-block` – optionally bound the scan to an explicit block range (useful for smoke tests before running a full backfill).
 
-## Cache Structure
+---
 
-The cache stores data in JSON format with the following structure:
+## Cache Format
 
+Transactions are stored as plain JSON:
+
+```json
+{
+  "meta": {
+    "network": "archive",
+    "treasuries": ["…"],
+    "lock_period_days": 60,
+    "blocks_per_day": 7200,
+    "last_block": 5584000,
+    "last_updated": "2025-01-30T12:00:00+00:00"
+  },
+  "transactions": [
+    {
+      "block": 5555555,
+      "subnet_id": 5,
+      "amount_rao": 1234567890,
+      "amount_alpha": 1.23456789,
+      "src": "5…",
+      "dest": "5…",
+      "direction": "in"
+    }
+  ]
+}
 ```
-cache/
-├── portfolio_cache.json    # Portfolio state cache
-└── transfers_cache.json    # Transfer summary cache
-```
 
-Each cache entry includes:
-- Block number
-- Timestamp
-- Cached data (portfolio state or transfer summary)
+The cache is append-only; re-running the CLI simply adds new entries and keeps
+the same structure so other services can reuse it as a read-only ledger.
 
-## Tolerance Range
+---
 
-The caching system uses a tolerance range to find cached data near the requested block. For example, if you request block 6633585 with a tolerance of 360 blocks, it will return cached data from any block between 6633225 and 6633945.
+## Metrics Provided
 
-## Performance
+The CLI produces a JSON payload containing:
 
-- **Cache Hits**: Near-instant retrieval of cached data
-- **Cache Misses**: Full calculation/scanning required
-- **Range Queries**: Efficient retrieval of multiple cached entries
-- **Persistent Storage**: Data survives application restarts
+- **Holdings** – per-subnet alpha & TAO valuations, locked vs liquid capital,
+  cumulative inflows/outflows.
+- **Revenue** – daily and 7-day average staking rewards (alpha & TAO) plus
+  annualised APR estimates per subnet and for the overall portfolio.
+- **Auctions** – average budget utilisation, mean miner discount (margin),
+  total SN73 emission since inception (based on commitment history).
+- **Buybacks** – lifetime SN73 alpha repurchased, daily spend, and weekly
+  averages (in both alpha and TAO units).
 
-## Error Handling
+Every number is computed deterministically from the cache + archive snapshots,
+so running the tool on another host yields the same view.
 
-The services include robust error handling:
-- Graceful handling of RPC failures
-- Automatic retry mechanisms
-- Detailed logging of errors and statistics
-- Fallback to cached data when available
+---
 
-## Example Output
+## Extending the Toolkit
 
-```
-[PROCESSING BLOCK RANGE]
-Processing blocks from 6626385 to 6633585 with step 360
+- **New metrics**: add pure functions in `treasury_metrics.py` so they can be
+  unit-tested without touching the network.
+- **Additional data sources**: extend `treasury_chain.py` for new RPC queries,
+  keeping the async/lock discipline already present in the module.
+- **Automation**: schedule `python -m finance.cli` via cron/PM2; the script is
+  idempotent and safe to run frequently.
 
-Progress: 10 blocks processed, 5 portfolio states calculated, 3 transfers scanned, 0 errors
-Progress: 20 blocks processed, 8 portfolio states calculated, 6 transfers scanned, 0 errors
+---
 
-[PROCESSING COMPLETE]
-Blocks processed: 20
-Portfolio states calculated: 8
-Portfolio states from cache: 12
-Transfers scanned: 6
-Transfers from cache: 14
-Errors: 0
-Portfolio cache entries: 8
-Transfer cache entries: 6
-```
+## Tests & Coverage
+
+Metrics logic has been factored out of chain interaction and can be covered
+with synthetic fixtures. Add tests under `tests/finance/` (or reuse your
+preferred harness) to keep arithmetic regressions from slipping through.
+
+---
 
 ## Dependencies
 
-- bittensor
-- asyncio
-- pathlib
-- dataclasses
-- typing
-- json
-- threading
+- `bittensor` (AsyncSubtensor + balance utilities)
+- `metahash.validator.alpha_transfers` (existing scanner reused by treasury cache)
+- Standard library modules only otherwise
 
-## Notes
-
-- The portfolio calculation is currently simplified and may need enhancement based on actual settlement engine logic
-- Transfer scanning uses the existing AlphaTransfersScanner with proper RPC locking
-- Cache files are stored in JSON format for easy inspection and debugging
-- All operations are thread-safe and can be used in concurrent environments
+No additional external packages are required.

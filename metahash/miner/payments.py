@@ -433,6 +433,12 @@ class Payments:
                 "payments",
                 {"invoice_id": inv.invoice_id, **loop_info_dict("worker.start")}
             )
+        def _env_float(name: str, default: float) -> float:
+            try:
+                return float(os.getenv(name, str(default)))
+            except Exception:
+                return default
+
         try:
             # Use separate AsyncSubtensor for payments
             await self._ensure_payments_async_subtensor()
@@ -462,7 +468,12 @@ class Payments:
             block_fetch_failures = 0
             max_block_fetch_failures = 10
             worker_start_time = time.time()
-            max_worker_runtime = 3600  # 60 minutes max runtime per worker (increased for payment window)
+            block_time_seconds = float(BLOCKTIME) if float(BLOCKTIME) > 0 else 12.0
+            default_min_runtime = max(block_time_seconds * 360.0, 3600.0)
+            default_max_runtime = max(default_min_runtime * 4.0, 21600.0)
+            min_worker_runtime = max(0.0, _env_float("METAHASH_PAY_WORKER_MIN_RUNTIME", default_min_runtime))
+            max_worker_runtime_cap = max(min_worker_runtime, _env_float("METAHASH_PAY_WORKER_MAX_RUNTIME", default_max_runtime))
+            max_worker_runtime = max(min_worker_runtime, block_time_seconds * 10.0)
             
             while True:
                 # Check if worker has been running too long
@@ -481,6 +492,24 @@ class Payments:
                     )
                     break
                 blk = await self._get_current_block_payments()
+
+                if blk > 0:
+                    # Adjust runtime budget dynamically so we remain alive through long payment windows.
+                    window_end_block = end if end else max(allowed_start, blk) + int(self._retry_every_blocks * self._retry_max_attempts * 6)
+                    wait_blocks = max(0, allowed_start - blk)
+                    window_blocks = max(0, window_end_block - max(blk, allowed_start))
+                    expected_runtime = (wait_blocks + window_blocks + 5) * block_time_seconds
+                    # Clamp to configured bounds
+                    expected_runtime = max(min_worker_runtime, min(expected_runtime, max_worker_runtime_cap))
+                    if expected_runtime > max_worker_runtime + 1:
+                        max_worker_runtime = expected_runtime
+                        if DEBUG_ASYNC:
+                            log_settlement(LogLevel.MEDIUM, "Payment worker runtime adjusted", "worker", {
+                                "invoice_id": inv.invoice_id,
+                                "wait_blocks": wait_blocks,
+                                "window_blocks": window_blocks,
+                                "runtime_seconds": round(max_worker_runtime, 2)
+                            })
                 
                 # Handle block fetch failures
                 if blk <= 0:
