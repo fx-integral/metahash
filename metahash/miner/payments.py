@@ -562,17 +562,86 @@ class Payments:
                     LogLevel.MEDIUM
                 )
 
-                ok = False
-                resp: Any = None
-                tx_hash: Optional[str] = None
-                paid_block: Optional[int] = None
                 origin_hotkey = self._origin_hotkey_for_invoice(inv)
 
                 need_alpha = float(inv.amount_rao) / float(PLANCK)
-                bal_alpha = await self._get_alpha_balance_payments(inv.subnet_id, origin_hotkey)
-                if bal_alpha is not None and bal_alpha + 1e-12 < need_alpha:
-                    inv.last_response = f"insufficient α on subnet {inv.subnet_id}: have {bal_alpha:.6f}, need {need_alpha:.6f}"
+                pay_lock = self._pay_lock
+                if pay_lock is None:
+                    pay_lock = asyncio.Lock()
+                    self._pay_lock = pay_lock
+
+                attempt_info: Dict[str, Any] = {
+                    "status": "UNKNOWN",
+                    "resp": "",
+                    "bal_alpha": None,
+                    "block": None,
+                    "ok": None,
+                    "tx_hash": None,
+                    "paid_block": None,
+                }
+
+                # Serialize balance verification and transfer submission to avoid concurrent wallet/subtensor usage
+                async with pay_lock:
+                    bal_alpha = await self._get_alpha_balance_payments(inv.subnet_id, origin_hotkey)
+                    attempt_info["bal_alpha"] = bal_alpha
+                    if bal_alpha is not None and bal_alpha + 1e-12 < need_alpha:
+                        attempt_info["status"] = "INSUFFICIENT_BALANCE"
+                        attempt_info["resp"] = (
+                            f"insufficient α on subnet {inv.subnet_id}: have {bal_alpha:.6f}, need {need_alpha:.6f}"
+                        )
+                    else:
+                        payments_st = await self._ensure_payments_async_subtensor()
+                        blk2 = await self._get_current_block_payments()
+                        attempt_info["block"] = blk2
+                        if start and (blk2 <= 0 or blk2 < allowed_start):
+                            attempt_info["status"] = "WINDOW_PENDING"
+                            attempt_info["resp"] = (
+                                f"not yet in window (blk {blk2} < start {start}+{self._pay_start_safety_blocks})"
+                            )
+                            attempt_info["ok"] = False
+                        elif end and blk2 > end:
+                            attempt_info["status"] = "WINDOW_EXPIRED"
+                            attempt_info["resp"] = f"window over (blk {blk2} > end {end})"
+                            attempt_info["ok"] = False
+                        elif inv.paid:
+                            attempt_info["status"] = "ALREADY_PAID"
+                            attempt_info["resp"] = "already paid"
+                            attempt_info["ok"] = True
+                        else:
+                            try:
+                                result = await self._maybe_transfer_alpha(
+                                    subtensor=payments_st,
+                                    wallet=self.wallet,
+                                    hotkey_ss58=origin_hotkey,
+                                    origin_and_dest_netuid=inv.subnet_id,
+                                    dest_coldkey_ss58=inv.treasury_coldkey,
+                                    amount=bt.Balance.from_rao(inv.amount_rao),
+                                    wait_for_inclusion=True,
+                                    wait_for_finalization=False,
+                                )
+                            except Exception as exc:
+                                attempt_info["status"] = "EXCEPTION"
+                                attempt_info["resp"] = f"exception: {exc}"
+                                attempt_info["ok"] = False
+                            else:
+                                if isinstance(result, bool):
+                                    ok_result = result
+                                    tx_hash = None
+                                    paid_block = None
+                                else:
+                                    ok_result = True
+                                    tx_hash = getattr(result, "extrinsic_hash", None) or getattr(result, "tx_hash", None) or getattr(result, "hash", None)
+                                    paid_block = getattr(result, "in_block", None) or getattr(result, "included_block", None)
+                                attempt_info["status"] = "SUCCESS" if ok_result else "FAILED"
+                                attempt_info["ok"] = ok_result
+                                attempt_info["tx_hash"] = tx_hash
+                                attempt_info["paid_block"] = paid_block
+                                attempt_info["resp"] = "ok" if ok_result else "rejected"
+
+                if attempt_info["status"] == "INSUFFICIENT_BALANCE":
+                    inv.last_response = attempt_info["resp"]
                     await self.state.save_async()
+                    bal_alpha = attempt_info["bal_alpha"] or 0.0
                     log_settlement(LogLevel.HIGH, "Insufficient balance for payment", "worker", {
                         "invoice_id": inv.invoice_id,
                         "subnet_id": inv.subnet_id,
@@ -595,46 +664,29 @@ class Payments:
                     await asyncio.sleep(max(0.5, float(BLOCKTIME) * float(self._retry_every_blocks)))
                     continue
 
-                # Use payments AsyncSubtensor for the transaction
-                payments_st = await self._ensure_payments_async_subtensor()
-                blk2 = await self._get_current_block_payments()
-                if start and (blk2 <= 0 or blk2 < allowed_start):
-                    inv.last_response = f"not yet in window (blk {blk2} < start {start}+{self._pay_start_safety_blocks})"
-                    ok = False
-                    resp = inv.last_response
-                elif end and blk2 > end:
-                    inv.last_response = f"window over (blk {blk2} > end {end})"
+                ok = bool(attempt_info.get("ok"))
+                resp = attempt_info.get("resp", "")
+                tx_hash = attempt_info.get("tx_hash")
+                paid_block = attempt_info.get("paid_block")
+                blk2 = attempt_info.get("block")
+
+                if attempt_info["status"] == "WINDOW_EXPIRED":
                     inv.expired = True
-                    ok = False
-                    resp = inv.last_response
-                elif inv.paid:
-                    ok = True
-                    resp = "already paid"
-                else:
-                    try:
-                        result = await self._maybe_transfer_alpha(
-                            subtensor=payments_st,
-                            wallet=self.wallet,
-                            hotkey_ss58=origin_hotkey,
-                            origin_and_dest_netuid=inv.subnet_id,
-                            dest_coldkey_ss58=inv.treasury_coldkey,
-                            amount=bt.Balance.from_rao(inv.amount_rao),
-                            wait_for_inclusion=True,
-                            wait_for_finalization=False,
-                        )
-                        if isinstance(result, bool):
-                            ok = result
-                        else:
-                            ok = True
-                            tx_hash = getattr(result, "extrinsic_hash", None) or getattr(result, "tx_hash", None) or getattr(result, "hash", None)
-                            paid_block = getattr(result, "in_block", None) or getattr(result, "included_block", None)
-                        resp = "ok" if ok else "rejected"
-                    except Exception as exc:
-                        ok = False
-                        resp = f"exception: {exc}"
+                    blk_for_log = blk2 if isinstance(blk2, int) and blk2 > 0 else blk
+                    log_settlement(LogLevel.HIGH, "Payment window expired", "worker", {
+                        "invoice_id": inv.invoice_id,
+                        "current_block": blk_for_log,
+                        "window_end": end
+                    })
+                    miner_logger.phase_panel(
+                        MinerPhase.SETTLEMENT, "PAY Exit",
+                        [("inv", inv.invoice_id), ("reason", "window over"), ("blk", blk_for_log), ("end", end)],
+                        LogLevel.HIGH
+                    )
 
                 inv.pay_attempts += 1
-                inv.last_response = str(resp)[:300]
+                if resp:
+                    inv.last_response = str(resp)[:300]
 
                 if ok and inv.paid:
                     break

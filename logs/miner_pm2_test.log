@@ -1,0 +1,30 @@
+Traceback (most recent call last):
+  File "/home/usuario1/metahash/metahash/neurons/miner.py", line 11, in <module>
+    import bittensor as bt
+  File "/home/usuario1/miniconda3/lib/python3.13/site-packages/bittensor/__init__.py", line 4, in <module>
+    from .utils.btlogging import logging
+  File "/home/usuario1/miniconda3/lib/python3.13/site-packages/bittensor/utils/__init__.py", line 19, in <module>
+    from bittensor.utils.btlogging import logging
+  File "/home/usuario1/miniconda3/lib/python3.13/site-packages/bittensor/utils/btlogging/__init__.py", line 11, in <module>
+    logging = LoggingMachine(LoggingMachine.config())
+  File "/home/usuario1/miniconda3/lib/python3.13/site-packages/bittensor/utils/btlogging/loggingmachine.py", line 142, in __init__
+    self._queue = mp.Queue(-1)
+                  ~~~~~~~~^^^^
+  File "/home/usuario1/miniconda3/lib/python3.13/multiprocessing/context.py", line 103, in Queue
+    return Queue(maxsize, ctx=self.get_context())
+  File "/home/usuario1/miniconda3/lib/python3.13/multiprocessing/queues.py", line 41, in __init__
+    self._rlock = ctx.Lock()
+                  ~~~~~~~~^^
+  File "/home/usuario1/miniconda3/lib/python3.13/multiprocessing/context.py", line 68, in Lock
+    return Lock(ctx=self.get_context())
+  File "/home/usuario1/miniconda3/lib/python3.13/multiprocessing/synchronize.py", line 169, in __init__
+    SemLock.__init__(self, SEMAPHORE, 1, 1, ctx=ctx)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/usuario1/miniconda3/lib/python3.13/multiprocessing/synchronize.py", line 57, in __init__
+    sl = self._semlock = _multiprocessing.SemLock(
+                         ~~~~~~~~~~~~~~~~~~~~~~~~^
+        kind, value, maxvalue, self._make_name(),
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        unlink_now)
+        ^^^^^^^^^^^
+PermissionError: [Errno 13] Permission denied
