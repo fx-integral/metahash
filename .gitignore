@@ -10,8 +10,10 @@ __pycache__/
 .hypothesis
 .pytest_cache
 local/
+logs/
 test/
 miner_state.json
 pending_commits.json
 validated_epochs.json
 metahash.egg-info/
+.pm2/

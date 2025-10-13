@@ -292,19 +292,36 @@ class Runtime:
 
         unique_ids = list(dict.fromkeys(int(s) for s in subnet_ids))
 
+        current_block = await self.get_current_block()
+        block_arg: Optional[int] = current_block if current_block and current_block > 0 else None
+
         # Serialize RPCs to avoid concurrent recv() on the same websocket
         out: Dict[int, float] = {}
         for sid in unique_ids:
             try:
                 async with self._rpc_lock:  # type: ignore[arg-type]
-                    res = await st.get_stake(
+                    kwargs: Dict[str, Any] = dict(
                         coldkey_ss58=cold_ss58,
                         hotkey_ss58=validator_hotkey_ss58,
                         netuid=int(sid),
-                        reuse_block=True,
+                        reuse_block=False,
                     )
+                    if block_arg is not None:
+                        kwargs["block"] = block_arg
+                    res = await st.get_stake(**kwargs)
                 out[int(sid)] = self._balance_to_alpha(res)
-            except Exception:
+            except Exception as e:
+                log_init(
+                    LogLevel.ERROR,
+                    "Failed to fetch delegated stake",
+                    "stake",
+                    {
+                        "subnet_id": int(sid),
+                        "validator_hotkey": validator_hotkey_ss58,
+                        "block": block_arg,
+                        "error": str(e),
+                    },
+                )
                 out[int(sid)] = 0.0
         return out
 
