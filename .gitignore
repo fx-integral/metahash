@@ -9,8 +9,12 @@ __pycache__/
 .vscode
 .hypothesis
 .pytest_cache
+cache/
 local/
+logs/
 test/
 miner_state.json
 pending_commits.json
 validated_epochs.json
+metahash.egg-info/
+.pm2/

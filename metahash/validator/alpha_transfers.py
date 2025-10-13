@@ -27,6 +27,7 @@ from substrateinterface.utils.ss58 import (
     ss58_decode as _ss58_decode_generic,
     ss58_encode as _ss58_encode_generic,
 )
+from async_substrate_interface.errors import SubstrateRequestException
 
 from metahash.config import MAX_CONCURRENCY
 
@@ -47,7 +48,12 @@ async def maybe_async(fn: Callable[..., T] | T, *args, **kwargs) -> T:  # noqa: 
         return await fn  # type: ignore[return-value]
     if asyncio.iscoroutinefunction(fn):
         return await fn(*args, **kwargs)  # type: ignore[misc]
-    return await asyncio.to_thread(fn, *args, **kwargs)
+    # Call synchronous function in thread to avoid blocking the event loop.
+    # Critically, if it returns an awaitable (e.g., a cached coroutine), await it here.
+    result = await asyncio.to_thread(fn, *args, **kwargs)
+    if inspect.isawaitable(result):
+        return await result  # type: ignore[return-value]
+    return result  # type: ignore[return-value]
 
 
 def _name(obj) -> str | None:
@@ -63,37 +69,6 @@ def _name(obj) -> str | None:
     return str(obj)
 
 
-def _allowed_extrinsic_indices(  # noqa: PLR0911
-    self,
-    extrinsics,
-    block_num: int,
-) -> set[int]:
-    """Whitelist extrinsic indices inside *extrinsics* that are allowed to produce α-stake events.
-
-    • Always allow SubtensorModule.transfer_stake.
-    • Allow Utility.{batch,force_batch,batch_all} only when self.allow_batch is True.
-    """
-    allowed: set[int] = set()
-    for idx, ex in enumerate(extrinsics):
-        try:
-            pallet = _name(ex["call"]["call_module"])
-            func = _name(ex["call"]["call_function"])
-            if self.debug_extr:
-                bt.logging.debug(f"[blk {block_num}] ex#{idx} {pallet}.{func}")
-            # 1️⃣ direct α-stake transfer
-            if (pallet, func) == ("SubtensorModule", "transfer_stake"):
-                allowed.add(idx)
-            # 2️⃣ optional Utility batches
-            elif (
-                pallet == "Utility"
-                and func in UTILITY_FUNS
-                and getattr(self, "allow_batch", False)
-            ):
-                allowed.add(idx)
-        except Exception as err:
-            if self.debug_extr:
-                bt.logging.debug(f"[blk {block_num}] ex#{idx} unreadable – {err!s}")
-    return allowed
 
 
 # ── constants ───────────────────────────────────────────────────────────
@@ -120,31 +95,163 @@ class TransferEvent:
 
 
 # ── SS58 helpers ────────────────────────────────────────────────────────
-def _encode_ss58(raw: bytes, fmt: int) -> str:  # noqa: D401
+def _encode_ss58(raw: Optional[bytes], fmt: int) -> Optional[str]:  # noqa: D401
+    """
+    Safely encode a 32-byte AccountId to SS58; returns None if input missing or if library signatures mismatch.
+
+    Handles both:
+      • ss58_encode(bytes_or_hex, address_type)
+      • ss58_encode(pubkey=<bytes>, address_type=<int>)
+      • ss58_encode(address=<hexstr>, address_type=<int>)
+    """
+    if raw is None:
+        return None
+
+    # 1) Try the common positional (pubkey, fmt)
     try:
-        return _ss58_encode_generic(raw, fmt)
-    except TypeError:
-        return _ss58_encode_generic(raw, address_type=fmt)
+        out = _ss58_encode_generic(raw, fmt)  # some versions accept pubkey bytes here
+        return out
+    except Exception as e1:
+        pass
+
+    # 2) Try explicit keywords (pubkey=..., address_type=...)
+    try:
+        out = _ss58_encode_generic(pubkey=raw, address_type=fmt)  # substrate-interface style
+        return out
+    except Exception as e2:
+        pass
+
+    # 3) Try hex "address" path that some scalecodec versions expect
+    try:
+        out = _ss58_encode_generic(address="0x" + raw.hex(), address_type=fmt)
+        return out
+    except Exception as e3:
+        pass
+
+    # 4) Last resort: give up quietly; caller will drop the event if None
+    return None
 
 
 def _decode_ss58(addr: str) -> bytes:  # noqa: D401
+    """
+    Decode SS58 to raw 32-byte account id; tolerate signature differences across libraries.
+    """
     try:
-        return _ss58_decode_generic(addr)
-    except TypeError:
-        return _ss58_decode_generic(addr, valid_ss58_format=True)
+        result = _ss58_decode_generic(addr)
+        # Handle case where decode returns string instead of bytes
+        if isinstance(result, str):
+            # Try to convert hex string to bytes
+            if result.startswith('0x'):
+                return bytes.fromhex(result[2:])
+            else:
+                return bytes.fromhex(result)
+        elif isinstance(result, bytes):
+            return result
+        else:
+            # Try different formats
+            for fmt in [42, 0, 2]:
+                try:
+                    result = _ss58_decode_generic(addr, valid_ss58_format=fmt)
+                    if isinstance(result, str):
+                        if result.startswith('0x'):
+                            return bytes.fromhex(result[2:])
+                        else:
+                            return bytes.fromhex(result)
+                    elif isinstance(result, bytes):
+                        return result
+                except Exception:
+                    continue
+            raise ValueError(f"Could not decode SS58 address: {addr}")
+    except Exception as e:
+        # Try different formats as fallback
+        for fmt in [42, 0, 2]:
+            try:
+                result = _ss58_decode_generic(addr, valid_ss58_format=fmt)
+                if isinstance(result, str):
+                    if result.startswith('0x'):
+                        return bytes.fromhex(result[2:])
+                    else:
+                        return bytes.fromhex(result)
+                elif isinstance(result, bytes):
+                    return result
+            except Exception:
+                continue
+        raise ValueError(f"Could not decode SS58 address: {addr} - {e}")
 
 
 def _account_id(obj) -> bytes | None:  # noqa: ANN001,D401
-    if isinstance(obj, (bytes, bytearray)) and len(obj) == 32:
-        return bytes(obj)
+    # Direct bytes-like 32 length
+    if isinstance(obj, (bytes, bytearray)):
+        try:
+            return bytes(obj) if len(obj) == 32 else None
+        except Exception:
+            return None
+    # Common scalecodec container shapes
+    if hasattr(obj, "value"):
+        try:
+            return _account_id(getattr(obj, "value"))
+        except Exception:
+            pass
+    if isinstance(obj, dict):
+        # Some versions wrap under 'value' first
+        if "value" in obj:
+            v = obj.get("value")
+            got = _account_id(v)
+            if got is not None:
+                return got
+        # Named variants e.g. {'Id': '0x..'}, {'AccountId': bytes}, {'AccountId32': {...}}
+        inner = (
+            obj.get("Id")
+            or obj.get("AccountId")
+            or obj.get("AccountId32")
+            or next(iter(obj.values()), None)
+        )
+        return _account_id(inner)
+    # List of ints or nested singleton
     if isinstance(obj, (list, tuple)):
         if len(obj) == 32 and all(isinstance(x, int) for x in obj):
-            return bytes(obj)
+            try:
+                return bytes(obj)  # list[int] -> bytes
+            except Exception:
+                return None
         if len(obj) == 1:
             return _account_id(obj[0])
-    if isinstance(obj, dict):
-        inner = obj.get("Id") or obj.get("AccountId") or next(iter(obj.values()), None)
-        return _account_id(inner)
+    # Hex string e.g. '0x..'
+    if isinstance(obj, str):
+        s = obj.strip()
+        if s.startswith("0x") and len(s) >= 66:  # 32 bytes -> 64 hex chars + 0x
+            try:
+                b = bytes.fromhex(s[2:])
+                return b if len(b) == 32 else None
+            except Exception:
+                return None
+        # Try SS58 decode
+        try:
+            b = _decode_ss58(s)
+            if isinstance(b, (bytes, bytearray)) and len(b) == 32:
+                return b
+            else:
+                pass
+        except Exception as e:
+            pass
+        
+        # Try with different SS58 formats as fallback
+        for fmt in [42, 0, 2]:  # Common SS58 formats
+            try:
+                b = _ss58_decode_generic(s, valid_ss58_format=fmt)
+                # Handle string result from decode
+                if isinstance(b, str):
+                    if b.startswith('0x'):
+                        b = bytes.fromhex(b[2:])
+                    else:
+                        b = bytes.fromhex(b)
+                if isinstance(b, (bytes, bytearray)) and len(b) == 32:
+                    return b
+                else:
+                    pass
+            except Exception as fmt_e:
+                continue
+        return None
     return None
 
 
@@ -172,9 +279,37 @@ def _event_fields(ev) -> Sequence:  # noqa: ANN001
 
 def _f(params, idx, default=None):  # noqa: ANN001
     try:
-        val = params[idx]
+        # Support both list/tuple and dict-like event params
+        if isinstance(params, dict):
+            # Preserve insertion order from dict.values() (Python 3.7+)
+            vals = list(params.values())
+            val = vals[idx]
+        else:
+            val = params[idx]
         return val["value"] if isinstance(val, dict) and "value" in val else val
     except (IndexError, TypeError):
+        return default
+
+
+def _fk(params, key_names: Sequence[str], default=None):  # noqa: ANN001
+    """Fetch parameter by any of the candidate names from dict-shaped params or list of (name,value) dicts."""
+    try:
+        # Direct dict with named attributes
+        if isinstance(params, dict):
+            for k in key_names:
+                if k in params:
+                    v = params.get(k)
+                    return v["value"] if isinstance(v, dict) and "value" in v else v
+        # List/tuple of dicts that look like {name:..., value:...}
+        if isinstance(params, (list, tuple)):
+            for item in params:
+                if isinstance(item, dict):
+                    name = item.get("name") or item.get("id") or item.get("key")
+                    if isinstance(name, str) and name in key_names:
+                        v = item.get("value") if "value" in item else item.get(name)
+                        return v
+        return default
+    except Exception:
         return default
 
 
@@ -185,16 +320,23 @@ def _mask(ck: Optional[str]) -> str:
 # ── parser helpers ──────────────────────────────────────────────────────
 def _parse_stake_transferred(params, fmt: int) -> TransferEvent:  # noqa: ANN001
     """Parse StakeTransferred event parameters (chain v9 & v10)."""
-    from_coldkey_raw = _account_id(_f(params, 0))
-    dest_coldkey_raw = _account_id(_f(params, 1))
-    subnet_id = int(_f(params, 3, -1))  # destination netuid
-    to_uid = int(_f(params, 4, -1))
+    # Prefer named keys when available
+    from_val = _fk(params, ["from_coldkey", "from", "src", "source", "who"]) or _f(params, 0)
+    to_val = _fk(params, ["to_coldkey", "to", "dest", "destination"]) or _f(params, 1)
+    net_val = _fk(params, ["dest_netuid", "netuid", "subnet", "to_netuid"]) or _f(params, 3, -1)
+    uid_val = _fk(params, ["to_uid", "uid", "dest_uid"]) or _f(params, 4, -1)
+    amt_val = _fk(params, ["amount", "value", "stake", "amt", "rao"]) or _f(params, 5, 0)
+
+    from_coldkey_raw = _account_id(from_val)
+    dest_coldkey_raw = _account_id(to_val)
+    subnet_id = int(net_val if net_val is not None else -1)
+    to_uid = int(uid_val if uid_val is not None else -1)
     return TransferEvent(
         block=-1,
         from_uid=-1,  # origin UID not provided
         to_uid=to_uid,
         subnet_id=subnet_id,  # = dest netuid
-        amount_rao=int(_f(params, 5, 0)),  # placeholder, fixed later
+        amount_rao=int(amt_val or 0),  # placeholder, fixed later
         src_coldkey=_encode_ss58(from_coldkey_raw, fmt),
         dest_coldkey=_encode_ss58(dest_coldkey_raw, fmt),
         src_coldkey_raw=from_coldkey_raw,
@@ -252,6 +394,38 @@ class AlphaTransfersScanner:
         self.ss58_format = subtensor.substrate.ss58_format
         self._rpc_lock: asyncio.Lock = rpc_lock or asyncio.Lock()
 
+    def _allowed_extrinsic_indices(  # noqa: PLR0911
+        self,
+        extrinsics,
+        block_num: int,
+    ) -> set[int]:
+        """Whitelist extrinsic indices inside *extrinsics* that are allowed to produce α-stake events.
+
+        • Always allow SubtensorModule.transfer_stake.
+        • Allow Utility.{batch,force_batch,batch_all} only when self.allow_batch is True.
+        """
+        allowed: set[int] = set()
+        for idx, ex in enumerate(extrinsics):
+            try:
+                pallet = _name(ex["call"]["call_module"])
+                func = _name(ex["call"]["call_function"])
+                if self.debug_extr:
+                    bt.logging.debug(f"[blk {block_num}] ex#{idx} {pallet}.{func}")
+                # 1️⃣ direct α-stake transfer
+                if (pallet, func) == ("SubtensorModule", "transfer_stake"):
+                    allowed.add(idx)
+                # 2️⃣ optional Utility batches
+                elif (
+                    pallet == "Utility"
+                    and func in UTILITY_FUNS
+                    and getattr(self, "allow_batch", False)
+                ):
+                    allowed.add(idx)
+            except Exception as err:
+                if self.debug_extr:
+                    bt.logging.debug(f"[blk {block_num}] ex#{idx} unreadable – {err!s}")
+        return allowed
+
     async def _rpc(self, fn, *a, **kw):
         """
         Call substrate functions safely by:
@@ -271,18 +445,29 @@ class AlphaTransfersScanner:
 
     async def _get_block(self, bn: int):
         """Return *(events, extrinsics_list)* for block *bn* with strict normalization."""
+        # Get block hash
         bh = await self._rpc(self.st.substrate.get_block_hash, block_id=int(bn))
-        # Guard block hash type
-        if not isinstance(bh, (str, bytes)):
-            bh = str(bh)
 
-        # Fetch events / block
-        events = await self._rpc(self.st.substrate.get_events, block_hash=bh)
-        blk = await self._rpc(self.st.substrate.get_block, block_hash=bh)
+        # Guard block hash
+        if not bh:
+            raise ValueError(f"Got empty block hash for block {bn}")
+
+        # Normalize block hash to a hex string for downstream RPCs.
+        # Some substrate clients expect a string and will call .replace on it.
+        if isinstance(bh, (bytes, bytearray)):
+            bh_str = "0x" + bytes(bh).hex()
+        else:
+            bh_str = str(bh)
+
+        # Fetch events / block using normalized hash
+        events = await self._rpc(self.st.substrate.get_events, block_hash=bh_str)
+        blk = await self._rpc(self.st.substrate.get_block, block_hash=bh_str)
+        
+        # Reduced logging - only log block processing errors
 
         # Normalize events to a list of dict-ish items
         if not isinstance(events, list):
-            events = []
+            raise TypeError(f"Expected list from get_events, got {type(events).__name__}")
 
         # Normalize extrinsics shape
         if isinstance(blk, dict):
@@ -296,7 +481,7 @@ class AlphaTransfersScanner:
 
         # Ensure list
         if not isinstance(extrinsics, list):
-            extrinsics = []
+            raise TypeError(f"Expected list for extrinsics, got {type(extrinsics).__name__}")
 
         return events, extrinsics
 
@@ -304,7 +489,7 @@ class AlphaTransfersScanner:
         if frm > to:
             return []
         total = to - frm + 1
-        bt.logging.info(f"Scanner: frm={frm} to={to} ({total} blocks)")
+        bt.logging.info(f"[SCANNER] Starting scan: blocks {frm} to {to} ({total} blocks)")
 
         q: asyncio.Queue[int | None] = asyncio.Queue()
         events_by_block: Dict[int, list[TransferEvent]] = {}
@@ -328,31 +513,28 @@ class AlphaTransfersScanner:
                     break
                 try:
                     raw_events, extrinsics = await self._get_block(bn)
-                    allowed_idx = _allowed_extrinsic_indices(self, extrinsics, bn)
-                    # Normalize event rows to dicts; drop weird shapes/strings
-                    cleaned = []
-                    for ev in raw_events or []:
-                        if not isinstance(ev, dict):
-                            continue
-                        idx = ev.get("extrinsic_idx")
-                        if idx in allowed_idx or idx is None:
-                            cleaned.append(ev)
-                    raw_events = cleaned
-                except websockets.exceptions.WebSocketException as err:
-                    bt.logging.error(f"RPC error at block {bn}: {err}; skipping block.")
-                    # Skip this block, continue scanning
-                    blk_cnt += 1
-                    continue
-                except TypeError as terr:
-                    # Typical after ws task blows up and returns a bad shape;
-                    # avoid aborting the whole scan.
-                    bt.logging.error(f"Type error at block {bn}: {terr}; skipping block.")
-                    blk_cnt += 1
-                    continue
                 except Exception as err:
-                    bt.logging.error(f"Unexpected error at block {bn}: {err}; skipping block.")
-                    blk_cnt += 1
+                    bt.logging.error(
+                        f"[SCANNER] block {bn}: failed to fetch block data: {err}"
+                    )
                     continue
+
+                allowed_idx = self._allowed_extrinsic_indices(extrinsics, bn)
+                # Normalize event rows to dicts; drop weird shapes/strings
+                cleaned = []
+                for ev in raw_events or []:
+                    if not isinstance(ev, dict):
+                        bt.logging.error(
+                            f"[SCANNER] block {bn}: skip non-dict event of type {type(ev).__name__}"
+                        )
+                        continue
+                    idx = ev.get("extrinsic_idx")
+                    if idx is None:
+                        # Newer interfaces sometimes use 'extrinsic_index'
+                        idx = ev.get("extrinsic_index")
+                    if idx in allowed_idx or idx is None:
+                        cleaned.append(ev)
+                raw_events = cleaned
 
                 bucket = events_by_block.setdefault(bn, [])
                 seen, kept = self._accumulate(
@@ -360,6 +542,7 @@ class AlphaTransfersScanner:
                     bucket,
                     block_hint_single=bn,
                     dump=self.dump_events and bn >= to - self.dump_last + 1,
+                    extrinsics=extrinsics,
                 )
                 ev_cnt += seen
                 keep_cnt += kept
@@ -374,7 +557,9 @@ class AlphaTransfersScanner:
             *[asyncio.create_task(worker()) for _ in range(self.max_conc)],
         )
 
-        bt.logging.info(f"✓ scan finished: {blk_cnt} blk, {ev_cnt} ev, {keep_cnt} kept")
+        bt.logging.info(f"[SCANNER] ✓ Scan finished: {blk_cnt}/{total} blocks processed, {ev_cnt} events found, {keep_cnt} kept")
+        if blk_cnt < total:
+            bt.logging.warning(f"[SCANNER] ⚠️  Only processed {blk_cnt}/{total} blocks - some blocks were skipped due to errors")
         await _flush_progress()
 
         ordered_events: List[TransferEvent] = []
@@ -389,28 +574,125 @@ class AlphaTransfersScanner:
         *,
         block_hint_single: int,
         dump: bool,
+        extrinsics: Optional[Sequence] = None,
     ) -> Tuple[int, int]:
         """Filters one block’s events; mutates *out*; returns (seen, kept)."""
         seen = kept = 0
         scratch: Dict[int, Dict] = {}  # per-extrinsic bucket
 
+        def _accounts_from_extrinsic(ex) -> Tuple[bytes | None, bytes | None]:
+            """Try to extract up to two distinct 32-byte AccountIds from an extrinsic's call args."""
+            try:
+                args = None
+                if isinstance(ex, dict):
+                    args = ex.get("call", {}).get("args") or ex.get("args")
+                else:
+                    args = getattr(getattr(ex, "call", None), "args", None) or getattr(ex, "args", None)
+                if args is None:
+                    return None, None
+                # Flatten nested values
+                vals: list = []
+                if isinstance(args, dict):
+                    vals.extend(args.values())
+                elif isinstance(args, (list, tuple)):
+                    vals.extend(args)
+                # Dive one level for dict/list containers
+                flat: list = []
+                for v in vals:
+                    if isinstance(v, dict):
+                        flat.extend(v.values())
+                    elif isinstance(v, (list, tuple)):
+                        flat.extend(v)
+                    else:
+                        flat.append(v)
+                found: list[bytes] = []
+                for v in flat:
+                    raw = _account_id(v)
+                    if raw is not None and raw not in found:
+                        found.append(raw)
+                    if len(found) >= 2:
+                        break
+                a = found[0] if len(found) >= 1 else None
+                b = found[1] if len(found) >= 2 else None
+                return a, b
+            except Exception:
+                return None, None
+
         for ev in raw_events:
             idx = ev.get("extrinsic_idx")
+            name = _event_name(ev)
             if idx is None:
                 continue  # ignore system events
             bucket = scratch.setdefault(idx, {})
-            name = _event_name(ev)
             fields = _event_fields(ev)
+            # Normalize dict-like fields to a list of values for downstream helpers
+            if isinstance(fields, dict):
+                fields = list(fields.values())
+            elif isinstance(fields, (list, tuple)):
+                fields = list(fields)
+            else:
+                fields = [fields] if fields is not None else []
 
             if name == "StakeRemoved":
                 bucket["src_amt"] = _amount_from_stake_removed(fields)
                 bucket["src_net"] = _subnet_from_stake_removed(fields)
+                # Try to capture source coldkey raw from any AccountId-like field
+                if "src_raw" not in bucket:
+                    # scan both normalized list and original mapping
+                    candidates = []
+                    if isinstance(fields, (list, tuple)):
+                        candidates.extend(fields)
+                    elif isinstance(fields, dict):
+                        candidates.extend(fields.values())
+                    for v in candidates:
+                        raw = _account_id(v)
+                        if raw is not None:
+                            bucket["src_raw"] = raw
+                            break
             elif name == "StakeAdded":
                 bucket["dst_amt"] = _amount_from_stake_added(fields)
                 bucket["dst_net"] = _subnet_from_stake_added(fields)
+                # Try to capture destination coldkey raw from any AccountId-like field
+                if "dst_raw" not in bucket:
+                    candidates = []
+                    if isinstance(fields, (list, tuple)):
+                        candidates.extend(fields)
+                    elif isinstance(fields, dict):
+                        candidates.extend(fields.values())
+                    for v in candidates:
+                        raw = _account_id(v)
+                        if raw is not None:
+                            bucket["dst_raw"] = raw
+                            break
             elif name == "StakeTransferred":
                 seen += 1
+                
                 bucket["te"] = _parse_stake_transferred(fields, self.ss58_format)
+                # Also try to record raw accounts from this event directly if present
+                if "src_raw" not in bucket:
+                    candidates = []
+                    if isinstance(fields, (list, tuple)):
+                        candidates.extend(fields)
+                    elif isinstance(fields, dict):
+                        candidates.extend(fields.values())
+                    for i, v in enumerate(candidates):
+                        raw = _account_id(v)
+                        if raw is not None:
+                            bucket["src_raw"] = raw
+                            break
+                if "dst_raw" not in bucket:
+                    candidates = []
+                    if isinstance(fields, (list, tuple)):
+                        candidates.extend(fields)
+                    elif isinstance(fields, dict):
+                        candidates.extend(fields.values())
+                    for i, v in enumerate(candidates):
+                        raw = _account_id(v)
+                        if raw is not None:
+                            # do not overwrite src_raw if only one account found
+                            if "src_raw" in bucket and bucket["src_raw"] != raw:
+                                bucket["dst_raw"] = raw
+                                break
 
             te: TransferEvent | None = bucket.get("te")
             if te is None:
@@ -420,6 +702,22 @@ class AlphaTransfersScanner:
                 te = replace(te, amount_rao=bucket["dst_amt"])
             if "src_net" in bucket:
                 te = replace(te, src_subnet_id=bucket["src_net"])
+            # Enrich with captured raw account ids if missing from parsed TE
+            if getattr(te, "src_coldkey_raw", None) is None and "src_raw" in bucket:
+                raw = bucket.get("src_raw")
+                te = replace(te, src_coldkey_raw=raw, src_coldkey=_encode_ss58(raw, self.ss58_format))
+            if getattr(te, "dest_coldkey_raw", None) is None and "dst_raw" in bucket:
+                raw = bucket.get("dst_raw")
+                te = replace(te, dest_coldkey_raw=raw, dest_coldkey=_encode_ss58(raw, self.ss58_format))
+            # Final fallback: try reading accounts from extrinsic args when both missing
+            if (te.src_coldkey_raw is None or te.dest_coldkey_raw is None) and extrinsics is not None:
+                ex = extrinsics[idx] if isinstance(extrinsics, list) and 0 <= idx < len(extrinsics) else None
+                a, b = _accounts_from_extrinsic(ex)
+                # Only apply if we don't already have values
+                if te.src_coldkey_raw is None and a is not None:
+                    te = replace(te, src_coldkey_raw=a, src_coldkey=_encode_ss58(a, self.ss58_format))
+                if te.dest_coldkey_raw is None and b is not None and b != (te.src_coldkey_raw or a):
+                    te = replace(te, dest_coldkey_raw=b, dest_coldkey=_encode_ss58(b, self.ss58_format))
 
             # SECURITY: drop cross-subnet
             if te.src_subnet_id is not None and te.src_subnet_id != te.subnet_id:
@@ -427,7 +725,17 @@ class AlphaTransfersScanner:
                 continue
 
             te = replace(te, block=block_hint_single)
-            if te.amount_rao > 0 and (self.dest_ck is None or te.dest_coldkey == self.dest_ck):
+            # Require usable addresses; drop if encoding failed or missing
+            if te.amount_rao > 0 \
+               and te.src_coldkey is not None \
+               and te.dest_coldkey is not None \
+               and (self.dest_ck is None or te.dest_coldkey == self.dest_ck):
+                keep_msg = (
+                    f"[SCANNER] keeping transfer | blk={block_hint_single} "
+                    f"idx={idx} net={te.subnet_id} α={te.amount_rao} "
+                    f"src={_mask(te.src_coldkey)} dst={_mask(te.dest_coldkey)}"
+                )
+                bt.logging.debug(keep_msg)
                 kept += 1
                 out.append(te)
                 if dump:
@@ -436,6 +744,25 @@ class AlphaTransfersScanner:
                         f"net={te.subnet_id} uid={te.from_uid}->{te.to_uid} "
                         f"α={te.amount_rao} **KEPT** (to {_mask(te.dest_coldkey)})"
                     )
+            else:
+                # Verbose reason for drop
+                reason_parts = []
+                if te.amount_rao <= 0:
+                    reason_parts.append("nonpositive_amount")
+                if te.src_coldkey is None:
+                    reason_parts.append("src_ck_none")
+                if te.dest_coldkey is None:
+                    reason_parts.append("dest_ck_none")
+                if (self.dest_ck is not None) and (te.dest_coldkey != self.dest_ck):
+                    reason_parts.append("treasury_mismatch")
+                reason_msg = ",".join(reason_parts) or "unknown"
+                drop_msg = (
+                    f"[SCANNER] dropping transfer | blk={block_hint_single} "
+                    f"idx={idx} reasons={reason_msg} net={te.subnet_id} "
+                    f"α={te.amount_rao} src={_mask(te.src_coldkey)} "
+                    f"dst={_mask(te.dest_coldkey)}"
+                )
+                bt.logging.warning(drop_msg)
             scratch.pop(idx, None)
 
         return seen, kept

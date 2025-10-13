@@ -1,735 +1,548 @@
 #!/usr/bin/env python3
-# neurons/miner.py — Event-driven bidder v2.8.0 (hardened)
+# neurons/miner.py
 
 import asyncio
-import time
-from math import isfinite
+import os
+import sys
+import faulthandler
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Any
 
 import bittensor as bt
-from bittensor import Synapse, BLOCKTIME
+from bittensor import Synapse
 
-from metahash.miner.models import BidLine, WinInvoice
+    # Enable debug mode by default (can be disabled via environment variable)
+DEBUG_ASYNC = os.getenv("METAHASH_DEBUG_ASYNC", "0") not in ("0", "", "false", "False", "no", "No")
+
+# Enable Python's own async debug and fault handler by default
+if DEBUG_ASYNC:
+    os.environ.setdefault("PYTHONASYNCIODEBUG", "1")
+    os.environ.setdefault("PYTHONUNBUFFERED", "1")
+    faulthandler.enable(file=sys.stderr)
+
 from metahash.base.miner import BaseMinerNeuron
-from metahash.miner.mixins import MinerMixins
-
 from metahash.base.utils.logging import ColoredLogger as clog
 from metahash.protocol import AuctionStartSynapse, WinSynapse
-from metahash.config import (
-    PLANCK,
-    S_MIN_ALPHA_MINER,
-)
-from metahash.utils.pretty_logs import pretty
-from metahash.utils.wallet_utils import unlock_wallet, transfer_alpha
 from metahash.treasuries import VALIDATOR_TREASURIES
+from metahash.utils.pretty_logs import pretty
+from metahash.utils.wallet_utils import unlock_wallet
+from metahash.miner.logging import (
+    MinerPhase, LogLevel, miner_logger, 
+    init_banner, log_init, log_auction, log_commitments, log_settlement
+)
+from metahash.utils.async_debug import loop_info_dict
+
+# Compact components
+from metahash.miner.state import StateStore
+from metahash.miner.runtime import Runtime
+from metahash.miner.payments import Payments
+from metahash.miner.autosell import AutoSellManager, AutoSellConfig
+from metahash.miner.bidding_control import BiddingController, BiddingControlConfig
 
 
-class Miner(BaseMinerNeuron, MinerMixins):
+def _strip_internals_inplace(syn: Any) -> None:
+    """
+    Remove transient / non-serializable attributes that may be attached by the
+    inbound call context (e.g., dendrite with a `uids` slice). This prevents
+    Axon/Pydantic from walking into a Python `slice` and raising:
+      TypeError: unhashable type: 'slice'
+    """
+    def _recursive_clean(obj, visited=None, path=""):
+        if visited is None:
+            visited = set()
+
+        # Handle None objects early
+        if obj is None:
+            return
+
+        # Prevent infinite recursion
+        obj_id = id(obj)
+        if obj_id in visited:
+            return
+        visited.add(obj_id)
+
+        # Handle slice objects directly
+        if isinstance(obj, slice):
+            return None
+
+        # Handle dictionaries
+        if isinstance(obj, dict):
+            for key, value in list(obj.items()):
+                if isinstance(value, slice):
+                    obj[key] = None
+                elif value is not None and (hasattr(value, '__dict__') or isinstance(value, (dict, list, tuple))):
+                    _recursive_clean(value, visited, f"{path}[{key}]")
+
+        # Handle lists and tuples
+        elif isinstance(obj, (list, tuple)):
+            for i, item in enumerate(obj):
+                if isinstance(item, slice):
+                    if isinstance(obj, list):
+                        obj[i] = None
+                elif item is not None and (hasattr(item, '__dict__') or isinstance(item, (dict, list, tuple))):
+                    _recursive_clean(item, visited, f"{path}[{i}]")
+
+        # Handle objects with attributes
+        elif hasattr(obj, '__dict__'):
+            for attr_name in list(obj.__dict__.keys()):
+                try:
+                    attr_value = getattr(obj, attr_name)
+                    if isinstance(attr_value, slice):
+                        setattr(obj, attr_name, None)
+                    elif attr_value is not None and (hasattr(attr_value, '__dict__') or isinstance(attr_value, (dict, list, tuple))):
+                        _recursive_clean(attr_value, visited, f"{path}.{attr_name}")
+                except Exception:
+                    pass
+    
+    # First, recursively clean any nested slice objects
+    _recursive_clean(syn)
+    
+    # Most important: inbound context
+    for attr in ("dendrite", "_dendrite"):
+        if hasattr(syn, attr):
+            try:
+                setattr(syn, attr, None)
+            except Exception:
+                try:
+                    delattr(syn, attr)
+                except Exception:
+                    pass
+
+    # Extra caution: sometimes frameworks attach other transient handles
+    for attr in ("axon", "_axon", "server", "_server", "context", "_context"):
+        if hasattr(syn, attr):
+            try:
+                setattr(syn, attr, None)
+            except Exception:
+                try:
+                    delattr(syn, attr)
+                except Exception:
+                    pass
+
+
+class Miner(BaseMinerNeuron):
+    """
+    Thin orchestrator:
+      - Per-coldkey state scoping (safe fallback name if dir fails)
+      - Creates Runtime (auction + chain helpers) and Payments (background loop + workers)
+      - Delegates protocol handlers
+    """
+
     def __init__(self, config=None):
         super().__init__(config=config)
 
-        # Local persistent state
-        self._state_file = Path("miner_state.json")
-
-        # SECURITY: Treasuries are pinned to the local allowlist. Do *not* mutate
-        # from network input or persisted state. We overwrite any restored version
-        # right after load to avoid stale/poisoned data.
-        self._treasuries: Dict[str, str] = {}
-
-        # Remember if we have already bid to a validator in an epoch
-        self._already_bid: Dict[str, List[Tuple[int, int, float, int]]] = {}  # validator_key -> list of (epoch, subnet, alpha, discount_bps)
-        self._wins: List[WinInvoice] = []
-
-        # Guards
-        self._pay_lock: asyncio.Lock = asyncio.Lock()    # prevent concurrent tx on-chain
-        self._state_lock: asyncio.Lock = asyncio.Lock()  # serialize state writes
-
-        # Async subtensor bound to axon loop
-        self._async_subtensor: Optional[bt.AsyncSubtensor] = None
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
-
-        # Per-invoice tasks (no global daemon)
-        self._payment_tasks: Dict[str, asyncio.Task] = {}
-
-        # Discount mode: default False (use effective-discount transformation)
-        # Will be finalized by _build_lines_from_config()
-        self._bids_raw_discount: bool = False
-
-        # Optional: start fresh
-        if getattr(self.config, "fresh", False):
-            self._wipe_state()
-            pretty.log("[magenta]Fresh start requested: cleared local miner state.[/magenta]")
-
-        # Load persisted state (wins, etc.). Immediately re-pin treasuries.
-        self._load_state_file()
-        # SECURITY: pin to local allowlist after loading persisted state
-        self._treasuries = dict(VALIDATOR_TREASURIES)
-
-        # Build bid lines from CLI/config
-        self.lines: List[BidLine] = self._build_lines_from_config()
-
-        pretty.banner(
-            "Miner started",
-            f"uid={self.uid} | hotkey={self.wallet.hotkey.ss58_address} | lines={len(self.lines)} | epoch(e)={getattr(self, 'epoch_index', 0)}",
-            style="bold magenta",
-        )
-        self._log_cfg_summary()
-        pretty.kv_panel(
-            "[magenta]Local treasuries loaded[/magenta]",
-            [("allowlisted_validators", len(self._treasuries))],
-            style="bold magenta",
-        )
-
+        # Initialize phase-aware logging
+        init_banner("Miner Initialization Started", "Setting up miner components and configuration")
+        
+        # Initialize shared AsyncSubtensor with proper network configuration
+        self._initialize_shared_async_subtensor()
+        
+        # Wallet unlock (best-effort)
+        log_init(LogLevel.MEDIUM, "Unlocking wallet", "wallet", {"hotkey": getattr(self.wallet.hotkey, "ss58_address", "unknown")})
         unlock_wallet(wallet=self.wallet)
 
-        # Payment source / retry config
-        self._pay_cfg_initialized: bool = False
-        self._pay_rr_index: int = 0
-        self._pay_pool: List[str] = []
-        self._pay_map: Dict[int, str] = {}
-        self._pay_start_safety_blocks: int = 0
-        self._retry_every_blocks: int = 2
-        self._retry_max_attempts: int = 12
-
-    # ---------------------- configuration ----------------------
-
-    def _ensure_payment_config(self):
-        """Load CLI-provided payment sources + retry knobs exactly once."""
-        if self._pay_cfg_initialized:
-            return
-
-        pay_cfg = getattr(self.config, "payment", None)
-
-        # --payment.validators hk1 hk2 ...
+        # ---------------------- Per-coldkey state directory ----------------------
+        log_init(LogLevel.MEDIUM, "Setting up per-coldkey state directory", "state")
+        self._coldkey_ss58: str = getattr(getattr(self.wallet, "coldkey", None), "ss58_address", "") or "unknown_coldkey"
+        desired_state_dir: Path = Path("miner_state") / self._coldkey_ss58
         try:
-            pool = list(getattr(pay_cfg, "validators", [])) if pay_cfg is not None else []
-            self._pay_pool = [hk.strip() for hk in pool if isinstance(hk, str) and hk.strip()]
-            if self._pay_pool:
-                pretty.log(f"[green]Payment pool loaded[/green]: {len(self._pay_pool)} round-robin origin hotkey(s).")
-        except Exception:
-            self._pay_pool = []
+            desired_state_dir.mkdir(parents=True, exist_ok=True)
+            state_path = desired_state_dir / "miner_state.json"
+            self._state_dir = desired_state_dir
+        except Exception as e:
+            self._state_dir = Path(".")
+            state_path = Path(f"miner_state_{self._coldkey_ss58}.json")
+            log_init(LogLevel.HIGH, "State directory creation failed, using fallback", "state", {"error": str(e), "fallback_path": str(state_path)})
 
-        # --payment.map sid:hk sid:hk ...
-        try:
-            pairs = list(getattr(pay_cfg, "map", [])) if pay_cfg is not None else []
-            for item in pairs:
-                if not isinstance(item, str) or ":" not in item:
-                    continue
-                sid_s, hk = item.split(":", 1)
-                sid_s = sid_s.strip()
-                hk = hk.strip()
-                if not sid_s or not hk:
-                    continue
-                try:
-                    sid = int(sid_s)
-                except Exception:
-                    continue
-                self._pay_map[sid] = hk
-            if self._pay_map:
-                pretty.log(f"[green]Payment map loaded[/green]: {len(self._pay_map)} subnet-specific origin hotkey(s).")
-        except Exception:
-            self._pay_map = {}
+        # ---------------------- StateStore ----------------------
+        log_init(LogLevel.MEDIUM, "Initializing state store", "state", {"state_file": str(state_path)})
+        self.state = StateStore(state_path)
 
-        # --payment.start_safety_blocks N
-        try:
-            ssb = int(getattr(pay_cfg, "start_safety_blocks", 0) or 0) if pay_cfg is not None else 0
-            self._pay_start_safety_blocks = max(0, ssb)
-            if self._pay_start_safety_blocks:
-                pretty.log(f"[green]Payment start safety[/green]: +{self._pay_start_safety_blocks} block(s) after window start.")
-        except Exception:
-            self._pay_start_safety_blocks = 0
+        # Optional fresh start
+        if getattr(self.config, "fresh", False):
+            log_init(LogLevel.HIGH, "Fresh start requested - clearing local state", "state", {"coldkey": self._coldkey_ss58})
+            self.state.wipe()
+            log_init(LogLevel.MEDIUM, "Local state cleared successfully", "state")
+        else:
+            # Only load state if not doing a fresh start
+            self.state.load()
+        self.state.treasuries = dict(VALIDATOR_TREASURIES)  # re-pin allowlist
 
-        # --payment.retry_every_blocks N (default 2)
-        try:
-            reb = int(getattr(pay_cfg, "retry_every_blocks", 2) or 2) if pay_cfg is not None else 2
-            self._retry_every_blocks = max(1, reb)
-        except Exception:
-            self._retry_every_blocks = 2
-
-        # --payment.retry_max_attempts N (default 12)
-        try:
-            rma = int(getattr(pay_cfg, "retry_max_attempts", 12) or 12) if pay_cfg is not None else 12
-            self._retry_max_attempts = max(1, rma)
-        except Exception:
-            self._retry_max_attempts = 12
-
-        if not self._pay_map and not self._pay_pool and not self._pay_start_safety_blocks:
-            pretty.log("[yellow]No --payment.map / --payment.validators / --payment.start_safety_blocks; defaults in effect.[/yellow]")
-
-        self._pay_cfg_initialized = True
-
-    def _pick_rr_hotkey(self) -> str:
-        """Round-robin from the pool; if empty, fall back to local wallet hotkey."""
-        if not self._pay_pool:
-            return self.wallet.hotkey.ss58_address
-        hk = self._pay_pool[self._pay_rr_index % len(self._pay_pool)]
-        self._pay_rr_index += 1
-        return hk
-
-    def _origin_hotkey_for_invoice(self, inv: WinInvoice) -> str:
-        """
-        Decide which origin hotkey to use for this invoice:
-          1) If subnet-specific mapping exists → use mapped hotkey.
-          2) Else use round-robin pool (if any).
-          3) Else use local wallet hotkey (default / legacy).
-        """
-        sid = getattr(inv, "subnet_id", None)
-        if isinstance(sid, int) and sid in self._pay_map:
-            return self._pay_map[sid]
-        return self._pick_rr_hotkey()
-
-    # ---------------------- allowlist helpers ----------------------
-
-    def _lookup_local_treasury(
-        self,
-        caller_hot: Optional[str],
-        vkey: str,
-    ) -> Tuple[Optional[str], Optional[str]]:
-        """
-        Return (treasury_coldkey, matched_validator_key) if the validator is allowlisted,
-        else (None, None). We try the caller's hotkey first, then vkey fallback.
-
-        NOTE: `vkey` is what self._validator_key(uid, caller_hot) returns; depending on
-        upstream, it may be the hotkey or some derived key. The allowlist uses hotkeys.
-        """
-        # Prefer direct hotkey match
-        if isinstance(caller_hot, str) and caller_hot:
-            ck = self._treasuries.get(caller_hot)
-            if ck:
-                return ck, caller_hot
-
-        # Fallback to whatever `vkey` is, in case your allowlist chose that string
-        if isinstance(vkey, str) and vkey:
-            ck = self._treasuries.get(vkey)
-            if ck:
-                return ck, vkey
-
-        return None, None
-
-    def _allowed_validator_note(self, caller_hot: Optional[str], vkey: str) -> str:
-        key_preview = (caller_hot or vkey or "?")
-        return f"validator not allowlisted: {key_preview}"
-
-    # ---------------------- per-invoice scheduler ----------------------
-
-    def _schedule_payment(self, inv: WinInvoice):
-        """Create a single async task to handle paying this invoice; idempotent."""
-        if inv.paid:
-            return
-        t = self._payment_tasks.get(inv.invoice_id)
-        if t and not t.done():
-            return  # already scheduled
-
-        # Update UX immediately
-        inv.last_response = f"scheduled (wait ≥{self._pay_start_safety_blocks} blk)"
-        asyncio.create_task(self._async_save_state())
-
-        task = asyncio.create_task(self._payment_worker(inv), name=f"pay_{inv.invoice_id}")
-        self._payment_tasks[inv.invoice_id] = task
-
-        pretty.kv_panel(
-            "[cyan]Payment scheduled[/cyan]",
-            [
-                ("invoice", inv.invoice_id),
-                ("subnet", inv.subnet_id),
-                ("α", f"{inv.amount_rao/PLANCK:.4f}"),
-                ("window", f"[{inv.pay_window_start_block},{inv.pay_window_end_block or '?'}]"),
-                ("safety", f"+{self._pay_start_safety_blocks} blk"),
-                ("retry", f"every {self._retry_every_blocks} blk × {self._retry_max_attempts}"),
-            ],
-            style="bold cyan",
+        # ---------------------- Bidding Controller (needed for runtime) ----------------------
+        log_init(LogLevel.MEDIUM, "Initializing bidding controller", "bidding_control")
+        self.bidding_control_config = self._build_bidding_control_config()
+        self.bidding_controller = BiddingController(
+            config=self.bidding_control_config,
+            state_store=self.state
         )
 
-    async def _payment_worker(self, inv: WinInvoice):
-        """Try to pay inside the window with retries; exits when paid/expired/attempts exceeded."""
-        try:
-            await self._ensure_async_subtensor()
+        # ---------------------- Runtime & Payments ----------------------
+        log_init(LogLevel.MEDIUM, "Initializing runtime component", "runtime")
+        self.runtime = Runtime(
+            config=self.config,
+            wallet=self.wallet,
+            metagraph=self.metagraph,
+            state=self.state,
+            shared_async_subtensor=self.shared_async_subtensor,
+            bidding_controller=self.bidding_controller,
+        )
 
-            start = int(inv.pay_window_start_block or 0)
-            end = int(inv.pay_window_end_block or 0)
-            allowed_start = start + int(self._pay_start_safety_blocks or 0)
+        # Initialize separate AsyncSubtensor for payments
+        self._initialize_payments_async_subtensor()
+        
+        log_init(LogLevel.MEDIUM, "Initializing payments component", "payments")
+        self.payments = Payments(
+            config=self.config,
+            wallet=self.wallet,
+            runtime=self.runtime,
+            state=self.state,
+            payments_async_subtensor=self.payments_async_subtensor,
+        )
 
-            attempt = 0
-            while True:
-                blk = await self._get_current_block()
+        # Track if background tasks have been started (will start on first RPC)
+        self._background_tasks_started = False
+        
+        # Log loop status before starting background tasks
+        if DEBUG_ASYNC:
+            log_init(LogLevel.MEDIUM, "miner: before starting bg payments", "init", loop_info_dict("miner.before_bg"))
 
-                # Too early
-                if start and (blk <= 0 or blk < allowed_start):
-                    inv.last_response = f"waiting (blk {blk} < start {allowed_start})"
-                    await self._async_save_state()
-                    sleep_blocks = max(1, allowed_start - blk)
-                    sleep_s = max(0.5, min(10 * float(BLOCKTIME), sleep_blocks * float(BLOCKTIME)))
-                    pretty.kv_panel(
-                        "[blue]PAY wait[/blue]",
-                        [("inv", inv.invoice_id), ("blk", blk), ("allowed_start", allowed_start), ("sleep", f"{sleep_s:.1f}s")],
-                        style="bold blue",
-                    )
-                    await asyncio.sleep(sleep_s)
-                    continue
+        # Build bid lines from config and show summary
+        log_init(LogLevel.MEDIUM, "Building bid lines from configuration", "config")
+        self.lines = self.runtime.build_lines_from_config()
+        self.runtime.log_cfg_summary(self.lines)
 
-                # Window over
-                if end and blk > end:
-                    inv.last_response = f"window over (blk {blk} > end {end})"
-                    await self._async_save_state()
-                    pretty.kv_panel(
-                        "[yellow]PAY exit[/yellow]",
-                        [("inv", inv.invoice_id), ("reason", "window over"), ("blk", blk), ("end", end)],
-                        style="bold yellow",
-                    )
-                    break
-
-                # Attempt payment (under lock)
-                attempt += 1
-                inv.last_attempt_ts = time.time()
-                await self._async_save_state()
-                pretty.kv_panel(
-                    "[white]PAY attempt[/white]",
-                    [("inv", inv.invoice_id), ("try", f"{attempt}/{self._retry_max_attempts}"), ("blk", blk), ("win", f"[{start},{end}]")],
-                    style="bold white",
-                )
-
-                async with self._pay_lock:
-                    if inv.paid:
-                        inv.last_response = "already paid"
-                        await self._async_save_state()
-                        break
-
-                    # Fresh height under the lock too
-                    blk2 = await self._get_current_block()
-                    if start and (blk2 <= 0 or blk2 < allowed_start):
-                        inv.last_response = f"not yet in window (blk {blk2} < start {start}+{self._pay_start_safety_blocks})"
-                        ok = False
-                        resp = inv.last_response
-                    elif end and blk2 > end:
-                        inv.last_response = f"window over (blk {blk2} > end {end})"
-                        ok = False
-                        resp = inv.last_response
-                    else:
-                        origin_hotkey = self._origin_hotkey_for_invoice(inv)
-                        try:
-                            ok = await transfer_alpha(
-                                subtensor=self._async_subtensor,
-                                wallet=self.wallet,
-                                hotkey_ss58=origin_hotkey,
-                                origin_and_dest_netuid=inv.subnet_id,
-                                dest_coldkey_ss58=inv.treasury_coldkey,
-                                amount=bt.Balance.from_rao(inv.amount_rao),
-                                wait_for_inclusion=True,
-                                wait_for_finalization=False,
-                            )
-                            resp = "ok" if ok else "rejected"
-                        except Exception as exc:
-                            ok = False
-                            resp = f"exception: {exc}"
-
-                    inv.pay_attempts += 1
-                    inv.last_response = str(resp)[:300]
-
-                    if ok:
-                        inv.paid = True
-                        await self._async_save_state()
-                        pretty.kv_panel(
-                            "[green]Payment OK[/green]",
-                            [
-                                ("inv", inv.invoice_id),
-                                ("α", f"{inv.amount_rao/PLANCK:.4f}"),
-                                ("dst_treasury", inv.treasury_coldkey[:8] + "…"),
-                                ("src_hotkey", origin_hotkey[:8] + "…"),
-                                ("sid", inv.subnet_id),
-                                ("pay_e", inv.pay_epoch_index),
-                            ],
-                            style="bold green",
-                        )
-                        self._status_tables()
-                        self._log_aggregate_summary()
-                        break
-                    else:
-                        await self._async_save_state()
-                        pretty.kv_panel(
-                            "[red]Payment FAILED[/red]",
-                            [
-                                ("inv", inv.invoice_id),
-                                ("resp", inv.last_response[:80]),
-                                ("sid", inv.subnet_id),
-                                ("attempts", inv.pay_attempts),
-                            ],
-                            style="bold red",
-                        )
-
-                # Exit conditions
-                if attempt >= int(self._retry_max_attempts or 1):
-                    inv.last_response = f"max attempts ({attempt})"
-                    await self._async_save_state()
-                    pretty.kv_panel(
-                        "[yellow]PAY exit[/yellow]",
-                        [("inv", inv.invoice_id), ("reason", "max attempts"), ("attempts", attempt)],
-                        style="bold yellow",
-                    )
-                    break
-
-                # Sleep until next retry
-                await asyncio.sleep(max(0.5, float(self._retry_every_blocks) * float(BLOCKTIME)))
-
-        except asyncio.CancelledError:
-            inv.last_response = "cancelled"
-            await self._async_save_state()
-            pretty.kv_panel("[grey]PAY cancelled[/grey]", [("inv", inv.invoice_id)], style="bold magenta")
-            raise
-        except Exception as e:
-            inv.last_response = f"error: {e}"
-            await self._async_save_state()
-            pretty.kv_panel(
-                "[yellow]PAY worker error[/yellow]",
-                [("inv", getattr(inv, "invoice_id", "?")), ("err", str(e)[:120])],
-                style="bold yellow",
+        # Enhanced startup logging with structured information
+        init_banner(
+            "Miner Started Successfully",
+            f"uid={self.uid} | coldkey={self._coldkey_ss58} | hotkey={self.wallet.hotkey.ss58_address} | lines={len(self.lines)} | epoch(e)={getattr(self, 'epoch_index', 0)}",
+            [
+                ("uid", self.uid),
+                ("coldkey", self._coldkey_ss58),
+                ("hotkey", self.wallet.hotkey.ss58_address),
+                ("bid_lines", len(self.lines)),
+                ("epoch", getattr(self, 'epoch_index', 0))
+            ]
+        )
+        
+        # Enhanced state information panel
+        miner_logger.phase_panel(
+            MinerPhase.INITIALIZATION, "State Configuration", 
+            [
+                ("state_dir", str(self._state_dir)),
+                ("state_file", str(self.state.path)),
+                ("fresh_start", getattr(self.config, "fresh", False)),
+                ("config_loaded", "✅" if hasattr(self.config, "miner") else "❌"),
+            ]
+        )
+        
+        # Enhanced treasury information
+        treasury_list = list(self.state.treasuries.keys()) if self.state.treasuries else []
+        miner_logger.phase_panel(
+            MinerPhase.INITIALIZATION, "Treasury Configuration",
+            [
+                ("allowlisted_validators", len(self.state.treasuries)),
+                ("treasury_hotkeys", ", ".join([hk[:8] + "…" for hk in treasury_list[:3]]) + ("..." if len(treasury_list) > 3 else "")),
+                ("treasury_source", "LOCAL allowlist (pinned)"),
+            ]
+        )
+        
+        # Enhanced bid lines summary
+        if self.lines:
+            total_alpha = sum(line.alpha for line in self.lines)
+            subnets = [str(line.subnet_id) for line in self.lines]
+            miner_logger.phase_panel(
+                MinerPhase.INITIALIZATION, "Bid Configuration",
+                [
+                    ("total_bid_lines", len(self.lines)),
+                    ("total_alpha", f"{total_alpha:.4f} α"),
+                    ("target_subnets", ", ".join(subnets)),
+                    ("discount_mode", "EFFECTIVE-DISCOUNT (weight-adjusted)"),
+                ]
             )
-            return
-        finally:
-            # cleanup finished/cancelled task
-            t = self._payment_tasks.get(inv.invoice_id)
-            if t and t.done():
-                self._payment_tasks.pop(inv.invoice_id, None)
 
-    def _schedule_unpaid_pending(self):
-        """Schedule tasks for all unpaid invoices (idempotent), allowlist-enforced."""
-        for w in self._wins:
-            if w.paid:
-                continue
-            # Only schedule if validator is still allowlisted (safety on restarts)
-            treasury_ck, _matched = self._lookup_local_treasury(None, w.validator_key)
-            if treasury_ck:
-                # Update the pinned treasury on the invoice to match local file
-                w.treasury_coldkey = treasury_ck
-                self._schedule_payment(w)
-            else:
-                pretty.kv_panel(
-                    "[yellow]Skipping pending invoice[/yellow]",
-                    [("inv", getattr(w, "invoice_id", "?")), ("reason", "validator not allowlisted")],
-                    style="bold yellow",
-                )
+        # Payment system will start on first RPC call (when event loop is available)
+        log_init(LogLevel.MEDIUM, "Payment system initialized (will start on first RPC)", "payments")
+        
+        # ---------------------- Auto-Sell Manager ----------------------
+        log_init(LogLevel.MEDIUM, "Initializing auto-sell manager", "autosell")
+        self.autosell_config = self._build_autosell_config()
+        self.autosell_manager = AutoSellManager(
+            config=self.autosell_config,
+            wallet=self.wallet,
+            runtime=self.runtime
+        )
+        
+        # Auto-sell will start in main event loop (PM2 compatible)
+        if self.autosell_config.enabled:
+            log_init(LogLevel.MEDIUM, "Auto-sell manager initialized (will start in main loop)", "autosell")
+        else:
+            log_init(LogLevel.MEDIUM, "Auto-sell manager initialized (disabled)", "autosell")
+        
+        log_init(LogLevel.MEDIUM, "Miner initialization completed successfully", "main")
 
-    # ---------------------- discount math (effective -> raw) ----------------------
+    def _build_autosell_config(self) -> AutoSellConfig:
+        """Build AutoSellConfig from miner configuration."""
+        return AutoSellConfig(
+            enabled=getattr(self.config, 'autosell.enabled', False),
+            keep_alpha=getattr(self.config, 'autosell.keep_alpha', 0.0),
+            subnet_id=getattr(self.config, 'autosell.subnet_id', 73),
+            check_interval=getattr(self.config, 'autosell.check_interval', 30.0),
+            max_retries=getattr(self.config, 'autosell.max_retries', 3),
+            wait_for_inclusion=getattr(self.config, 'autosell.wait_for_inclusion', True),
+            wait_for_finalization=getattr(self.config, 'autosell.wait_for_finalization', False),
+            period=getattr(self.config, 'autosell.period', 512),
+            total_alpha_target=getattr(self.config, 'autosell.total_alpha_target', 0.0)
+        )
 
-    @staticmethod
-    def _clamp_bps(x: int) -> int:
-        return 0 if x < 0 else (10_000 if x > 10_000 else x)
+    def _build_bidding_control_config(self) -> BiddingControlConfig:
+        """Build BiddingControlConfig from miner configuration."""
+        return BiddingControlConfig(
+            max_total_alpha=getattr(self.config, 'bidding.max_total_alpha', 0.0),
+            min_stake_alpha=getattr(self.config, 'bidding.min_stake_alpha', 0.0),
+            stop_on_low_stake=getattr(self.config, 'bidding.stop_on_low_stake', False)
+        )
 
-    @staticmethod
-    def _compute_raw_discount_bps(effective_factor_bps: int, weight_bps: int) -> int:
+    # ---------------------- Shared AsyncSubtensor ----------------------
+    
+    def _initialize_shared_async_subtensor(self):
         """
-        Given:
-          - effective_factor_bps in [0..10_000], representing:  effective_factor = weight * (1 - raw_discount)
-          - weight_bps in [0..10_000], representing the validator's subnet weight
-
-        Solve for raw_discount (bps) to send to the validator.
-
-        raw_discount = 1 - (effective_factor / weight)   [clamped to 0..1]
+        Initialize shared AsyncSubtensor with custom endpoint for read operations.
+        This uses the custom endpoint for AsyncSubtensor operations while main subtensor handles axon serving.
         """
-        w_bps = Miner._clamp_bps(int(weight_bps or 0))
-        ef_bps = Miner._clamp_bps(int(effective_factor_bps or 0))
+        log_init(LogLevel.MEDIUM, "Starting shared AsyncSubtensor initialization", "chain")
+        
+        # Log configuration details
+        log_init(LogLevel.MEDIUM, f"Config subtensor.network: {getattr(self.config.subtensor, 'network', 'None')}", "chain")
+        log_init(LogLevel.MEDIUM, f"Config subtensor.chain_endpoint: {getattr(self.config.subtensor, 'chain_endpoint', 'None')}", "chain")
+        log_init(LogLevel.MEDIUM, f"Config subtensor._mock: {getattr(self.config.subtensor, '_mock', 'None')}", "chain")
+        
+        # Use the custom endpoint for AsyncSubtensor operations (read-only operations)
+        custom_endpoint = self.config.subtensor.chain_endpoint
+        if not custom_endpoint:
+            log_init(LogLevel.CRITICAL, "No chain_endpoint configuration found in config.subtensor.chain_endpoint", "chain")
+            raise RuntimeError("No chain_endpoint configuration found in config.subtensor.chain_endpoint")
+        
+        log_init(LogLevel.MEDIUM, f"Creating AsyncSubtensor with custom endpoint: {custom_endpoint}", "chain")
+        self.shared_async_subtensor = bt.AsyncSubtensor(network=custom_endpoint)
+        
+        # Ensure the network attribute is set for debugging
+        self.shared_async_subtensor.network = custom_endpoint
+        log_init(LogLevel.MEDIUM, f"Shared AsyncSubtensor created successfully", "chain")
+        log_init(LogLevel.MEDIUM, f"AsyncSubtensor.network attribute: {getattr(self.shared_async_subtensor, 'network', 'None')}", "chain")
+        log_init(LogLevel.MEDIUM, f"AsyncSubtensor.chain_endpoint attribute: {getattr(self.shared_async_subtensor, 'chain_endpoint', 'None')}", "chain")
 
-        if w_bps <= 0:
-            # No weight → product will be 0 regardless. Best we can do is not self-penalize.
-            return 0
+    async def _ensure_shared_async_subtensor(self):
+        """Ensure the shared AsyncSubtensor is initialized and ready to use."""
+        if self.shared_async_subtensor is None:
+            self._initialize_shared_async_subtensor()
+        if self.shared_async_subtensor is None:
+            raise RuntimeError("Failed to initialize shared AsyncSubtensor")
+        
+        # Initialize if method exists and is coroutine
+        init = getattr(self.shared_async_subtensor, "initialize", None)
+        if callable(init):
+            try:
+                maybe_coro = init()
+                if asyncio.iscoroutine(maybe_coro):
+                    await maybe_coro
+            except Exception as e:
+                log_init(LogLevel.HIGH, f"Shared AsyncSubtensor initialization failed: {e}", "chain")
+        
+        return self.shared_async_subtensor
 
-        w = w_bps / 10_000.0
-        ef = ef_bps / 10_000.0
+    def _initialize_payments_async_subtensor(self):
+        """
+        Initialize separate AsyncSubtensor for payments with custom endpoint.
+        This ensures payments have their own connection for parallel processing.
+        """
+        log_init(LogLevel.MEDIUM, "Starting payments AsyncSubtensor initialization", "payments")
+        
+        # Log configuration details
+        log_init(LogLevel.MEDIUM, f"Config subtensor.network: {getattr(self.config.subtensor, 'network', 'None')}", "payments")
+        log_init(LogLevel.MEDIUM, f"Config subtensor.chain_endpoint: {getattr(self.config.subtensor, 'chain_endpoint', 'None')}", "payments")
+        log_init(LogLevel.MEDIUM, f"Config subtensor._mock: {getattr(self.config.subtensor, '_mock', 'None')}", "payments")
+        
+        # Use the custom endpoint for payments AsyncSubtensor operations
+        custom_endpoint = self.config.subtensor.chain_endpoint
+        if not custom_endpoint:
+            log_init(LogLevel.CRITICAL, "No chain_endpoint configuration found in config.subtensor.chain_endpoint", "payments")
+            raise RuntimeError("No chain_endpoint configuration found in config.subtensor.chain_endpoint")
+        
+        log_init(LogLevel.MEDIUM, f"Creating payments AsyncSubtensor with custom endpoint: {custom_endpoint}", "payments")
+        self.payments_async_subtensor = bt.AsyncSubtensor(network=custom_endpoint)
+        
+        # Ensure the network attribute is set for debugging
+        self.payments_async_subtensor.network = custom_endpoint
+        log_init(LogLevel.MEDIUM, f"Payments AsyncSubtensor created successfully", "payments")
+        log_init(LogLevel.MEDIUM, f"Payments AsyncSubtensor.network attribute: {getattr(self.payments_async_subtensor, 'network', 'None')}", "payments")
+        log_init(LogLevel.MEDIUM, f"Payments AsyncSubtensor.chain_endpoint attribute: {getattr(self.payments_async_subtensor, 'chain_endpoint', 'None')}", "payments")
 
-        raw = 1.0 - (ef / w)
-        if raw < 0.0:
-            raw = 0.0
-        elif raw > 1.0:
-            raw = 1.0
-        return int(round(raw * 10_000))
+    async def _ensure_payments_async_subtensor(self):
+        """Ensure the payments AsyncSubtensor is initialized and ready to use."""
+        if self.payments_async_subtensor is None:
+            self._initialize_payments_async_subtensor()
+        if self.payments_async_subtensor is None:
+            raise RuntimeError("Failed to initialize payments AsyncSubtensor")
+        
+        # Initialize if method exists and is coroutine
+        init = getattr(self.payments_async_subtensor, "initialize", None)
+        if callable(init):
+            try:
+                maybe_coro = init()
+                if asyncio.iscoroutine(maybe_coro):
+                    await maybe_coro
+            except Exception as e:
+                log_init(LogLevel.HIGH, f"Payments AsyncSubtensor initialization failed: {e}", "payments")
+        
+        return self.payments_async_subtensor
 
-    # ---------------------- auction handlers ----------------------
+    # ---------------------- Background task management ----------------------
+
+    async def _ensure_background_tasks_started(self):
+        """Start background tasks on first RPC call when event loop is available."""
+        if not self._background_tasks_started:
+            if DEBUG_ASYNC:
+                log_init(LogLevel.MEDIUM, "Starting background tasks on first RPC", "init", loop_info_dict("miner.first_rpc"))
+            
+            # Start payment background tasks
+            if hasattr(self, 'payments'):
+                self.payments.start_background_tasks()
+                if DEBUG_ASYNC:
+                    log_init(LogLevel.MEDIUM, "miner: after starting bg payments", "init", loop_info_dict("miner.after_bg"))
+            
+            # Start auto-sell background tasks
+            if hasattr(self, 'autosell_manager'):
+                self.autosell_manager.start_background_tasks()
+            
+            self._background_tasks_started = True
+            log_init(LogLevel.MEDIUM, "Background tasks started successfully", "init")
+
+    # ---------------------- Protocol handlers ----------------------
 
     async def auctionstart_forward(self, synapse: AuctionStartSynapse) -> AuctionStartSynapse:
-        await self._ensure_async_subtensor()
-        self._ensure_payment_config()
-
-        uid, caller_hot = self._resolve_caller(synapse)
-        vkey = self._validator_key(uid, caller_hot)
-        epoch = int(synapse.epoch_index)
-
-        # SECURITY: Never trust synapse.treasury_coldkey. We only use local allowlist.
-        treasury_ck, matched_key = self._lookup_local_treasury(caller_hot, vkey)
-        if not treasury_ck:
-            # Do not bid for unknown validators
-            note = self._allowed_validator_note(caller_hot, vkey)
-            pretty.kv_panel(
-                "[red]AuctionStart ignored[/red]",
-                [("validator", f"{caller_hot or vkey} (uid={uid if uid is not None else '?'})"),
-                 ("reason", "not allowlisted"),
-                 ("note", note)],
-                style="bold red"
-            )
-            synapse.ack = True  # we answered, but with no bids
-            synapse.bids = []
-            synapse.bids_sent = 0
-            synapse.note = note
-            return synapse
-
-        budget_alpha = float(getattr(synapse, "auction_budget_alpha", 0.0) or 0.0)
-        min_stake_alpha = float(getattr(synapse, "min_stake_alpha", S_MIN_ALPHA_MINER) or S_MIN_ALPHA_MINER)
-
-        # Weights (bps) sent by validator for this auction
-        weights_bps_raw = getattr(synapse, "weights_bps", {}) or {}
-        # Be defensive about key types
-        weights_bps: Dict[int, int] = {}
+        """
+        Keep the standard pattern: fill fields into the incoming synapse in Runtime,
+        then strip non-serializable internals before returning it.
+        """
+        # Start background tasks on first RPC call (when event loop is available)
+        await self._ensure_background_tasks_started()
+        
+        if DEBUG_ASYNC:
+            log_auction(LogLevel.MEDIUM, "auctionstart_forward entry", "handler", loop_info_dict("auctionstart.entry"))
+        log_auction(LogLevel.MEDIUM, "Processing auction start request", "handler", {
+            "validator_uid": getattr(synapse, "validator_uid", "unknown"),
+            "epoch": getattr(synapse, "epoch_index", "unknown")
+        })
+        _strip_internals_inplace(synapse)
+        
+        # Auto-sell monitoring runs in background via main event loop
+        
+        # Use timeout to prevent auction processing from blocking other requests
         try:
-            for k, v in list(weights_bps_raw.items()):
-                try:
-                    kk = int(k)
-                except Exception:
-                    kk = k
-                try:
-                    vv = int(v)
-                except Exception:
-                    vv = 0
-                weights_bps[int(kk)] = self._clamp_bps(vv)
-        except Exception:
-            # fallback: no weights known
-            weights_bps = {}
-
-        pretty.kv_panel(
-            "[cyan]AuctionStart[/cyan]",
-            [
-                ("validator", f"{caller_hot or vkey} (uid={uid if uid is not None else '?'})"),
-                ("epoch (e)", epoch),
-                ("budget α", f"{budget_alpha:.3f}"),
-                ("min_stake", f"{min_stake_alpha:.3f} α"),
-                ("weights", f"{len(weights_bps)} subnet(s)"),
-                ("discount_mode", "RAW (pass-through)" if self._bids_raw_discount else "EFFECTIVE (weight-adjusted)"),
-                ("timeline", f"bid now (e) → pay in (e+1={epoch+1}) → weights from e in (e+2={epoch+2})"),
-                ("treasury_src", "LOCAL allowlist (pinned)"),
-            ],
-            style="bold cyan",
-        )
-
-        # (Re)schedule any pending unpaid invoices we may have persisted (allowlist will filter)
-        self._schedule_unpaid_pending()
-
-        # Stake gate
-        my_stake = float(self.metagraph.stake[self.uid])
-        if my_stake < min_stake_alpha:
-            pretty.log(f"[yellow]Stake below S_MIN_ALPHA_MINER – not bidding to this validator (epoch {epoch}).[/yellow]")
-            self._status_tables()
+            out = await asyncio.wait_for(
+                self.runtime.handle_auction_start(synapse, self.lines),
+                timeout=3.0  # 3 second timeout for auction processing
+            )
+        except asyncio.TimeoutError:
+            log_auction(LogLevel.HIGH, "Auction processing timed out, returning empty response", "handler", {
+                "validator_uid": getattr(synapse, "validator_uid", "unknown"),
+                "epoch": getattr(synapse, "epoch_index", "unknown")
+            })
+            # Return empty response to avoid blocking
             synapse.ack = True
+            synapse.retries_attempted = 0
             synapse.bids = []
             synapse.bids_sent = 0
-            synapse.note = "stake gate"
-            return synapse
-
-        # Build bids on received synapse
-        out_bids = []
-        sent = 0
-        rows_sent = []
-        for ln in self.lines:
-            # Checks; DO NOT cap by validator budget.
-            if not isfinite(ln.alpha) or ln.alpha <= 0:
-                pretty.log(f"[yellow]Invalid alpha {ln.alpha} for subnet {ln.subnet_id} – skipping line.[/yellow]")
-                continue
-            if not (0 <= ln.discount_bps <= 10_000):
-                pretty.log(f"[yellow]Invalid discount {ln.discount_bps} bps – skipping line.[/yellow]")
-                continue
-
-            # Determine the "raw" discount to send (possibly transformed)
-            subnet_id = int(ln.subnet_id)
-            weight_bps = weights_bps.get(subnet_id, 10_000)  # default to 1.0 if absent
-
-            if self._bids_raw_discount:
-                send_disc_bps = int(ln.discount_bps)
-                eff_factor_bps = int(round(weight_bps * (1.0 - (send_disc_bps / 10_000.0))))
-                mode_note = "raw"
-            else:
-                # ln.discount_bps is interpreted as the EFFECTIVE multiplier (weight * (1 - raw_discount))
-                send_disc_bps = self._compute_raw_discount_bps(ln.discount_bps, weight_bps)
-                eff_factor_bps = int(round(weight_bps * (1.0 - (send_disc_bps / 10_000.0))))
-                mode_note = "effective→raw"
-
-            # Skip duplicates for this validator in this epoch with the *actual* discount we will send
-            if self._has_bid(vkey, epoch, subnet_id, ln.alpha, send_disc_bps):
-                continue
-
-            if budget_alpha > 0 and ln.alpha > budget_alpha:
-                pretty.log(
-                    f"[grey58]Note:[/grey58] line α {ln.alpha:.4f} exceeds validator budget α {budget_alpha:.4f}; may be partially filled."
-                )
-
-            bid_id = self._make_bid_id(vkey, epoch, subnet_id, ln.alpha, send_disc_bps)
-            out_bids.append({
-                "subnet_id": subnet_id,
-                "alpha": float(ln.alpha),
-                "discount_bps": int(send_disc_bps),
-                "bid_id": bid_id,
-            })
-            self._remember_bid(vkey, epoch, subnet_id, ln.alpha, send_disc_bps)
-            sent += 1
-
-            # Log: show cfg discount, sent (raw) discount, weight, and implied effective factor
-            rows_sent.append([
-                subnet_id,
-                f"{ln.alpha:.4f} α",
-                f"{ln.discount_bps} bps" + (" (cfg)" if not self._bids_raw_discount else ""),
-                f"{send_disc_bps} bps",
-                f"{weight_bps} w_bps",
-                f"{eff_factor_bps} eff_bps",
-                bid_id,
-                epoch,
-                mode_note,
-            ])
-
-        if sent == 0:
-            pretty.log("[grey]No bids were added (all lines either invalid or already added).[/grey]")
-        else:
-            pretty.table(
-                "[yellow]Bids Sent[/yellow]",
-                ["Subnet", "Alpha", "Disc(cfg)", "Disc(send)", "Weight", "Eff", "BidID", "Epoch", "Mode"],
-                rows_sent,
-            )
-
-        await self._async_save_state()
-        self._status_tables()
-
-        synapse.ack = True
-        synapse.bids = out_bids
-        synapse.bids_sent = sent
-        synapse.note = None
-        return synapse
+            synapse.note = "auction processing timeout"
+            out = synapse
+        
+        _strip_internals_inplace(out)
+        return out
 
     async def win_forward(self, synapse: WinSynapse) -> WinSynapse:
-        await self._ensure_async_subtensor()
-        self._ensure_payment_config()
-
-        uid, caller_hot = self._resolve_caller(synapse)
-        vkey = self._validator_key(uid, caller_hot)
-
-        # SECURITY: Use local allowlist only (ignore synapse-provided treasury).
-        treasury_ck, matched_key = self._lookup_local_treasury(caller_hot, vkey)
-        if not treasury_ck:
-            note = self._allowed_validator_note(caller_hot, vkey)
-            pretty.kv_panel(
-                "[red]Win ignored[/red]",
-                [("validator", f"{caller_hot or vkey} (uid={uid if uid is not None else '?'})"),
-                 ("reason", "not allowlisted"),
-                 ("note", note)],
-                style="bold red",
+        """
+        Same approach for wins: Payments fills the same object; we sanitize it
+        before giving it back to Axon for serialization.
+        """
+        # Start background tasks on first RPC call (when event loop is available)
+        await self._ensure_background_tasks_started()
+        
+        if DEBUG_ASYNC:
+            log_commitments(LogLevel.MEDIUM, "win_forward entry", "handler", loop_info_dict("win.entry"))
+        log_commitments(LogLevel.MEDIUM, "Processing win notification", "handler", {
+            "validator_uid": getattr(synapse, "validator_uid", "unknown"),
+            "subnet_id": getattr(synapse, "subnet_id", "unknown"),
+            "accepted_alpha": getattr(synapse, "accepted_alpha", "unknown")
+        })
+        
+        # Use timeout to prevent win processing from blocking other requests
+        try:
+            synapse = await asyncio.wait_for(
+                self.payments.handle_win(synapse),
+                timeout=1.0  # 1 second timeout for win processing (should be fast)
             )
+        except asyncio.TimeoutError:
+            log_commitments(LogLevel.HIGH, "Win processing timed out, returning error response", "handler", {
+                "validator_uid": getattr(synapse, "validator_uid", "unknown"),
+                "subnet_id": getattr(synapse, "subnet_id", "unknown")
+            })
+            # Return error response to avoid blocking
             synapse.ack = False
             synapse.payment_attempted = False
             synapse.payment_ok = False
             synapse.attempts = 0
-            synapse.last_response = note
-            return synapse
-
-        # Prefer explicit accepted_alpha if provided (new), fallback to alpha (compat)
-        accepted_alpha = float(getattr(synapse, "accepted_alpha", None) or synapse.alpha)
-        requested_alpha = float(getattr(synapse, "requested_alpha", None) or accepted_alpha)
-        was_partial = bool(getattr(synapse, "was_partially_accepted", accepted_alpha < requested_alpha - 1e-12))
-
-        # IMPORTANT: discount does NOT reduce payment.
-        amount_rao = int(round(accepted_alpha * PLANCK))
-        epoch_now = int(getattr(self, "epoch_index", 0))
-
-        pay_start = int(getattr(synapse, "pay_window_start_block", 0) or 0)
-        pay_end = int(getattr(synapse, "pay_window_end_block", 0) or 0)
-        pay_ep = int(getattr(synapse, "pay_epoch_index", 0) or 0)
-        clearing_bps = int(getattr(synapse, "clearing_discount_bps", 0) or 0)
-
-        inv = WinInvoice(
-            validator_key=vkey,
-            treasury_coldkey=treasury_ck,  # <- pinned local value
-            subnet_id=int(synapse.subnet_id),
-            alpha=float(accepted_alpha),
-            alpha_requested=float(requested_alpha),
-            was_partial=was_partial,
-            discount_bps=clearing_bps,
-            pay_window_start_block=pay_start,
-            pay_window_end_block=pay_end,
-            pay_epoch_index=pay_ep,
-            amount_rao=amount_rao,
-            epoch_seen=epoch_now,
-        )
-
-        # Window-stable invoice identity
-        inv.invoice_id = self._make_invoice_id(
-            vkey,
-            inv.subnet_id,
-            inv.alpha,
-            inv.discount_bps,
-            inv.amount_rao,
-            inv.pay_window_start_block,
-            inv.pay_window_end_block,
-            inv.pay_epoch_index,
-        )
-
-        # idempotent merge by window identity of the allocation
-        for w in self._wins:
-            if (
-                w.validator_key == inv.validator_key
-                and w.subnet_id == inv.subnet_id
-                and w.alpha == inv.alpha
-                and w.discount_bps == inv.discount_bps
-                and w.amount_rao == inv.amount_rao
-                and w.pay_window_start_block == inv.pay_window_start_block
-                and w.pay_window_end_block == inv.pay_window_end_block
-            ):
-                if inv.pay_window_end_block and not w.pay_window_end_block:
-                    w.pay_window_end_block = inv.pay_window_end_block
-                w.alpha_requested = inv.alpha_requested
-                w.was_partial = inv.was_partial
-                w.pay_epoch_index = inv.pay_epoch_index or w.pay_epoch_index
-                # SECURITY: ensure treasury is local-pinned even after merge
-                w.treasury_coldkey = treasury_ck
-                inv = w
-                break
-        else:
-            self._wins.append(inv)
-
-        await self._async_save_state()
-
-        pretty.kv_panel(
-            "[green]Win received[/green]",
-            [
-                ("validator", f"{caller_hot or vkey} (uid={uid if uid is not None else '?'})"),
-                ("epoch_now (e)", epoch_now),
-                ("subnet", inv.subnet_id),
-                ("accepted α", f"{inv.alpha:.4f}"),
-                ("requested α", f"{inv.alpha_requested:.4f}"),
-                ("partial", inv.was_partial),
-                ("discount", f"{inv.discount_bps} bps"),
-                ("pay_epoch (e+1)", inv.pay_epoch_index or (epoch_now + 1)),
-                ("window", f"[{inv.pay_window_start_block}, {inv.pay_window_end_block or '?'}]"),
-                ("amount_to_pay", f"{inv.amount_rao/PLANCK:.4f} α"),
-                ("invoice_id", inv.invoice_id),
-                ("treasury_src", "LOCAL allowlist (pinned)"),
-            ],
-            style="bold green",
-        )
-
-        # Schedule payment task (no daemon)
-        self._schedule_payment(inv)
-        self._status_tables()
-
-        synapse.ack = True
-        # Latest known status; actual payment occurs in the task.
-        synapse.payment_attempted = inv.pay_attempts > 0
-        synapse.payment_ok = inv.paid
-        synapse.attempts = inv.pay_attempts
-        synapse.last_response = inv.last_response[:300] if inv.last_response else ""
+            synapse.last_response = "win processing timeout"
+        
+        _strip_internals_inplace(synapse)
         return synapse
 
     async def forward(self, synapse: Synapse):
+        """
+        You requested to keep echoing the inbound base Synapse. That's fine;
+        the slice problem comes from typed routes, which we now sanitize.
+        """
+        # Start background tasks on first RPC call (when event loop is available)
+        await self._ensure_background_tasks_started()
+        
+        _strip_internals_inplace(synapse)
         return synapse
+
+    # ---------------------- Override async main loop for debugging ----------------------
+
+    async def _async_main_loop(self):
+        """Override to add loop status logging - background tasks now start on first RPC."""
+        if DEBUG_ASYNC:
+            log_init(LogLevel.MEDIUM, "miner: async main loop started (background tasks will start on first RPC)", "init", loop_info_dict("miner.main_loop"))
+        
+        while not self.should_exit:
+            self.sync()   
+            self.step += 1
+            
+            # Reduced sleep time for better responsiveness (12 seconds instead of 48)
+            await asyncio.sleep(12)
+
+    # ---------------------- Context manager shutdown ----------------------
+
+    def __exit__(self, exc_type, exc, tb):
+        log_init(LogLevel.MEDIUM, "Shutting down miner", "shutdown")
+        try:
+            self.payments.shutdown_background()
+        except Exception as e:
+            log_init(LogLevel.HIGH, "Error during payments shutdown", "shutdown", {"error": str(e)})
+        
+        try:
+            if hasattr(self, 'autosell_manager') and self.autosell_manager:
+                # Auto-sell shutdown is handled by task cancellation in main event loop
+                log_init(LogLevel.MEDIUM, "Auto-sell shutdown handled by main event loop", "shutdown")
+        except Exception as e:
+            log_init(LogLevel.HIGH, "Error during auto-sell shutdown", "shutdown", {"error": str(e)})
+        finally:
+            return super().__exit__(exc_type, exc, tb)
 
 
 if __name__ == "__main__":
     from metahash.bittensor_config import config
-
     with Miner(config=config(role="miner")) as m:
         import time as _t
         while True:
-            clog.info("Miner running…", color="gray")
             _t.sleep(12)

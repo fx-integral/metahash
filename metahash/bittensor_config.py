@@ -82,6 +82,8 @@ def add_validator_args(parser: argparse.ArgumentParser) -> None:
     # Validator-specific testing args
     parser.add_argument("--no_epoch", action="store_true", default=False,
                         help="Enable mock mode (no real chain calls).")
+    parser.add_argument("--force_epoch", action="store_true", default=False,
+                        help="Force running the current epoch immediately (no waiting). Use when recovering from crashes or missed heads.")
     parser.add_argument("--neuron.moving_average_alpha", type=float, default=1.0,
                         help="Moving average alpha parameter for validator rewards blending.")
 
@@ -132,12 +134,53 @@ def add_miner_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
 
+    # Optional: list of validator hotkeys whose delegated α should be used
+    # for bidding availability checks and as the default payment source hotkeys.
+    parser.add_argument(
+        "--miner.bids.validators",
+        nargs="+",
+        type=str,
+        default=[],
+        help=(
+            "Validator hotkeys to source α from when bidding/paying. If set, availability "
+            "is computed from these delegations and payments default to these hotkeys."
+        ),
+    )
+
     # NEW: Origin hotkey selection for payments
     parser.add_argument("--payment.validators", nargs="+", type=str, default=[],
                         help="Round-robin pool of origin hotkeys (ss58) to use for α payments.")
     parser.add_argument("--payment.map", nargs="+", type=str, default=[],
                         help="Explicit subnet→hotkey mapping entries like '348:5G...abc'. "
                              "Mapping takes precedence over --payment.validators.")
+
+    # Auto-sell configuration (miner)
+    parser.add_argument("--autosell.enabled", action="store_true", default=False,
+                        help="Enable automatic selling of SN73 alpha stake.")
+    parser.add_argument("--autosell.keep_alpha", type=float, default=0.0,
+                        help="Amount of alpha to keep (default: sell everything).")
+    parser.add_argument("--autosell.subnet_id", type=int, default=73,
+                        help="Subnet ID to monitor for auto-selling (default: 73).")
+    parser.add_argument("--autosell.check_interval", type=float, default=30.0,
+                        help="Check interval in seconds for auto-sell monitoring.")
+    parser.add_argument("--autosell.max_retries", type=int, default=3,
+                        help="Max retries for failed auto-sell transactions.")
+    parser.add_argument("--autosell.wait_for_inclusion", action="store_true", default=True,
+                        help="Wait for transaction inclusion before considering it successful.")
+    parser.add_argument("--autosell.wait_for_finalization", action="store_true", default=False,
+                        help="Wait for transaction finalization before considering it successful.")
+    parser.add_argument("--autosell.period", type=int, default=512,
+                        help="Block period for transaction confirmation.")
+    parser.add_argument("--autosell.total_alpha_target", type=float, default=0.0,
+                        help="Total amount of alpha to sell before stopping (0 = unlimited).")
+    
+    # Bidding control configuration (miner)
+    parser.add_argument("--bidding.max_total_alpha", type=float, default=0.0,
+                        help="Maximum total alpha to spend on bidding before stopping (0 = unlimited).")
+    parser.add_argument("--bidding.min_stake_alpha", type=float, default=0.0,
+                        help="Minimum alpha stake to maintain - stop bidding when reached.")
+    parser.add_argument("--bidding.stop_on_low_stake", action="store_true", default=False,
+                        help="Stop bidding when stake falls below min_stake_alpha threshold.")
 
 
 # ──────────────────────── main entrypoint ───────────────────────── #

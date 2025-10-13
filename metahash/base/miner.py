@@ -110,25 +110,32 @@ class BaseMinerNeuron(BaseNeuron):
 
         bt.logging.info(f"Miner starting at block: {self.block}")
 
+        # Run the async main loop
         try:
-            while not self.should_exit:
-                # light epoch cadence for metagraph maintenance
-                while (
-                    True
-                ):
-                    if self.should_exit:
-                        break
-
-                    self.sync()   
-                    self.step += 1
-                    time.sleep(12 * 4)
-
+            asyncio.run(self._async_main_loop())
         except KeyboardInterrupt:
             self.axon.stop()
             bt.logging.success("Miner killed by keyboard interrupt.")
             exit()
         except Exception:
             bt.logging.error(traceback.format_exc())
+
+    async def _async_main_loop(self):
+        """Async main loop that handles both axon serving and payment processing."""
+        # Start payment tasks in main event loop (PM2 compatible)
+        if hasattr(self, 'payments'):
+            self.payments.start_background_tasks()
+        
+        # Start auto-sell tasks in main event loop (PM2 compatible)
+        if hasattr(self, 'autosell_manager'):
+            self.autosell_manager.start_background_tasks()
+        
+        while not self.should_exit:
+            self.sync()   
+            self.step += 1
+            
+            # Use asyncio.sleep instead of time.sleep for PM2 compatibility
+            await asyncio.sleep(12 * 4)
 
     # ------------------------ background-thread helpers ---------------------- #
     def run_in_background_thread(self):

@@ -97,6 +97,9 @@ class Pretty:
     # Convenience formatters
     def show_master_shares(self, shares: List[Tuple[str, int, float, float]]):
         # (hotkey, uid, stake, budget_alpha)
+        if not shares:
+            self.log("[yellow]No active masters meet the threshold this epoch.[/yellow]")
+            return
         rows = [[_mask(hk), uid, f"{st:.3f}", f"{bud:.3f} α"] for hk, uid, st, bud in shares]
         self.table("Active Masters (stake & budget)", ["Hotkey", "UID", "Stake α", "Budget α"], rows)
 

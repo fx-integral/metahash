@@ -74,8 +74,24 @@ class BaseNeuron(ABC):
         while True:
             try:
                 bt.logging.info("Initializing subtensor and metagraph")
+                
+                # Log configuration details before creating subtensor
+                bt.logging.info(f"Config subtensor.network: {getattr(self.config.subtensor, 'network', 'None')}")
+                bt.logging.info(f"Config subtensor.chain_endpoint: {getattr(self.config.subtensor, 'chain_endpoint', 'None')}")
+                bt.logging.info(f"Config subtensor._mock: {getattr(self.config.subtensor, '_mock', 'None')}")
+                bt.logging.info(f"Config netuid: {getattr(self.config, 'netuid', 'None')}")
+                
+                bt.logging.info("Creating main subtensor...")
                 self.subtensor = bt.subtensor(config=self.config)
+                
+                # Log subtensor details after creation
+                bt.logging.info(f"Main subtensor created successfully")
+                bt.logging.info(f"Main subtensor.network: {getattr(self.subtensor, 'network', 'None')}")
+                bt.logging.info(f"Main subtensor.chain_endpoint: {getattr(self.subtensor, 'chain_endpoint', 'None')}")
+                
+                bt.logging.info(f"Creating metagraph for netuid: {self.config.netuid}")
                 self.metagraph = self.subtensor.metagraph(self.config.netuid)
+                bt.logging.info(f"Metagraph created successfully")
                 break
             except Exception as e:
                 bt.logging.error(
@@ -125,7 +141,6 @@ class BaseNeuron(ABC):
         """
         Wrapper for synchronizing the state of the network for the given miner or validator.
         """
-        bt.logging.info("Syncing Neuron")
         # Ensure miner or validator hotkey is still registered on the network.
         self.check_registered()
 

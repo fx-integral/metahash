@@ -10,6 +10,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from bittensor import BLOCKTIME
 from metahash.utils.pretty_logs import pretty
+from metahash.utils.phase_logs import set_phase, phase_start, phase_end, phase_table, phase_summary, compact_status, log as phase_log, grouped_info
 from metahash.utils.ipfs import aget_json
 from metahash.utils.commitments import read_all_plain_commitments
 from metahash.validator.alpha_transfers import AlphaTransfersScanner, TransferEvent
@@ -48,14 +49,7 @@ def _isatty() -> bool:
 
 
 def _pause(msg: str):
-    return
-    """Optional interactive pause."""
-    if not PAUSE_ON_CHECKPOINTS or not _isatty():
-        return
-    try:
-        input(f"\n[PAUSE] {msg} — press <enter> to continue...")
-    except Exception:
-        pass
+    return  
 
 
 def _j(obj) -> str:
@@ -130,15 +124,8 @@ class SettlementEngine:
         if epoch_to_settle < 0 or epoch_to_settle in self.state.validated_epochs:
             return
 
-        pretty.rule("[bold cyan]SETTLEMENT — BEGIN[/bold cyan]")
-        pretty.kv_panel(
-            "Settlement kickoff",
-            [("epoch_to_settle (e−2)", epoch_to_settle),
-             ("testing", str(TESTING).lower()),
-             ("force_burn", str(bool(FORCE_BURN_WEIGHTS)).lower()),
-             ("strict_per_subnet", str(bool(STRICT_PER_SUBNET)).lower())],
-            style="bold cyan",
-        )
+        set_phase('settlement')
+        phase_start('settlement', f"epoch_to_settle (e−2): {epoch_to_settle} | testing: {str(TESTING).lower()} | force_burn: {str(bool(FORCE_BURN_WEIGHTS)).lower()} | strict_per_subnet: {str(bool(STRICT_PER_SUBNET)).lower()}")
 
         # 1) Load snapshots (payloads) from commitments (IPFS v4 or legacy inline)
         snapshots = await self._load_snapshots_from_commitments(epoch_to_settle)
@@ -154,7 +141,8 @@ class SettlementEngine:
         # 3) Scan α transfers in [as, de]
         events = await self._scan_alpha_transfers(start_block, end_block)
         if events is None:
-            pretty.kv_panel("Settlement postponed", [("epoch", epoch_to_settle), ("reason", "scanner failed")], style="bold yellow")
+            set_phase('settlement')
+            phase_summary('settlement', {"epoch": epoch_to_settle, "reason": "scanner failed"})
             return
 
         # 4) Build paid α pools (by coldkey, treasury, subnet)
@@ -185,22 +173,23 @@ class SettlementEngine:
         if burn_deficit_tao > 0 and 0 in uid_to_idx:
             final_scores[uid_to_idx[0]] += burn_deficit_tao
 
-        pretty.kv_panel(
-            "Budget Accounting — settlement",
-            [
-                ("spent_from_payload (TAO)", f"{spent_tao:.6f}"),
-                ("leftover_from_payload (TAO)", f"{leftover_tao:.6f}"),
-                ("target_budget (TAO)", f"{target_budget_tao:.6f}"),
-                ("credited_value (TAO)", f"{credited_total_tao:.6f}"),
-                ("burn_deficit → UID0 (TAO)", f"{burn_deficit_tao:.6f}"),
-            ],
-            style="bold magenta",
+        set_phase('settlement')
+        phase_summary(
+            'settlement',
+            {
+                "spent_from_payload (TAO)": f"{spent_tao:.6f}",
+                "leftover_from_payload (TAO)": f"{leftover_tao:.6f}",
+                "target_budget (TAO)": f"{target_budget_tao:.6f}",
+                "credited_value (TAO)": f"{credited_total_tao:.6f}",
+                "burn_deficit → UID0 (TAO)": f"{burn_deficit_tao:.6f}",
+            }
         )
 
         # 7) Apply weights (or preview in TESTING)
         self._apply_weights_or_preview(epoch_to_settle, final_scores)
 
-        pretty.rule("[bold cyan]SETTLEMENT — END[/bold cyan]")
+        set_phase('settlement')
+        phase_end('settlement')
 
     # ──────────────────────── Step 1: snapshots ────────────────────────
     async def _load_snapshots_from_commitments(self, epoch_to_settle: int) -> List[Dict]:
@@ -215,7 +204,7 @@ class SettlementEngine:
         masters_treasuries: Set[str] = set(VALIDATOR_TREASURIES.values())
         snapshots: List[Dict] = []
 
-        pretty.kv_panel("Commitments fetched", [("#hotkeys_in_commit_map", len(commits or {}))], style="bold cyan")
+        pretty.kv_panel("Commitments Fetched", [("hotkeys_in_commit_map", len(commits or {}))], style="bold cyan")
 
         def _decode_commit_entry(entry):
             if entry is None:
@@ -261,15 +250,15 @@ class SettlementEngine:
 
                             inv = payload.get("inv") or payload.get("i")
                             pretty.kv_panel(
-                                "Payload fetched (IPFS)",
+                                "Payload Fetched (IPFS)",
                                 [
-                                    ("hk", hk_key[:10] + "…"),
+                                    ("hotkey", hk_key[:10] + "…"),
                                     ("cid", cid[:46] + ("…" if len(cid) > 46 else "")),
-                                    ("e", payload.get("e")),
-                                    ("pe", payload.get("pe")),
-                                    ("as", payload.get("as")),
-                                    ("de", payload.get("de")),
-                                    ("has_inv", str(bool(inv)).lower()),
+                                    ("epoch", payload.get("e")),
+                                    ("pay_epoch", payload.get("pe")),
+                                    ("start_block", payload.get("as")),
+                                    ("end_block", payload.get("de")),
+                                    ("has_invoices", str(bool(inv)).lower()),
                                 ],
                                 style="bold cyan",
                             )
@@ -284,14 +273,14 @@ class SettlementEngine:
                     chosen.setdefault("hk", hk_key)
                     chosen.setdefault("t", VALIDATOR_TREASURIES.get(hk_key, ""))
                     pretty.kv_panel(
-                        "Payload fetched (inline legacy)",
+                        "Payload Fetched (Inline Legacy)",
                         [
-                            ("hk", hk_key[:10] + "…"),
-                            ("e", s.get("e")),
-                            ("pe", s.get("pe")),
-                            ("as", s.get("as")),
-                            ("de", s.get("de")),
-                            ("has_inv", str("inv" in s or "i" in s).lower()),
+                            ("hotkey", hk_key[:10] + "…"),
+                            ("epoch", s.get("e")),
+                            ("pay_epoch", s.get("pe")),
+                            ("start_block", s.get("as")),
+                            ("end_block", s.get("de")),
+                            ("has_invoices", str(bool(("inv" in s or "i" in s))).lower()),
                         ],
                         style="bold cyan",
                     )
@@ -369,15 +358,19 @@ class SettlementEngine:
 
     # ─────────────────── Step 3: scan α transfers ─────────────────────
     async def _scan_alpha_transfers(self, start_block: int, end_block: int) -> Optional[List[TransferEvent]]:
-        pretty.rule("[bold cyan]SCAN α TRANSFERS[/bold cyan]")
+        # pretty.rule("[bold cyan]SCAN α TRANSFERS[/bold cyan]")
+        # phase_log(f"[SETTLEMENT] Scanning α transfers: blocks {start_block} to {end_block} (range: {end_block - start_block + 1} blocks)")
 
         if self._scanner is None:
-            self._scanner = AlphaTransfersScanner(await self.parent._stxn(), dest_coldkey=None, rpc_lock=self._rpc_lock)
+            # Allow Utility.* batches to ensure wrapped transfer_stake are scanned
+            self._scanner = AlphaTransfersScanner(await self.parent._stxn(), dest_coldkey=None, allow_batch=True, rpc_lock=self._rpc_lock)
 
         try:
             events_raw = await self._scanner.scan(start_block, end_block)
         except Exception as scan_exc:
+            phase_log(f"[SETTLEMENT] Scanner failed for blocks {start_block}-{end_block}: {str(scan_exc)[:200]}")
             pretty.log(f"[yellow]Scanner failed: {scan_exc}[/yellow]")
+            raise scan_exc
             return None
 
         def _coerce(ev) -> TransferEvent | None:
@@ -633,7 +626,6 @@ class SettlementEngine:
                         continue
 
                     # proportional shares with largest remainder
-                    # compute raw shares
                     tmp = []
                     sum_floor = 0
                     for uid in uid_list:
@@ -745,25 +737,29 @@ class SettlementEngine:
                          ("miners_scored", sum(1 for x in final_scores if x > 0))],
                         style="bold green")
 
-    # ───────────────────────── helpers ─────────────────────────
+    # Inside SettlementEngine._normalize_inv (replace the whole method)
     def _normalize_inv(self, s: Dict) -> Optional[Dict[str, Dict]]:
         """
         Normalize inventory to:
-          inv = {
+        inv = {
             "<uid>": { "ck": "<coldkey|empty>", "ln": [[sid, disc_bps, weight_bps, required_rao, value_mu?], ...] },
             ...
-          }
+        }
         Accepts compact `i: [[uid, [[sid, disc_bps, w_bps, rao, value_mu?], ...]], ...]`
-        and legacy variants (ln with [sid, w_bps, rao, disc?, value_mu?]).
+        and legacy variants.
         """
-        inv: Dict[str, Dict] | None = s.get("inv")  # type: ignore[assignment]
-        if isinstance(inv, dict) and inv:
-            if VERBOSE_DUMPS:
-                sample_uid = next(iter(inv.keys()), None)
-                pretty.kv_panel("inv pre-normalized (dict)",
-                                [("uids", len(inv)), ("sample_uid", str(sample_uid))],
-                                style="bold cyan")
-            return inv
+        inv = s.get("inv")
+        # If inv exists but has no 'ln' lists, fall back to compact 'i'
+        if isinstance(inv, dict):
+            has_any_lines = any(isinstance(v, dict) and isinstance(v.get("ln"), list) for v in inv.values())
+            if has_any_lines:
+                if VERBOSE_DUMPS:
+                    sample_uid = next(iter(inv.keys()), None)
+                    pretty.kv_panel("inv pre-normalized (dict)",
+                                    [("uids", len(inv)), ("sample_uid", str(sample_uid))],
+                                    style="bold cyan")
+                return inv
+            # otherwise: fall through and rebuild from 'i'
 
         inv_tmp: Dict[str, Dict] = {}
         if "i" in s and isinstance(s["i"], list):
@@ -787,10 +783,7 @@ class SettlementEngine:
                         val_mu = int(ln[4]) if len(ln) >= 5 else 0
                     except Exception:
                         continue
-                    if val_mu:
-                        ln_list.append([sid, disc, w_bps, rao, val_mu])
-                    else:
-                        ln_list.append([sid, disc, w_bps, rao])
+                    ln_list.append([sid, disc, w_bps, rao] if not val_mu else [sid, disc, w_bps, rao, val_mu])
                 inv_tmp[str(uid_int)] = {"ck": "", "ln": ln_list}
 
         if VERBOSE_DUMPS and inv_tmp:

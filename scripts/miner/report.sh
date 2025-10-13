@@ -34,6 +34,12 @@ PM2_NAME=""
 LINES=5000
 TMP_INPUT=""
 
+# Choose awk: prefer gawk if present, else awk (mawk on Debian)
+AWK_BIN="awk"
+if command -v gawk >/dev/null 2>&1; then
+  AWK_BIN="gawk"
+fi
+
 # Parse args
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -96,7 +102,7 @@ fi
 
 export LC_ALL=C
 
-awk -v wantN="$N" -v detailed="$DETAIL" '
+"$AWK_BIN" -v wantN="$N" -v detailed="$DETAIL" '
 function trim(s){ gsub(/^[[:space:]]+|[[:space:]]+$/,"",s); return s }
 function toAlpha(rao){ return rao/1000000000.0 }
 function nz(v, d){ return (v == "" ? d : v) + 0 }
@@ -106,26 +112,22 @@ function kck(e,ck){ return e SUBSEP ck }
 function is_num(x){ return x ~ /^-?[0-9]+(\.[0-9]+)?$/ }
 function sanitize_num(s){ gsub(/[^0-9.\-]/,"",s); return s }
 function add_epoch(e){ if(e==""||e in seen_e) return; seen_e[e]=1; order[++nOrder]=e; current_e=e }
-function begin_json(buf, epoch_var, kind){ json_accum=1; json_kind=kind; json_epoch=epoch_var; json_buf=""; }
+function begin_json(_unused, epoch_var, kind){ json_accum=1; json_kind=kind; json_epoch=epoch_var; json_buf="" }
 function feed_json_line(line){
-  # drop ANSI and keep a light footprint
-  gsub(/\x1B\[[0-9;]*[A-Za-z]/, "", line)
-  # append raw (we ll normalize when closing)
+  # strip ANSI sequences (portable to mawk)
+  gsub(/\033\[[0-9;]*[A-Za-z]/, "", line)
   json_buf = json_buf line "\n"
   if(index(line,"]")>0){ close_json() }
 }
-function close_json(   s,n,i,p,parts,ck,amt,pr,ek){
+function close_json(   s,n,i,p,parts,ck,amt,pr){
   json_accum=0
   s=json_buf
-  # Keep only JSON-ish part after the colon
   sub(/.*\[[[:space:]]*/,"[",s)
-  # Flatten and split on object boundaries
   gsub(/\r/,"",s); gsub(/\n/,"",s)
   gsub(/\}\s*,\s*\{/, "}\n{", s)
   n=split(s, parts, /\n/)
   for(i=1;i<=n;i++){
     p=parts[i]
-    # source ck (truncate ellipsis to keep prefix)
     ck=""; amt=0; pr=0
     if(match(p,/"src_ck":"([^"]+)/,m)) ck=m[1]
     gsub(/…/,"",ck)
@@ -139,7 +141,7 @@ function close_json(   s,n,i,p,parts,ck,amt,pr,ek){
       if(pr>0){ alpha_paid_rao[json_epoch]+=pr; if(ck!="") alpha_paid_by_ck[json_epoch,ck]+=pr }
     }
   }
-  json_kind=""; json_epoch=""
+  json_kind=""; json_epoch=""; json_buf=""
 }
 
 BEGIN{
@@ -292,7 +294,7 @@ in_invoices && $0 ~ /[0-9][[:space:]]*│/ && $0 !~ /UID[[:space:]]*│/ {
 /Staged commit payload/ { }
 /^[[:space:]]*e:[[:space:]]*[0-9]+/ { if(match($0,/e:[[:space:]]*([0-9]+)/,m)){ staged_e=m[1]; add_epoch(staged_e) } }
 $0 ~ /#miners:[[:space:]]*[0-9]+/ { if(staged_e!="" && match($0,/#miners:[[:space:]]*([0-9]+)/,m)) staged_miners[staged_e]=m[1] }
-$0 ~ /#lines_total:[[:space:]]*[0-9]+/ { if(staged_e!="" && match($0,/#[^:]*:[[:space:]]*([0-9]+)/,m)) staged_lines[staged_e]=m[1] }
+$0 ~ /#lines_total:[[:space:]]*([0-9]+)/ { if(staged_e!="" && match($0,/#[^:]*:[[:space:]]*([0-9]+)/,m)) staged_lines[staged_e]=m[1] }
 
 /Commit Payload \(preview\)/ { }
 $0 ~ /epoch:[[:space:]]*[0-9]+/ && $0 ~ /has_inv:/ {
@@ -322,12 +324,24 @@ $0 ~ /target_budget .*:[[:space:]]*([0-9.]+)/         { if(settle_e!="" && match
 $0 ~ /credited_value .*:[[:space:]]*([0-9.]+)/        { if(settle_e!="" && match($0,/credited_value .*:[[:space:]]*([0-9.]+)/,m)) credited_value[settle_e]=m[1] }
 $0 ~ /burn_deficit .*:[[:space:]]*([0-9.]+)/          { if(settle_e!="" && match($0,/burn_deficit .*:[[:space:]]*([0-9.]+)/,m)) burn_deficit[settle_e]=m[1] }
 
-# ---- α scan & paid pools (multi-line JSON) ----
-/events\(sample\):/ { if(settle_e!=""){ begin_json(settle_e, settle_e, "events") } }
-/paid_pools\(sample\):/ { if(settle_e!=""){ begin_json(settle_e, settle_e, "paid_pools") } }
-json_accum { feed_json_line($0); next }
+# ---- Start JSON capture (feed first line) ----
+/events\(sample\):/ {
+  if(settle_e!=""){
+    begin_json("", settle_e, "events")
+    feed_json_line($0); next
+  }
+}
+/paid_pools\(sample\):/ {
+  if(settle_e!=""){
+    begin_json("", settle_e, "paid_pools")
+    feed_json_line($0); next
+  }
+}
 
-# ---- Errors ----
+# ---- While in JSON capture, swallow any further lines
+{ if (json_accum) { feed_json_line($0); next } }
+
+# ---- Connectivity errors ----
 /Cannot connect to host/ { e=(auction_e!=""?auction_e:(budget_e!=""?budget_e:current_e)); conn_err[e]++ }
 /TimeoutError#/          { e=(auction_e!=""?auction_e:(budget_e!=""?budget_e:current_e)); timeouts[e]++ }
 

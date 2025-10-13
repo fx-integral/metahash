@@ -1,32 +1,27 @@
-# ╭──────────────────────────────────────────────────────────────────────╮
-# metahash/validator/epoch_validator.py                                  #
-# (v2.3 + EPOCH_LENGTH_OVERRIDE support + TESTING bootstrap forward)     #
-# ╰──────────────────────────────────────────────────────────────────────╯
+# metahash/validator/epoch_validator.py
 from __future__ import annotations
 
 import asyncio
 from datetime import datetime
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Any
 
 import bittensor as bt
-from bittensor import BLOCKTIME  # 12 s on Finney
+from bittensor import BLOCKTIME
 
 from metahash.base.validator import BaseValidatorNeuron
 from metahash.config import EPOCH_LENGTH_OVERRIDE, TESTING
+from metahash.validator.strategy import Strategy  # unified
 
 
 class EpochValidatorNeuron(BaseValidatorNeuron):
-    """Validator base-class with robust epoch rollover handling.
+    """
+    Validator base-class with robust epoch rollover handling.
 
-    This version additionally honors `EPOCH_LENGTH_OVERRIDE` from
-    `metahash.config`. When > 0, epoch length and the wait loop are driven
-    by the override (e.g., 10 blocks) instead of the chain's tempo.
-    This lets you test full e/e+1/e+2 flows quickly.
+    This version honors `EPOCH_LENGTH_OVERRIDE` and refreshes Strategy weights
+    immediately before each forward() invocation.
 
-    ⚠️ Note: With overrides you are *not* aligned to real chain epoch heads.
-    If you try to call `set_weights()` outside real heads, the chain will
-    reject it. When `TESTING=True`, you should also configure the validator
-    to avoid on-chain `set_weights` (e.g., via `config.no_epoch=True`).
+    Note: Strategy here is used for operator visibility; subnet weights are
+    also recomputed in the concrete Validator and injected into engines.
     """
 
     def __init__(self, *args, log_interval_blocks: int = 2, **kwargs):
@@ -35,7 +30,15 @@ class EpochValidatorNeuron(BaseValidatorNeuron):
         self._epoch_len: Optional[int] = None
         self.epoch_end_block: Optional[int] = None
         self._override_active: bool = False
-        self._bootstrapped: bool = False  # run forward immediately if TESTING
+        self._bootstrapped: bool = False
+        self._running: bool = False  # guard
+
+        # Strategy wiring — be robust if config sets strategy_path=None
+        raw_strategy_path = getattr(self.config, "strategy_path", None)
+        strategy_path = raw_strategy_path or "weights.yml"
+        strategy_algo_path = getattr(self.config, "strategy_algo_path", None)
+        self.strategy = Strategy(path=strategy_path, algorithm_path=strategy_algo_path)
+        self.current_strategy_out: Any = None  # can be dict (subnet bps) or list
 
     # ----------------------- helpers ---------------------------------- #
     def _discover_epoch_length(self) -> int:
@@ -83,7 +86,6 @@ class EpochValidatorNeuron(BaseValidatorNeuron):
         return blk, start, end, idx, ep_l
 
     def _apply_epoch_state(self, blk: int, start: int, end: int, idx: int, ep_len: int):
-        """Persist epoch fields to the instance and log the head."""
         self.epoch_start_block = start
         self.epoch_end_block = end
         self.epoch_index = idx
@@ -113,8 +115,42 @@ class EpochValidatorNeuron(BaseValidatorNeuron):
             sleep_blocks = max(1, min(30, remain // 2 or 1))
             await asyncio.sleep(sleep_blocks * BLOCKTIME * 0.95)
 
+    # ----------------------- strategy refresh ------------------------- #
+    def _refresh_strategy_before_forward(self):
+        """
+        Recompute strategy output for operator visibility.
+        Supports dict (subnet bps) or list outputs.
+        """
+        try:
+            out = self.strategy.compute_weights_bps(
+                netuid=self.config.netuid,
+                metagraph=self.metagraph,
+                active_uids=None,
+            )
+            self.current_strategy_out = out
+            # tolerant logging
+            if isinstance(out, dict):
+                nonzero = sum(1 for v in out.values() if int(v) > 0)
+                total = sum(int(v) for v in out.values())
+                bt.logging.info(
+                    f"[strategy] refreshed subnet weights (entries={len(out)} "
+                    f"nonzero={nonzero} sum_bps={total})"
+                )
+            else:
+                nz = sum(1 for v in (out or []) if v)
+                bt.logging.info(
+                    f"[strategy] refreshed weights (len={len(out or [])} nonzeros={nz})"
+                )
+        except Exception as e:
+            bt.logging.warning(f"[strategy] refresh failed: {e}")
+
     # ----------------------- main loop -------------------------------- #
     def run(self):  # noqa: D401
+        if self._running:
+            bt.logging.warning("run() called while validator is already running; ignoring.")
+            return
+        self._running = True
+
         bt.logging.info(
             f"EpochValidator starting at block {self.block:,} (netuid {self.config.netuid})"
         )
@@ -135,18 +171,18 @@ class EpochValidatorNeuron(BaseValidatorNeuron):
                     f"blocks (~{int(eta_s // 60)}m{int(eta_s % 60):02d}s)"
                 )
 
-                # --- TESTING bootstrap: run a forward immediately on first loop ---
-                if TESTING and not self._bootstrapped:
-                    # Treat the *current* position as a head for testing purposes.
-                    # This avoids waiting for the next real/override head on startup.
+                # TESTING bootstrap or explicit force_epoch
+                if (TESTING and not self._bootstrapped) or getattr(self.config, "force_epoch", False):
                     self._apply_epoch_state(blk, start, end, idx, ep_len)
                     self._bootstrapped = True
 
                     try:
                         self.sync()
+                        self._refresh_strategy_before_forward()
                         await self.concurrent_forward()
                     except Exception as err:
                         bt.logging.error(f"bootstrap forward() raised: {err}")
+                        bt.logging.debug("bootstrap forward() traceback:", exc_info=True)
                     finally:
                         try:
                             self.sync()
@@ -154,29 +190,34 @@ class EpochValidatorNeuron(BaseValidatorNeuron):
                             bt.logging.warning(f"wallet sync failed: {e}")
                         self.step += 1
 
-                    # After bootstrap, continue the loop to await the next head normally (unless no_epoch).
-                    if self.config.no_epoch:
-                        # When no_epoch is True, we keep looping to call forward at each detected head
-                        # (below, after the wait). Skip the wait here so we can refresh the snapshot now.
-                        pass
-                    else:
-                        await self._wait_for_next_head()
-
-                else:
-                    # Normal path: wait for the next head unless explicitly disabled.
+                    # If force_epoch was set, only force once, then continue normal cadence
+                    if getattr(self.config, "force_epoch", False):
+                        # clear the flag so we don't loop tight; behave normally after this run
+                        try:
+                            # bt.config stores args as attributes; mutate for this process only
+                            setattr(self.config, "force_epoch", False)
+                        except Exception:
+                            pass
                     if not self.config.no_epoch:
                         await self._wait_for_next_head()
 
-                # Recompute snapshot *at* the head (or immediately after bootstrap)
-                self._epoch_len = None  # allow re-probe in case tempo/override changed
+                else:
+                    if not self.config.no_epoch:
+                        await self._wait_for_next_head()
+
+                # head snapshot
+                self._epoch_len = None
                 blk2, start2, end2, idx2, ep_len2 = self._epoch_snapshot()
                 self._apply_epoch_state(blk2, start2, end2, idx2, ep_len2)
 
                 try:
                     self.sync()
+                    self._refresh_strategy_before_forward()
                     await self.concurrent_forward()
                 except Exception as err:
+                    # FIX: don't 'raise e' (undefined). Log and continue.
                     bt.logging.error(f"forward() raised: {err}")
+                    bt.logging.debug("forward() traceback:", exc_info=True)
                 finally:
                     try:
                         self.sync()
@@ -185,7 +226,24 @@ class EpochValidatorNeuron(BaseValidatorNeuron):
                     self.step += 1
 
         try:
-            self.loop.run_until_complete(_loop())
-        except KeyboardInterrupt:
-            getattr(self, "axon", bt.logging).stop()
-            bt.logging.success("Validator stopped by keyboard interrupt.")
+            # Prefer asyncio.run() for a clean loop; it avoids the "already running" trap.
+            asyncio.run(_loop())
+        except RuntimeError as e:
+            # Fallback if already inside a running loop (rare in CLI, common in notebooks).
+            if "already running" in str(e):
+                bt.logging.warning(
+                    "Detected an already-running event loop; scheduling background task."
+                )
+                loop = asyncio.get_event_loop()
+                loop.create_task(_loop())
+            else:
+                raise
+        finally:
+            self._running = False
+            try:
+                ax = getattr(self, "axon", None)
+                if ax and hasattr(ax, "stop"):
+                    ax.stop()
+            except Exception:
+                pass
+            bt.logging.success("Validator main loop exited.")
