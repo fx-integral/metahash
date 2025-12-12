@@ -1,0 +1,64 @@
+name: Bug Report
+description: Report a bug or unexpected behavior.
+labels: [bug, codex]
+assignees: [lunamidori5]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Bug Report
+        Please fill out this form to help us fix the issue.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Bug Summary
+      description: Briefly describe the bug.
+      placeholder: What happened?
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to Reproduce
+      description: List the steps to reproduce the bug.
+      placeholder: 1. ... 2. ... 3. ...
+    validations:
+      required: false
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: What did you expect to happen?
+      placeholder: Describe the correct behavior.
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual Behavior
+      description: What actually happened?
+      placeholder: Describe what went wrong.
+    validations:
+      required: false
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, browser, device, or other relevant info.
+      placeholder: e.g. Windows 11, Chrome 120, Steam Deck
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant Logs or Screenshots
+      description: Paste logs, error messages, or attach screenshots if possible.
+      placeholder: Drag and drop files or paste logs here.
+    validations:
+      required: false
