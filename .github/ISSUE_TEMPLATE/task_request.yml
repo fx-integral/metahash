@@ -1,0 +1,53 @@
+name: Task Request
+description: Request a new task or assign work to a contributor mode. Pick the mode that should handle this task.
+labels: []
+assignees: [lunamidori5]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Task Requested
+        Please describe the work you need done and which contributor mode should own it.
+
+  - type: textarea
+    id: request
+    attributes:
+      label: Task Details
+      description: What request are you needing done?
+      placeholder: Describe the task, acceptance criteria, and any files/locations to change.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Which mode should handle this?
+      description: Pick one mode to own this task.
+      options:
+        - "AUDITOR — deep quality gate"
+        - "CODER — implement or change code"
+        - "MANAGER — update process docs"
+        - "REVIEWER — audit docs and planning notes"
+        - "TASKMASTER — create and maintain actionable tasks"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: task_file
+    attributes:
+      label: Task file status
+      description: Is this request already represented as a task file under `.codex/tasks/`?
+      options:
+        - Already exists as a task file
+        - Create a new task file
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Additional Context
+      description: Add any other context, links, or files to help with this request.
+      placeholder: Links, screenshots, or related issue numbers.
+    validations:
+      required: false
