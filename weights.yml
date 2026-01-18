@@ -1,5 +1,7 @@
 default: 1.0   # every subnet gets 1 unless listed below
 
-0: 0           # disable subnet 0
+0:  0          # disable subnet 0
 73: 0          # disable subnet 73
-136: 1
+7:  0          # disabled transfers
+12: 0          # disabled transfers
+29: 0          # disabled transfers

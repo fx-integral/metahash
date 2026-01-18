@@ -5,76 +5,144 @@
   <img src="image.png" width="96">
 </picture>
 
-# **MetaHash | Subnet 73**
+# **MetaHash Group | Treasury Subnet (SN73)**
 
 [![Discord Chat](https://img.shields.io/discord/308323056592486420.svg)](https://discord.gg/bittensor)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Twitter Follow](https://img.shields.io/twitter/follow/MetaHashSn73?style=social)](https://twitter.com/MetaHashSn73)
 
-🌐 [Website](https://metahash73.com) • ⛏️ [Miner Guide](docs/miner.md) • 🧪 [Validator Guide](docs/validator.md)
+🌐 [Website](https://metahash73.com) • ⛏️ [Miner Guide](https://docs.metahash73.com/MinerSetupSimple) • 🧪 [Validator Guide](https://docs.metahash73.com/ValidatorSetupSimple)
 </div>
 
 ---
 
-## 🚀 Overview
-**MetaHash (Subnet 73)** is a decentralized liquidity and incentive layer on the Bittensor network.
+## Overview
 
-It is designed to:
-- Give **dTAO holders** a way to put α to work across subnets,  
-- Allow **miners and subnet owners** to access α without destabilizing their own liquidity pools,  
-- Enable **validators** to allocate weights in a transparent, market-driven way.  
+**MetaHash Group** is a treasury-driven governing entity within the Bittensor ecosystem.
 
-In short: MetaHash connects α supply and demand while minimizing slippage, improving capital efficiency, and strengthening subnet economics.
+It operates **Subnet 73 (SN73)** as its on-chain treasury and coordination layer, while expanding its scope to **acquire, govern, and support a portfolio of subnets** across multiple functional domains.
+
+SN73 continues to function as a decentralized **alpha acquisition and settlement subnet**, but its role is now situated within a broader group-level strategy focused on capital allocation, subnet ownership, and long-term ecosystem development.
 
 ---
 
-## 🔥 Value Proposition
+## MetaHash Group Structure
 
-### 🧑‍🌾 For dTAO Holders
-- Open participation – you don’t need to be a miner to earn.  
-- Convert **α → MetaHash** exposure seamlessly.  
-- Deploy α across subnets without causing slippage in your origin pools.  
-- Receive transparent accounting of how your α is allocated.  
+### Group-Level Role
 
-### 🧍‍♀️ For Subnet 73
-- Acts as a **liquidity hub** where α demand meets α supply.  
-- Validator weights are allocated by a **fair, deterministic auction**, not subjective heuristics.  
-- **Budget signaling and burns** ensure unused α is never misallocated.  
-- Strengthens SN73’s role as a backbone for cross-subnet liquidity.
+MetaHash Group acts as:
+- A **capital allocator** and treasury operator
+- A **governance and coordination layer** for aligned subnets
+- A long-term steward of infrastructure within Bittensor
+
+The group treasury is anchored to **SN73**, which executes auctions, commitments, and settlements on-chain.
 
 ---
 
-## 🔁 How It Works (Epoch Lifecycle)
+## Domain-Based Subnet Portfolio
 
-MetaHash validators run a three-epoch pipeline:
+MetaHash Group organizes subnet activity across five functional domains:
 
-### **Epoch e: Auction & Clearing**
-1. **AuctionStart** — validator broadcasts start of auction.  
-2. **Bids** — miners submit `(subnet_id, α, discount_bps)`.  
-3. **Clearing** — bids are ranked by **TAO value** with slippage and optional reputation caps; partial fills allowed.  
-4. **Early Wins** — winners are notified with a `Win` invoice, including the **payment window** `[as, de]` in e+1.  
-5. **Stage Commitment** — snapshot of winners + budget signals (`bt_mu`, `bl_mu`) saved locally.
+### Compute
+- Inference and training workloads  
+- GPU capacity provisioning  
+- Core infrastructure primitives  
 
-### **Epoch e+1: Commitments**
-- Validator publishes e’s snapshot:  
-  - **CID-only** on-chain (v4 commitments)  
-  - Full JSON payload to IPFS  
-- Strict publisher: **only e−1 is published**, no catch-up.
+### Robotics
+- Control systems and simulation  
+- Embodied AI workloads  
+- Physical-world inference loops  
 
-### **Epoch e+2: Settlement**
-- Merge payment windows, scan on-chain α transfers.  
-- Apply `STRICT_PER_SUBNET` rules (if enabled).  
-- Compute miner scores, **burn underfill to UID 0**, and set weights.  
-- If `TESTING=true`, preview only (no on-chain weights).
+### Data & Signals
+- Data feeds and telemetry  
+- Market and web signals  
+- Real-time and batch signal processing  
+
+### Agents & Automation
+- Orchestration of models and tools  
+- Operational and application agents  
+- Multi-agent systems  
+
+### Advertising
+- Creative generation  
+- Targeting and optimization  
+- Spend allocation and performance analytics  
+
+Each domain may include one or more subnets, operated either directly by MetaHash Group or by independent teams under aligned incentive and governance frameworks.
+
+---
+
+## Role of Subnet 73 (SN73)
+
+### What Remains Unchanged
+- SN73 continues to run **alpha acquisition auctions**
+- SN73 continues to act as a **treasury**
+- Auction, clearing, commitment, and settlement mechanics remain intact
+- Validators continue to set weights deterministically based on delivered alpha
+
+### What Has Evolved
+SN73 is no longer positioned as a single-purpose liquidity venue.
+
+Instead, it serves as:
+- The **treasury subnet** of MetaHash Group
+- A capital formation layer for subnet acquisition and support
+- A coordination point for group-level strategy
+
+In short:
+
+> **SN73 is the execution and treasury layer of MetaHash Group.**
 
 ---
 
-## 🧠 Key Features
-- **Auction → Clearing → Commitments → Settlement** pipeline.  
-- **Slippage-aware valuation** of α bids (`K_SLIP`, `SLIP_TOLERANCE`).  
-- **Reputation caps** per coldkey (baseline & max fractions).  
-- **Budget signaling** (`bt_mu`, `bl_mu`) to enforce deterministic burns.  
-- **Strict publisher**: CID on-chain, JSON in IPFS.  
-- **Safety**: miners only pay to whitelisted treasuries (`metahash/treasuries.py`).  
+## How the Treasury Mechanism Works
+
+MetaHash validators operate a deterministic, multi-epoch pipeline:
+
+### Epoch *e*: Auction & Clearing
+1. Validator broadcasts `AuctionStart`
+2. Miners submit bids: `(subnet_id, alpha_amount, discount_bps)`
+3. Bids are valued using slippage-aware pricing and optional reputation caps
+4. Winners receive `Win` invoices with a payment window in epoch *e+1*
+5. Auction results are snapshotted locally
+
+### Epoch *e+1*: Commitments
+- Validator publishes the snapshot:
+  - **CID only** on-chain (v4 commitments)
+  - Full JSON payload to IPFS
+- Strict publishing order: only *e−1* is committed
+
+### Epoch *e+2*: Settlement
+- Validator scans on-chain alpha transfers during payment windows
+- Credits delivered alpha
+- **Burns underfilled amounts to UID 0**
+- Computes miner incentives and sets weights
+- Optional preview-only mode when `TESTING=true`
 
 ---
+
+## Key Properties
+
+- Deterministic **Auction → Clearing → Commitment → Settlement** pipeline
+- Slippage-aware alpha valuation
+- Reputation caps enforced per coldkey
+- Budget signaling to enforce capital discipline
+- Whitelisted treasury enforcement for miner payments
+- Transparent, auditable on-chain commitments
+
+---
+
+## Community & Subnet Expansion
+
+MetaHash Group actively engages with the community to:
+- Identify capable and motivated subnet teams
+- Acquire subnet slots
+- Provide capital, coordination, and long-term alignment
+- Support meaningful contributions to the Bittensor ecosystem
+
+This model emphasizes **alignment over control** and **capital efficiency over fragmentation**.
+
+---
+
+## License
+
+MIT License. See `LICENSE` for details.
