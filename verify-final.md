@@ -1,1 +1,1 @@
-verify-final
+release
