@@ -16,20 +16,36 @@
 
 from __future__ import annotations
 
+import random
+import time
+
 import asyncio
 import inspect
-from dataclasses import dataclass, replace
-from typing import Callable, Dict, List, Optional, Sequence, Tuple, TypeVar
+
+from dataclasses import dataclass
+from dataclasses import replace
+from typing import Callable
+from typing import Dict
+from typing import List
+from typing import Optional
+from typing import Sequence
+from typing import Tuple
+from typing import TypeVar
 
 import bittensor as bt
-import websockets  # WS errors
+import websockets
+
+from async_substrate_interface.errors import SubstrateRequestException
 from substrateinterface.utils.ss58 import (
     ss58_decode as _ss58_decode_generic,
     ss58_encode as _ss58_encode_generic,
 )
-from async_substrate_interface.errors import SubstrateRequestException
 
 from metahash.config import MAX_CONCURRENCY
+from metahash.config import ALPHA_SCAN_RPC_TIMEOUT_S
+from metahash.config import ALPHA_SCAN_RPC_MAX_RETRIES
+from metahash.config import ALPHA_SCAN_RPC_BACKOFF_BASE_S
+from metahash.config import ALPHA_SCAN_RPC_MIN_DELAY_S
 
 # ── extrinsic filter ───────────────────────────────────────────────────
 UTILITY_FUNS: set[str] = {"batch", "force_batch", "batch_all"}
@@ -67,8 +83,6 @@ def _name(obj) -> str | None:
     if isinstance(obj, dict):
         return obj.get("name")
     return str(obj)
-
-
 
 
 # ── constants ───────────────────────────────────────────────────────────
@@ -111,21 +125,21 @@ def _encode_ss58(raw: Optional[bytes], fmt: int) -> Optional[str]:  # noqa: D401
     try:
         out = _ss58_encode_generic(raw, fmt)  # some versions accept pubkey bytes here
         return out
-    except Exception as e1:
+    except Exception:
         pass
 
     # 2) Try explicit keywords (pubkey=..., address_type=...)
     try:
         out = _ss58_encode_generic(pubkey=raw, address_type=fmt)  # substrate-interface style
         return out
-    except Exception as e2:
+    except Exception:
         pass
 
     # 3) Try hex "address" path that some scalecodec versions expect
     try:
         out = _ss58_encode_generic(address="0x" + raw.hex(), address_type=fmt)
         return out
-    except Exception as e3:
+    except Exception:
         pass
 
     # 4) Last resort: give up quietly; caller will drop the event if None
@@ -232,9 +246,9 @@ def _account_id(obj) -> bytes | None:  # noqa: ANN001,D401
                 return b
             else:
                 pass
-        except Exception as e:
+        except Exception:
             pass
-        
+
         # Try with different SS58 formats as fallback
         for fmt in [42, 0, 2]:  # Common SS58 formats
             try:
@@ -249,7 +263,7 @@ def _account_id(obj) -> bytes | None:  # noqa: ANN001,D401
                     return b
                 else:
                     pass
-            except Exception as fmt_e:
+            except Exception:
                 continue
         return None
     return None
@@ -393,6 +407,8 @@ class AlphaTransfersScanner:
         self.max_conc = max_concurrency
         self.ss58_format = subtensor.substrate.ss58_format
         self._rpc_lock: asyncio.Lock = rpc_lock or asyncio.Lock()
+        self._rpc_next_time_s: float = 0.0
+        self.last_scan: Dict[str, int] = {}
 
     def _allowed_extrinsic_indices(  # noqa: PLR0911
         self,
@@ -432,16 +448,96 @@ class AlphaTransfersScanner:
           • pre-awaiting any awaitable args / kwargs (prevents coroutine leakage),
           • serializing the call under a lock to avoid interleaved ws payloads.
         """
-        async with self._rpc_lock:
-            # Pre-await any awaitable positional args
-            a2 = []
-            for x in a:
-                a2.append((await x) if inspect.isawaitable(x) else x)
-            # Pre-await any awaitable keyword args
-            kw2 = {}
-            for k, v in kw.items():
-                kw2[k] = (await v) if inspect.isawaitable(v) else v
-            return await maybe_async(fn, *a2, **kw2)
+        a2 = []
+        for x in a:
+            a2.append((await x) if inspect.isawaitable(x) else x)
+        kw2 = {}
+        for k, v in kw.items():
+            kw2[k] = (await v) if inspect.isawaitable(v) else v
+
+        async def _reconnect():
+            st = self.st
+            substrate = getattr(st, "substrate", None)
+            if substrate is not None:
+                close = getattr(substrate, "close", None)
+                if callable(close):
+                    res = close()
+                    if inspect.isawaitable(res):
+                        await res
+            init = getattr(st, "initialize", None)
+            if callable(init):
+                res = init()
+                if inspect.isawaitable(res):
+                    await res
+
+        def _is_transient(err: Exception) -> bool:
+            if isinstance(err, asyncio.TimeoutError):
+                return True
+            if isinstance(err, (ConnectionError, OSError)):
+                return True
+            wse = getattr(websockets, "exceptions", None)
+            if wse is not None:
+                for name in (
+                    "ConnectionClosed",
+                    "ConnectionClosedError",
+                    "InvalidHandshake",
+                    "InvalidStatusCode",
+                    "WebSocketException",
+                ):
+                    cls = getattr(wse, name, None)
+                    if cls is not None and isinstance(err, cls):
+                        return True
+            if isinstance(err, SubstrateRequestException):
+                return True
+            msg = str(err).lower()
+            for needle in (
+                "timeout",
+                "timed out",
+                "connection closed",
+                "connection reset",
+                "broken pipe",
+                "server disconnected",
+                "429",
+                "too many requests",
+                "rate limit",
+                "temporarily unavailable",
+                "service unavailable",
+            ):
+                if needle in msg:
+                    return True
+            return False
+
+        last_exc: Exception | None = None
+        max_retries = max(1, int(ALPHA_SCAN_RPC_MAX_RETRIES))
+        timeout_s = max(1.0, float(ALPHA_SCAN_RPC_TIMEOUT_S))
+        min_delay_s = max(0.0, float(ALPHA_SCAN_RPC_MIN_DELAY_S))
+        base_backoff_s = max(0.0, float(ALPHA_SCAN_RPC_BACKOFF_BASE_S))
+
+        for attempt in range(1, max_retries + 1):
+            async with self._rpc_lock:
+                now = time.monotonic()
+                wait_s = self._rpc_next_time_s - now
+                if wait_s > 0:
+                    await asyncio.sleep(wait_s)
+                try:
+                    if min_delay_s > 0:
+                        self._rpc_next_time_s = max(self._rpc_next_time_s, time.monotonic() + min_delay_s)
+                    return await asyncio.wait_for(maybe_async(fn, *a2, **kw2), timeout=timeout_s)
+                except Exception as err:
+                    last_exc = err
+                    if attempt >= max_retries or not _is_transient(err):
+                        raise
+                    backoff = base_backoff_s * (2 ** (attempt - 1))
+                    backoff = backoff + (random.random() * max(0.0, base_backoff_s))
+                    self._rpc_next_time_s = max(self._rpc_next_time_s, time.monotonic() + backoff)
+                    try:
+                        await asyncio.wait_for(_reconnect(), timeout=timeout_s)
+                    except Exception:
+                        pass
+                    continue
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("RPC failed with unknown error")
 
     async def _get_block(self, bn: int):
         """Return *(events, extrinsics_list)* for block *bn* with strict normalization."""
@@ -462,7 +558,7 @@ class AlphaTransfersScanner:
         # Fetch events / block using normalized hash
         events = await self._rpc(self.st.substrate.get_events, block_hash=bh_str)
         blk = await self._rpc(self.st.substrate.get_block, block_hash=bh_str)
-        
+
         # Reduced logging - only log block processing errors
 
         # Normalize events to a list of dict-ish items
@@ -487,6 +583,7 @@ class AlphaTransfersScanner:
 
     async def scan(self, frm: int, to: int) -> List[TransferEvent]:
         if frm > to:
+            self.last_scan = {"from": int(frm), "to": int(to), "total": 0, "processed": 0, "skipped": 0}
             return []
         total = to - frm + 1
         bt.logging.info(f"[SCANNER] Starting scan: blocks {frm} to {to} ({total} blocks)")
@@ -560,6 +657,13 @@ class AlphaTransfersScanner:
         bt.logging.info(f"[SCANNER] ✓ Scan finished: {blk_cnt}/{total} blocks processed, {ev_cnt} events found, {keep_cnt} kept")
         if blk_cnt < total:
             bt.logging.warning(f"[SCANNER] ⚠️  Only processed {blk_cnt}/{total} blocks - some blocks were skipped due to errors")
+        self.last_scan = {
+            "from": int(frm),
+            "to": int(to),
+            "total": int(total),
+            "processed": int(blk_cnt),
+            "skipped": int(total - blk_cnt),
+        }
         await _flush_progress()
 
         ordered_events: List[TransferEvent] = []
@@ -666,7 +770,7 @@ class AlphaTransfersScanner:
                             break
             elif name == "StakeTransferred":
                 seen += 1
-                
+
                 bucket["te"] = _parse_stake_transferred(fields, self.ss58_format)
                 # Also try to record raw accounts from this event directly if present
                 if "src_raw" not in bucket:

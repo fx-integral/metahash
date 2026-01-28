@@ -10,7 +10,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from bittensor import BLOCKTIME
 from metahash.utils.pretty_logs import pretty
-from metahash.utils.phase_logs import set_phase, phase_start, phase_end, phase_table, phase_summary, compact_status, log as phase_log, grouped_info
+from metahash.utils.phase_logs import set_phase, phase_start, phase_end, phase_summary, log as phase_log
 from metahash.utils.ipfs import aget_json
 from metahash.utils.commitments import read_all_plain_commitments
 from metahash.validator.alpha_transfers import AlphaTransfersScanner, TransferEvent
@@ -25,6 +25,8 @@ from metahash.config import (
     FORBIDDEN_ALPHA_SUBNETS,
     LOG_TOP_N,
     FORCE_BURN_WEIGHTS,
+    MAX_CHUNK,
+    ALPHA_SCAN_MAX_SKIP_RATIO,
 )
 
 # ---------------- precision / toggles ----------------
@@ -49,7 +51,7 @@ def _isatty() -> bool:
 
 
 def _pause(msg: str):
-    return  
+    return
 
 
 def _j(obj) -> str:
@@ -67,7 +69,7 @@ def _kv_preview(d: dict, n=8) -> dict:
     out = {}
     for i, (k, v) in enumerate(d.items()):
         if i >= n:
-            out["…"] = f"+{len(d)-n} more"
+            out["…"] = f"+{len(d) - n} more"
             break
         out[k] = v
     return out
@@ -346,7 +348,7 @@ class SettlementEngine:
                     ("settle epoch (e−2)", epoch_to_settle),
                     ("payment epoch scanned (e−1+1)", epoch_to_settle + 1),
                     ("blocks_left", remain),
-                    ("~eta", f"{int(eta_s//60)}m{int(eta_s%60):02d}s"),
+                    ("~eta", f"{int(eta_s // 60)}m{int(eta_s % 60):02d}s"),
                 ],
                 style="bold yellow",
             )
@@ -365,13 +367,11 @@ class SettlementEngine:
             # Allow Utility.* batches to ensure wrapped transfer_stake are scanned
             self._scanner = AlphaTransfersScanner(await self.parent._stxn(), dest_coldkey=None, allow_batch=True, rpc_lock=self._rpc_lock)
 
-        try:
-            events_raw = await self._scanner.scan(start_block, end_block)
-        except Exception as scan_exc:
-            phase_log(f"[SETTLEMENT] Scanner failed for blocks {start_block}-{end_block}: {str(scan_exc)[:200]}")
-            pretty.log(f"[yellow]Scanner failed: {scan_exc}[/yellow]")
-            raise scan_exc
-            return None
+        total_blocks = max(0, int(end_block) - int(start_block) + 1)
+        chunk_size = max(1, int(MAX_CHUNK))
+        processed = 0
+        skipped = 0
+        chunks = 0
 
         def _coerce(ev) -> TransferEvent | None:
             if isinstance(ev, TransferEvent):
@@ -395,16 +395,53 @@ class SettlementEngine:
             return None
 
         events: List[TransferEvent] = []
-        if isinstance(events_raw, list):
-            for ev in events_raw:
-                c = _coerce(ev)
-                if c:
-                    events.append(c)
+        for chunk_start in range(int(start_block), int(end_block) + 1, chunk_size):
+            chunk_end = min(int(end_block), chunk_start + chunk_size - 1)
+            chunks += 1
+            try:
+                events_raw = await self._scanner.scan(chunk_start, chunk_end)
+            except Exception as scan_exc:
+                phase_log(f"[SETTLEMENT] Scanner failed for blocks {chunk_start}-{chunk_end}: {str(scan_exc)[:200]}")
+                pretty.log(f"[yellow]Scanner failed: {scan_exc}[/yellow]")
+                return None
+
+            scan_stats = getattr(self._scanner, "last_scan", None)
+            if isinstance(scan_stats, dict):
+                processed += int(scan_stats.get("processed", 0) or 0)
+                skipped += int(scan_stats.get("skipped", 0) or 0)
+            else:
+                processed += int(chunk_end - chunk_start + 1)
+
+            if isinstance(events_raw, list):
+                for ev in events_raw:
+                    c = _coerce(ev)
+                    if c:
+                        events.append(c)
+
+        skip_ratio = float(skipped) / float(max(1, total_blocks))
+        if total_blocks > 0 and skip_ratio > float(ALPHA_SCAN_MAX_SKIP_RATIO):
+            pretty.kv_panel(
+                "Scanner incomplete",
+                [
+                    ("range", f"[{start_block},{end_block}]"),
+                    ("total_blocks", total_blocks),
+                    ("processed_blocks", processed),
+                    ("skipped_blocks", skipped),
+                    ("skip_ratio", f"{skip_ratio:.4f}"),
+                    ("max_skip_ratio", f"{float(ALPHA_SCAN_MAX_SKIP_RATIO):.4f}"),
+                ],
+                style="bold yellow",
+            )
+            return None
 
         pretty.kv_panel("Scanner result",
-                        [("#events_raw", len(events_raw or [])),
-                         ("#events (coerced)", len(events)),
-                         ("range", f"[{start_block},{end_block}]")],
+                        [("#events (coerced)", len(events)),
+                         ("range", f"[{start_block},{end_block}]"),
+                         ("chunks", chunks),
+                         ("total_blocks", total_blocks),
+                         ("processed_blocks", processed),
+                         ("skipped_blocks", skipped),
+                         ("skip_ratio", f"{skip_ratio:.4f}")],
                         style="bold cyan")
 
         if VERBOSE_DUMPS and events:
@@ -822,7 +859,7 @@ class SettlementEngine:
         pairs = list(zip(uids, weights))
         pairs.sort(key=lambda x: x[1], reverse=True)
         top_n = max(1, int(LOG_TOP_N))
-        rows = [[uid, f"{w:.6f}", f"{(w*100):.2f}%"] for uid, w in pairs[:top_n]]
+        rows = [[uid, f"{w:.6f}", f"{(w * 100):.2f}%"] for uid, w in pairs[:top_n]]
         pretty.table(
             f"[magenta]WEIGHTS PREVIEW — mode={mode}[/magenta]",
             ["UID", "Weight", "% of total"],
