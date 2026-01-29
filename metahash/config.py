@@ -65,6 +65,11 @@ SAMPLE_POINTS: int = 8
 MAX_CHUNK: int = int(os.getenv("ALPHA_SCAN_CHUNK", "512"))
 MAX_CONCURRENCY: int = int(os.getenv("ALPHA_SCAN_CONCURRENCY", "8"))
 POST_PAYMENT_CHECK_DELAY_BLOCKS: int = int(os.getenv("POST_PAYMENT_CHECK_DELAY_BLOCKS", "0"))
+ALPHA_SCAN_RPC_TIMEOUT_S: float = float(os.getenv("ALPHA_SCAN_RPC_TIMEOUT_S", "20"))
+ALPHA_SCAN_RPC_MAX_RETRIES: int = int(os.getenv("ALPHA_SCAN_RPC_MAX_RETRIES", "3"))
+ALPHA_SCAN_RPC_BACKOFF_BASE_S: float = float(os.getenv("ALPHA_SCAN_RPC_BACKOFF_BASE_S", "0.75"))
+ALPHA_SCAN_RPC_MIN_DELAY_S: float = float(os.getenv("ALPHA_SCAN_RPC_MIN_DELAY_S", "0"))
+ALPHA_SCAN_MAX_SKIP_RATIO: float = float(os.getenv("ALPHA_SCAN_MAX_SKIP_RATIO", "0.02"))
 # ╰────────────────────────────────────────────────────────────────────╯
 
 
